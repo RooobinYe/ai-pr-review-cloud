@@ -1,0 +1,303 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
+)
+
+const (
+	runID   = "0b4c1f6e-0000-4000-8000-000000000001"
+	headSHA = "2222222222222222222222222222222222222222"
+	oldSHA  = "1111111111111111111111111111111111111111"
+	bot     = "ai-pr-review-dev[bot]"
+)
+
+type harness struct {
+	c     *Controller
+	store *fakeStore
+	gh    *fakeGitHub
+	kube  *fakeKube
+	mux   *http.ServeMux
+}
+
+func newHarness() *harness {
+	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued})
+	gh := &fakeGitHub{head: headSHA}
+	k := newFakeKube()
+	cfg := Config{MaxRunning: 2, BotLogin: bot, Job: JobConfig{FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMSecret: "llm"}}
+	c := New(cfg, s, gh, k, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mux := http.NewServeMux()
+	c.Routes(mux)
+	return &harness{c: c, store: s, gh: gh, kube: k, mux: mux}
+}
+
+func (h *harness) reconcile() { h.c.Reconcile(context.Background()) }
+
+func (h *harness) state() store.Run {
+	r, _ := h.store.Get(context.Background(), runID)
+	return r
+}
+
+func (h *harness) post(res review.Result) int {
+	body, _ := json.Marshal(res)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/result", bytes.NewReader(body)))
+	return rec.Code
+}
+
+func result(v review.Verdict, comments ...review.Comment) review.Result {
+	if comments == nil {
+		comments = []review.Comment{}
+	}
+	return review.Result{
+		SchemaVersion: review.SchemaVersion,
+		PR:            review.PR{Repo: "o/r", Number: 7, HeadSHA: headSHA},
+		Model:         "deepseek/deepseek-flash",
+		GeneratedAt:   "2026-10-23T00:00:00Z",
+		Verdict:       v,
+		Body:          "Looks fine.",
+		Comments:      comments,
+	}
+}
+
+func approvedReview(id int64, login, sha string) githubapp.Review {
+	r := githubapp.Review{ID: id, State: "APPROVED", CommitID: sha}
+	r.User.Login = login
+	return r
+}
+
+func TestApproveFlow(t *testing.T) {
+	h := newHarness()
+	h.gh.reviews = []githubapp.Review{approvedReview(1, bot, oldSHA), approvedReview(2, "human", oldSHA), approvedReview(3, bot, headSHA)}
+
+	h.reconcile()
+	r := h.state()
+	if r.State != run.StateRunning || r.JobName != JobName(runID, 1) {
+		t.Fatalf("after claim: %+v", r)
+	}
+	if len(h.gh.dismissed) != 1 || h.gh.dismissed[0] != 1 {
+		t.Errorf("dismissed %v, want only the bot's stale approval", h.gh.dismissed)
+	}
+	if cr := h.gh.checkRuns[100]; len(cr) != 1 || cr[0].Status != "in_progress" || cr[0].HeadSHA != headSHA {
+		t.Errorf("check run %+v", cr)
+	}
+	job, ok := h.kube.jobs[r.JobName]
+	if !ok {
+		t.Fatal("job not created")
+	}
+	secret := h.kube.secrets[tokenSecretName(r.JobName)]
+	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
+		t.Errorf("token secret %+v", secret)
+	}
+
+	h.reconcile() // nothing new while the job runs
+	if len(h.gh.tokens) != 1 || len(h.gh.checkRuns) != 1 || len(h.gh.dismissed) != 1 {
+		t.Errorf("repeated side effects: tokens %d, check runs %d, dismissals %d", len(h.gh.tokens), len(h.gh.checkRuns), len(h.gh.dismissed))
+	}
+
+	if code := h.post(result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityLow, Confidence: review.ConfidenceHigh, Body: "nit"})); code != http.StatusNoContent {
+		t.Fatalf("post result: %d", code)
+	}
+	h.kube.finish(r.JobName, kube.JobComplete)
+	h.reconcile()
+
+	if got := h.state(); got.State != run.StateDone {
+		t.Fatalf("state %s, want done", got.State)
+	}
+	if len(h.gh.posted) != 1 {
+		t.Fatalf("posted %d reviews", len(h.gh.posted))
+	}
+	rv := h.gh.posted[0]
+	if rv.Event != "APPROVE" || rv.CommitID != headSHA || len(rv.Comments) != 1 || rv.Comments[0].Side != "RIGHT" || !strings.Contains(rv.Comments[0].Body, "**low**") {
+		t.Errorf("review %+v", rv)
+	}
+	if cr := h.gh.checkRuns[100]; len(cr) != 2 || cr[1].Conclusion != "success" {
+		t.Errorf("check run updates %+v", cr)
+	}
+
+	h.reconcile()
+	if code := h.post(result(review.VerdictApprove)); code != http.StatusNoContent {
+		t.Errorf("duplicate post: %d, want 204", code)
+	}
+	if len(h.gh.posted) != 1 || len(h.gh.checkRuns[100]) != 2 {
+		t.Error("finished run produced more GitHub writes")
+	}
+}
+
+func TestRequestChangesVotesComment(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.post(result(review.VerdictRequestChanges))
+	h.reconcile()
+	if rv := h.gh.posted[0]; rv.Event != "COMMENT" {
+		t.Errorf("event %s, want COMMENT", rv.Event)
+	}
+	if cr := h.gh.checkRuns[100]; cr[len(cr)-1].Conclusion != "neutral" {
+		t.Errorf("conclusion %s, want neutral", cr[len(cr)-1].Conclusion)
+	}
+}
+
+func TestApproveAfterHeadMovedVotesComment(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.gh.head = "3333333333333333333333333333333333333333"
+	h.post(result(review.VerdictApprove))
+	h.reconcile()
+	if rv := h.gh.posted[0]; rv.Event != "COMMENT" {
+		t.Errorf("event %s, want COMMENT for a stale head", rv.Event)
+	}
+}
+
+func TestRejectedInlineCommentsAreFolded(t *testing.T) {
+	h := newHarness()
+	h.gh.rejectLines = true
+	h.reconcile()
+	h.post(result(review.VerdictRequestChanges, review.Comment{Path: "a.go", Line: 99, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"}))
+	h.reconcile()
+	if len(h.gh.posted) != 1 {
+		t.Fatalf("posted %d reviews", len(h.gh.posted))
+	}
+	if rv := h.gh.posted[0]; len(rv.Comments) != 0 || !strings.Contains(rv.Body, "`a.go:99`") {
+		t.Errorf("folded review %+v", rv)
+	}
+	if h.state().State != run.StateDone {
+		t.Error("run not done")
+	}
+}
+
+func TestJobFailureIsReported(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	job := h.state().JobName
+	h.kube.pods = []kube.Pod{{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
+		{Name: "fetch", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: "fetch: 404 Not Found"}}},
+	}}}}
+	h.kube.finish(job, kube.JobFailed)
+	h.reconcile()
+
+	r := h.state()
+	if r.State != run.StateFailed || !strings.Contains(r.Error, "fetch exited with code 1: fetch: 404 Not Found") {
+		t.Fatalf("run %+v", r)
+	}
+	cr := h.gh.checkRuns[100]
+	if last := cr[len(cr)-1]; last.Conclusion != "failure" || !strings.Contains(last.Output.Summary, "404") {
+		t.Errorf("check run %+v", last)
+	}
+	h.reconcile()
+	if len(h.gh.checkRuns[100]) != len(cr) {
+		t.Error("failure reported twice")
+	}
+	if code := h.post(result(review.VerdictApprove)); code != http.StatusConflict {
+		t.Errorf("late result: %d, want 409", code)
+	}
+}
+
+func TestSucceededJobWithoutResultFails(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.kube.finish(h.state().JobName, kube.JobComplete)
+	h.reconcile()
+	if r := h.state(); r.State != run.StateFailed || !strings.Contains(r.Error, "without submitting") {
+		t.Errorf("run %+v", r)
+	}
+}
+
+func TestMissingSecretIsRecreated(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	clear(h.kube.secrets)
+	h.reconcile()
+	if len(h.kube.secrets) != 1 || len(h.gh.tokens) != 2 {
+		t.Errorf("secrets %d, tokens %d", len(h.kube.secrets), len(h.gh.tokens))
+	}
+}
+
+func TestResultValidation(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	other := result(review.VerdictApprove)
+	other.PR.HeadSHA = oldSHA
+	if code := h.post(other); code != http.StatusUnprocessableEntity {
+		t.Errorf("result for another commit: %d, want 422", code)
+	}
+	bad := result(review.VerdictApprove)
+	bad.Body = ""
+	if code := h.post(bad); code != http.StatusBadRequest {
+		t.Errorf("invalid result: %d, want 400", code)
+	}
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/runs/nope/result", strings.NewReader(mustJSON(result(review.VerdictApprove)))))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown run: %d, want 404", rec.Code)
+	}
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func TestMaxRunning(t *testing.T) {
+	h := newHarness()
+	h.c.cfg.MaxRunning = 0
+	h.reconcile()
+	if h.state().State != run.StateQueued || len(h.kube.jobs) != 0 {
+		t.Error("run claimed beyond MaxRunning")
+	}
+}
+
+func TestPermanentGitHubErrorFailsRun(t *testing.T) {
+	h := newHarness()
+	h.c.gh = failingGitHub{h.gh, &githubapp.APIError{Status: http.StatusNotFound, Message: "Not Found"}}
+	h.reconcile()
+	if r := h.state(); r.State != run.StateFailed || !strings.Contains(r.Error, "404") {
+		t.Errorf("run %+v, want failed with the GitHub error", r)
+	}
+	if len(h.kube.jobs) != 0 {
+		t.Error("job created for a run that cannot be reviewed")
+	}
+}
+
+func TestPermanent(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{&githubapp.APIError{Status: 404}, true},
+		{&githubapp.APIError{Status: 403, Message: "Resource not accessible by integration"}, true},
+		{&githubapp.APIError{Status: 403, Message: "You have exceeded a secondary rate limit"}, false},
+		{&githubapp.APIError{Status: 502}, false},
+		{io.ErrUnexpectedEOF, false},
+		{nil, false},
+	}
+	for _, tt := range tests {
+		if got := permanent(tt.err); got != tt.want {
+			t.Errorf("permanent(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+// failingGitHub fails every read of reviews, the first GitHub call of a run.
+type failingGitHub struct {
+	*fakeGitHub
+	err error
+}
+
+func (f failingGitHub) Client(int64) GitHubClient { return f }
+
+func (f failingGitHub) ListReviews(context.Context, string, int) ([]githubapp.Review, error) {
+	return nil, f.err
+}

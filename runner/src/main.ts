@@ -3,13 +3,15 @@
 //     /workspace and results go back to the controller.
 //   - local mode: --pr <url>; fetches the PR itself and prints the result,
 //     for development and CI use without a cluster.
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { Value } from "typebox/value";
+import { postResult } from "./controller.ts";
 import { clonePR, fetchPR } from "./github.ts";
-import { modelConfigFromEnv, parseThinking, resolveModel } from "./model.ts";
+import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } from "./model.ts";
+import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
 import { ReviewNotSubmittedError, review } from "./review.ts";
@@ -23,7 +25,10 @@ environment:
   LLM_MODEL      model id (default deepseek-flash)
   LLM_BASE_URL   override the provider endpoint, e.g. a LiteLLM proxy
   LLM_THINKING   off|minimal|low|medium|high|xhigh|max (default high)
-  GITHUB_TOKEN   optional; needed for private repositories and higher rate limits`;
+  GITHUB_TOKEN   optional; needed for private repositories and higher rate limits
+
+cluster mode (set by the controller's Job):
+  RUN_ID, CONTROLLER_URL, WORKSPACE (default /workspace), REVIEW_LANGUAGE`;
 
 const { values } = parseArgs({
   options: {
@@ -37,60 +42,79 @@ const { values } = parseArgs({
 
 const log = (line: string) => console.error(`runner: ${line}`);
 
+/** Reviews a checked-out PR and returns the validated result; shared by both modes. */
+async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: ModelConfig, language: string): Promise<ReviewResult> {
+  const started = Date.now();
+  const thinkingLevel = parseThinking(cfg.thinking);
+  const { model, modelRuntime } = await resolveModel(cfg, agentDir);
+  log(`reviewing ${pr.repo}#${pr.number} at ${pr.headSha.slice(0, 7)} with ${model.provider}/${model.id} (thinking ${thinkingLevel})`);
+  try {
+    const { submission, stats } = await review({
+      pr,
+      cwd,
+      agentDir,
+      model,
+      modelRuntime,
+      thinkingLevel,
+      language,
+      onProgress: (line) => log(`  ${line}`),
+    });
+    log(formatUsage({ ...stats.tokens, cost: stats.cost }, (Date.now() - started) / 1000));
+    const result: ReviewResult = {
+      schema_version: SCHEMA_VERSION,
+      pr: { repo: pr.repo, number: pr.number, head_sha: pr.headSha },
+      model: `${model.provider}/${model.id}`,
+      generated_at: new Date().toISOString(),
+      ...submission,
+    };
+    if (!Value.Check(ReviewResultSchema, result)) {
+      throw new Error(`result does not match schema v${SCHEMA_VERSION}: ${[...Value.Errors(ReviewResultSchema, result)].map((e) => `${e.instancePath} ${e.message}`).join("; ")}`);
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof ReviewNotSubmittedError) {
+      log(formatUsage({ ...err.stats.tokens, cost: err.stats.cost }, (Date.now() - started) / 1000));
+    }
+    throw err;
+  }
+}
+
 async function local(url: string, format: string): Promise<number> {
   if (format !== "markdown" && format !== "json") throw new Error(`--format must be markdown or json, got ${format}`);
   const ref = parsePRUrl(url);
   const cfg = modelConfigFromEnv(process.env);
-  const thinkingLevel = parseThinking(cfg.thinking);
+  parseThinking(cfg.thinking);
   const token = process.env.GITHUB_TOKEN || undefined;
-  const started = Date.now();
 
   const scratch = await mkdtemp(join(tmpdir(), "ai-pr-review-"));
   const cwd = join(scratch, "repo");
-  const agentDir = join(scratch, "pi");
   try {
     log(`fetching ${ref.owner}/${ref.repo}#${ref.number}`);
     const pr = await fetchPR(ref, token);
     await mkdir(cwd);
     await clonePR(pr, cwd, token);
     log(`checked out ${pr.headSha.slice(0, 7)} into ${cwd}; ${pr.files.length} files changed`);
-
-    const { model, modelRuntime } = await resolveModel(cfg, agentDir);
-    log(`reviewing with ${model.provider}/${model.id} (thinking ${thinkingLevel})`);
-    try {
-      const { submission, stats } = await review({
-        pr,
-        cwd,
-        agentDir,
-        model,
-        modelRuntime,
-        thinkingLevel,
-        language: values.language!,
-        onProgress: (line) => log(`  ${line}`),
-      });
-      const result: ReviewResult = {
-        schema_version: SCHEMA_VERSION,
-        pr: { repo: pr.repo, number: pr.number, head_sha: pr.headSha },
-        model: `${model.provider}/${model.id}`,
-        generated_at: new Date().toISOString(),
-        ...submission,
-      };
-      if (!Value.Check(ReviewResultSchema, result)) {
-        throw new Error(`result does not match schema v${SCHEMA_VERSION}: ${[...Value.Errors(ReviewResultSchema, result)].map((e) => `${e.instancePath} ${e.message}`).join("; ")}`);
-      }
-      process.stdout.write(format === "json" ? `${JSON.stringify(result, null, 2)}\n` : renderMarkdown(result));
-      log(formatUsage({ ...stats.tokens, cost: stats.cost }, (Date.now() - started) / 1000));
-      return 0;
-    } catch (err) {
-      if (err instanceof ReviewNotSubmittedError) {
-        log(formatUsage({ ...err.stats.tokens, cost: err.stats.cost }, (Date.now() - started) / 1000));
-      }
-      throw err;
-    }
+    const result = await reviewPR(pr, cwd, join(scratch, "pi"), cfg, values.language!);
+    process.stdout.write(format === "json" ? `${JSON.stringify(result, null, 2)}\n` : renderMarkdown(result));
+    return 0;
   } finally {
     if (values.keep) log(`kept ${scratch}`);
     else await rm(scratch, { recursive: true, force: true });
   }
+}
+
+async function cluster(runId: string): Promise<number> {
+  const controllerUrl = process.env.CONTROLLER_URL;
+  if (!controllerUrl) throw new Error("CONTROLLER_URL is not set");
+  const cfg = modelConfigFromEnv(process.env);
+  const workspace = process.env.WORKSPACE || "/workspace";
+  const pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-"));
+  log(`run ${runId}: ${pr.files.length} files changed`);
+  const result = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, process.env.REVIEW_LANGUAGE || values.language!);
+  await postResult(controllerUrl, runId, result, { log });
+  log(`run ${runId}: posted ${result.verdict} with ${result.comments.length} comments`);
+  return 0;
 }
 
 async function main(): Promise<number> {
@@ -98,10 +122,7 @@ async function main(): Promise<number> {
     console.error(USAGE);
     return 0;
   }
-  if (process.env.RUN_ID) {
-    log(`cluster mode for run ${process.env.RUN_ID} is not implemented yet (milestone M1)`);
-    return 2;
-  }
+  if (process.env.RUN_ID) return cluster(process.env.RUN_ID);
   if (values.pr) return local(values.pr, values.format!);
   console.error(USAGE);
   return 2;

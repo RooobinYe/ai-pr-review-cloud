@@ -16,6 +16,12 @@ const (
 	StateSuperseded       State = "superseded"
 )
 
+// States lists every state, in lifecycle order.
+var States = []State{
+	StateQueued, StateRunning, StatePreviewing, StateReviewed, StateAwaitingApproval,
+	StateMerging, StateDone, StateFailed, StateSuperseded,
+}
+
 // transitions lists every allowed edge of the state machine. The store mirrors
 // the state values in a CHECK constraint; keep both in sync.
 var transitions = map[State][]State{
