@@ -76,7 +76,7 @@ export function checkKubectlArgs(args: string[]): boolean {
   return rest.every((s) => /^[a-z0-9][a-z0-9.-]*$/.test(s) || /^--output=(json|yaml|wide)$/.test(s) || /^--sort-by=\.metadata\.creationTimestamp$/.test(s));
 }
 
-/** Fixed kubeconfig/namespace, no shell, credentials, exec, port-forward or arbitrary flags. */
+/** Fixed kubeconfig/namespace; no model-controlled shell, credential reads, exec or arbitrary flags. */
 export function kubectlTool(access: () => PreviewAccess | undefined) {
   return defineTool({
     name: "kubectl", label: "Inspect preview",

@@ -187,6 +187,7 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 | [故障 PR #10](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10)，head `e56c7c0` | readiness 路径为不存在的 `/readyz`；Pod 为 `0/1 Running`，事件为 `HTTP probe failed with statuscode: 404` |
 | agent 运行时验证 | 成功调用 `kubectl get pods`、`get deployments`、`get events` 和 `logs`；日志显示 `GET /readyz` 与 `GET /healthz`；Deployment JSON 确认两个探针的实际路径 |
 | [最终 Review](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10#pullrequestreview-5632292229) | `request_changes`，GitHub COMMENT，1 条逐行评论；端到端 217 秒，花费 $0.018352 |
+| 合入 M4 后复验：PR #10，head `f296c6f` | [Review 5632561250](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10#pullrequestreview-5632561250)：agent 通过 5 次 kubectl 检查确认探针 HTTP 404，`request_changes`；端到端 209 秒，花费 $0.015488；run `8563a6ae-06da-40f1-845b-5e0b91102cb9` |
 | 正常对照：PR #9，head `dd2ef5a` | Pod `1/1 Ready`，agent 读取 Pod、日志、事件后 APPROVE；端到端 362 秒，花费 $0.151225（包含整个 M5 实现的代码评审） |
 | 关闭清理 | 故障 PR 关闭后，controller 自动删除 namespace；没有手工删除或清理 finalizer |
 | 镜像 | CI 发布完整 head SHA 的 amd64/arm64 镜像；使用空 Docker 配置验证匿名获取，无需给预览应用提供镜像仓库凭据 |
