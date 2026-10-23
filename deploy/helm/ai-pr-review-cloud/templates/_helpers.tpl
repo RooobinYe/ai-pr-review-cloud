@@ -23,6 +23,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- .Values.github.existingSecret | default (printf "%s-github" (include "aprc.fullname" .)) -}}
 {{- end -}}
 
+{{- define "aprc.llmSecret" -}}
+{{- .Values.llm.existingSecret | default (printf "%s-llm" (include "aprc.fullname" .)) -}}
+{{- end -}}
+
 {{- define "aprc.databaseSecret" -}}
 {{- if .Values.postgres.dev.enabled -}}
 {{ include "aprc.fullname" . }}-database

@@ -2,7 +2,7 @@
 
 装在 GitHub 上、跑在 Kubernetes 上的 AI PR 评审服务。PR 打开或更新时自动触发，每个 PR 在独立的 Pod 里由 agent 探索代码并给出结构化结论，结果以 Check Run 和 PR Review 呈现。AI 像人类审批人一样投票：没问题时提交 approve，可以计入"需要 N 个 approval"；有问题时只留评论、不阻塞合并。可按仓库开启自动合并和预览环境验证。
 
-> 状态：M0 完成。runner 可以在本地评审任意 GitHub PR；集群闭环按 [roadmap](docs/roadmap.md) 逐步实现。
+> 状态：M1 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
 
 ## 架构
 
@@ -41,7 +41,35 @@ make kind-up
 make deploy
 ```
 
-`make deploy` 会构建 4 个镜像、加载进 Kind，并用 Helm 安装到 `ai-pr-review-cloud` 命名空间（附带一个仅供开发用的 PostgreSQL）。
+`make deploy` 会构建 4 个镜像、加载进 Kind，并用 Helm 安装到 `ai-pr-review-cloud` 命名空间（附带一个仅供开发用的 PostgreSQL）。不设置下面的环境变量也能部署，只是 run 会停在排队状态。
+
+### 接入 GitHub
+
+1. 新建一个 smee.io 通道（打开 https://smee.io/new），记下地址。
+2. 在 GitHub 的 Settings → Developer settings → GitHub Apps 注册一个 App：
+   - Webhook URL 填 smee 通道地址，Webhook secret 自己生成一个随机串；
+   - Repository 权限：Pull requests 读写、Checks 读写、Contents 读写、Metadata 只读（Contents 必须可写，否则 bot 的 APPROVE 不计入分支保护要求的审批数）；
+   - 订阅事件：Pull request、Issue comment、Pull request review。
+3. 生成私钥（.pem，放在仓库外），把 App 安装到要评审的仓库。
+4. 设置环境变量后部署，再启动转发：
+
+```bash
+export GITHUB_APP_ID=<App ID> GITHUB_APP_PRIVATE_KEY_FILE=<.pem 路径> GITHUB_WEBHOOK_SECRET=<webhook secret> LLM_API_KEY=<DeepSeek API key>
+```
+
+```bash
+make deploy
+```
+
+```bash
+make webhook-forward SMEE_URL=<smee 通道地址>
+```
+
+之后在仓库里开 PR，几分钟内会出现 "AI Review" Check Run 和 bot 的评审。结论为 approve 时 bot 提交 APPROVE，可以计入分支保护要求的审批数；发现问题时只提交 COMMENT，不阻塞合并。查看进度：
+
+```bash
+kubectl -n ai-pr-review-cloud logs deploy/ai-pr-review-cloud-controller -f
+```
 
 runner 也可以脱离集群单独运行（本地模式）：评审一个 PR，把结论打印到 stdout。默认使用 DeepSeek 的 `deepseek-flash`，其他模型和参数见 [架构 §4.5](docs/architecture.md#45-模型接入)。
 

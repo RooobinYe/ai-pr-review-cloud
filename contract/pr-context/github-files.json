@@ -1,0 +1,37 @@
+[
+  {
+    "filename": "src/server.go",
+    "status": "modified",
+    "additions": 2,
+    "deletions": 1,
+    "patch": "@@ -10,4 +10,5 @@ func serve() {\n \tmux := http.NewServeMux()\n-\tmux.Handle(\"/\", h)\n+\tmux.Handle(\"/\", logged(h))\n+\tmux.Handle(\"/healthz\", ok)\n \treturn mux"
+  },
+  {
+    "filename": "pkg/new_name.go",
+    "previous_filename": "pkg/old_name.go",
+    "status": "renamed",
+    "additions": 1,
+    "deletions": 1,
+    "patch": "@@ -1,3 +1,3 @@\n-package old\n+package pkg\n \n import \"fmt\""
+  },
+  {
+    "filename": "docs/added.md",
+    "status": "added",
+    "additions": 2,
+    "deletions": 0,
+    "patch": "@@ -0,0 +1,2 @@\n+# Added\n+text"
+  },
+  {
+    "filename": "legacy.txt",
+    "status": "removed",
+    "additions": 0,
+    "deletions": 1,
+    "patch": "@@ -1 +0,0 @@\n-bye"
+  },
+  {
+    "filename": "logo.png",
+    "status": "added",
+    "additions": 0,
+    "deletions": 0
+  }
+]

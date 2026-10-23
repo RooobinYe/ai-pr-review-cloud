@@ -5,10 +5,35 @@ image:
   pullPolicy: IfNotPresent
 
 github:
-  # Existing Secret with key `webhook-secret` (later also `app-id` and `private-key`).
+  # Existing Secret with keys `webhook-secret`, `app-id` and `private-key`.
   existingSecret: ""
   # Used to create that Secret when existingSecret is empty. Development only.
   webhookSecret: ""
+  appId: ""
+  # The App's PEM private key; pass it with --set-file github.privateKey=<path>.
+  # Without appId and privateKey the controller starts but leaves runs queued.
+  privateKey: ""
+
+llm:
+  # Existing Secret with key `LLM_API_KEY`, handed to runner Pods.
+  # M2 replaces it with per-run LiteLLM virtual keys.
+  existingSecret: ""
+  # Used to create that Secret when existingSecret is empty. Development only.
+  apiKey: ""
+  provider: deepseek
+  model: deepseek-flash
+  baseUrl: ""
+  thinking: high
+
+runs:
+  # Budget recorded for each run until repositories configure their own (M4).
+  budgetUSD: 0.5
+  # Runs with a live runner Job; the rest wait in the queue.
+  maxRunning: 4
+  # Language of review comments.
+  language: English
+  # Hard limit on one runner Job (activeDeadlineSeconds).
+  deadlineSeconds: 1800
 
 database:
   # Existing Secret with key `DATABASE_URL`. Ignored when postgres.dev.enabled is true.
@@ -32,3 +57,8 @@ controller:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { memory: 256Mi }
+
+runner:
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 1536Mi }

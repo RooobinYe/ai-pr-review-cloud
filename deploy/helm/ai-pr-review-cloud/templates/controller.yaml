@@ -5,7 +5,8 @@ metadata:
   name: {{ include "aprc.fullname" . }}-controller
   labels: {{- include "aprc.labels" . | nindent 4 }}
 ---
-# The controller creates and observes runner Jobs in its own namespace.
+# The controller creates and observes runner Jobs in its own namespace, and
+# creates each Job's Secret holding fetch's read-only GitHub token.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -20,7 +21,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete"]
+    verbs: ["create", "get", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -63,15 +64,43 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef: { name: {{ include "aprc.databaseSecret" . }}, key: DATABASE_URL }
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.githubSecret" . }}, key: app-id, optional: true }
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.githubSecret" . }}, key: private-key, optional: true }
             - name: RUNNER_IMAGE
               value: {{ include "aprc.image" (dict "root" . "component" "runner") }}
             - name: FETCH_IMAGE
               value: {{ include "aprc.image" (dict "root" . "component" "fetch") }}
+            - name: IMAGE_PULL_POLICY
+              value: {{ .Values.image.pullPolicy }}
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef: { fieldPath: metadata.namespace }
+            - name: CONTROLLER_URL
+              value: {{ printf "http://%s-controller.%s.svc" (include "aprc.fullname" .) .Release.Namespace | quote }}
+            - name: LLM_SECRET
+              value: {{ include "aprc.llmSecret" . }}
+            - name: LLM_PROVIDER
+              value: {{ .Values.llm.provider | quote }}
+            - name: LLM_MODEL
+              value: {{ .Values.llm.model | quote }}
+            - name: LLM_BASE_URL
+              value: {{ .Values.llm.baseUrl | quote }}
+            - name: LLM_THINKING
+              value: {{ .Values.llm.thinking | quote }}
+            - name: REVIEW_LANGUAGE
+              value: {{ .Values.runs.language | quote }}
+            - name: MAX_RUNNING
+              value: {{ .Values.runs.maxRunning | quote }}
+            - name: RUNNER_DEADLINE_SECONDS
+              value: {{ .Values.runs.deadlineSeconds | quote }}
+            - name: RUNNER_RESOURCES
+              value: {{ toJson .Values.runner.resources | quote }}
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
           livenessProbe:
             httpGet: { path: /healthz, port: http }
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
