@@ -136,3 +136,5 @@ preview:
   enabled: false
   # Include Kubernetes Service IP and API endpoint IPs (CNI DNAT behavior varies).
   apiServerCIDRs: []
+  # Trusted repo -> image repository mapping; PR content cannot override this.
+  imageRepositories: {}

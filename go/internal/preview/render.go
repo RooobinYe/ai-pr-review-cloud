@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,7 +22,22 @@ type Bundle struct {
 type Object = map[string]any
 
 // Render never executes PR programs or Helm plugins. Dependencies must be vendored.
-func Render(ctx context.Context, bundle Bundle, sha, namespace string) ([]Object, Config, error) {
+var ErrInput = errors.New("invalid preview input")
+var errInfrastructure = errors.New("preview renderer infrastructure")
+
+func Render(ctx context.Context, bundle Bundle, sha, namespace, repository string) ([]Object, Config, error) {
+	objects, cfg, err := render(ctx, bundle, sha, namespace, repository)
+	if err != nil && !errors.Is(err, errInfrastructure) {
+		err = fmt.Errorf("%w: %w", ErrInput, err)
+	}
+	return objects, cfg, err
+}
+
+func render(ctx context.Context, bundle Bundle, sha, namespace, repository string) ([]Object, Config, error) {
+	if repository == "" {
+		return nil, Config{}, fmt.Errorf("expected image repository is required")
+	}
+
 	cfg, err := Parse([]byte(bundle.Files[".ai-pr-review.yaml"]))
 	if err != nil || !cfg.Enabled {
 		return nil, cfg, err
@@ -31,7 +47,7 @@ func Render(ctx context.Context, bundle Bundle, sha, namespace string) ([]Object
 	}
 	dir, err := os.MkdirTemp("", "preview-")
 	if err != nil {
-		return nil, cfg, err
+		return nil, cfg, fmt.Errorf("%w: %w", errInfrastructure, err)
 	}
 	defer os.RemoveAll(dir)
 	total := 0
@@ -45,22 +61,26 @@ func Render(ctx context.Context, bundle Bundle, sha, namespace string) ([]Object
 		}
 		target := filepath.Join(dir, name)
 		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-			return nil, cfg, err
+			return nil, cfg, fmt.Errorf("%w: %w", errInfrastructure, err)
 		}
 		if err := os.WriteFile(target, []byte(content), 0600); err != nil {
-			return nil, cfg, err
+			return nil, cfg, fmt.Errorf("%w: %w", errInfrastructure, err)
 		}
 	}
 	args := []string{"template", "preview", filepath.Join(dir, cfg.Helm.Chart), "--namespace", namespace, "--skip-tests", "--skip-schema-validation"}
 	if cfg.Helm.ValuesFile != "" {
 		args = append(args, "--values", filepath.Join(dir, cfg.Helm.ValuesFile))
 	}
-	args = append(args, "--set-string", "image.tag="+sha)
+	args = append(args, "--set-string", "image.tag="+sha, "--set-string", "image.repository="+repository)
 	cmd := exec.CommandContext(ctx, "helm", args...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "HELM_PLUGINS=" + filepath.Join(dir, "no-plugins")}
 	var stdout, stderr cappedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if ctx.Err() != nil || !errors.As(err, &exitErr) {
+			return nil, cfg, fmt.Errorf("%w: %v", errInfrastructure, err)
+		}
 		return nil, cfg, fmt.Errorf("helm template: %w: %s", err, stderr.String())
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(stdout.Bytes()))
@@ -84,8 +104,8 @@ func Render(ctx context.Context, bundle Bundle, sha, namespace string) ([]Object
 			for _, v := range containers {
 				c, _ := v.(map[string]any)
 				image, _ := c["image"].(string)
-				if !strings.HasSuffix(image, ":"+sha) {
-					return nil, cfg, fmt.Errorf("preview image must use the PR head SHA tag")
+				if image != repository+":"+sha {
+					return nil, cfg, fmt.Errorf("preview image must use the operator-approved repository and PR head SHA tag")
 				}
 			}
 		}

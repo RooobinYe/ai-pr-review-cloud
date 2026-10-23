@@ -76,7 +76,7 @@ func TestPreviewReadyAndTimeoutKeepReadOnlyEvidenceAccess(t *testing.T) {
 			if err := os.WriteFile(ca, []byte("test CA"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			h.c.cfg.Preview = &PreviewConfig{Kube: &kube.Client{Host: server.URL, Namespace: "reviews", HTTP: server.Client()}, CAFile: ca}
+			h.c.cfg.Preview = &PreviewConfig{Kube: &kube.Client{Host: server.URL, Namespace: "reviews", HTTP: server.Client()}, CAFile: ca, ImageRepositories: map[string]string{"o/r": "ghcr.io/rooobinye/ai-pr-review-cloud-preview"}}
 			body, _ := json.Marshal(previewBundle(t))
 			rec := h.call("POST", "/runs/"+runID+"/preview", h.runToken(), body)
 			if rec.Code != 200 {
@@ -106,7 +106,7 @@ func TestPreviewRejectsUnauthenticatedDisabledAndStaleRequests(t *testing.T) {
 	if got := h.call("POST", "/runs/"+runID+"/preview", h.runToken(), body).Code; got != 422 {
 		t.Fatal(got)
 	}
-	h.c.cfg.Preview = &PreviewConfig{}
+	h.c.cfg.Preview = &PreviewConfig{ImageRepositories: map[string]string{"o/r": "ghcr.io/rooobinye/ai-pr-review-cloud-preview"}}
 	h.gh.head = oldSHA
 	if got := h.call("POST", "/runs/"+runID+"/preview", h.runToken(), body).Code; got != 409 {
 		t.Fatal(got)

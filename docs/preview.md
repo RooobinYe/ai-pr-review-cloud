@@ -20,7 +20,9 @@
 
 ## 开启服务端预览
 
-服务端 Helm chart 默认关闭预览。开启需要 `preview.enabled=true`，并配置 `preview.apiServerCIDRs`。列表必须包含 Kubernetes Service IP 和实际 API endpoint IP；不同 CNI 对 Service 地址转换的处理不同。端口仅放行 TCP 443 和 6443。
+服务端 Helm chart 默认关闭预览。开启需要 `preview.enabled=true`，并配置 `preview.apiServerCIDRs`。同时配置操作者维护的 `preview.imageRepositories`，将 GitHub 仓库映射到可信镜像仓库。PR 无法更改此映射。
+
+网络列表必须包含 Kubernetes Service IP 和实际 API endpoint IP；不同 CNI 对 Service 地址转换的处理不同。端口仅放行 TCP 443 和 6443。
 
 查询地址不需要读取任何 Secret：
 
@@ -35,6 +37,7 @@ kubectl get endpointslice -n default -l kubernetes.io/service-name=kubernetes -o
 helm upgrade ai-pr-review-cloud deploy/helm/ai-pr-review-cloud \
   --namespace ai-pr-review-cloud --reuse-values \
   --set preview.enabled=true \
+  --set-json 'preview.imageRepositories={"RooobinYe/ai-pr-review-cloud":"ghcr.io/rooobinye/ai-pr-review-cloud-preview"}' \
   --set 'preview.apiServerCIDRs[0]=10.96.0.1/32' \
   --set 'preview.apiServerCIDRs[1]=172.18.0.2/32' \
   --set image.tag=<已加载或已发布的新镜像标签> \
@@ -62,9 +65,11 @@ preview:
   readyTimeout: 2m
 ```
 
+仓库要求预览但服务端未开启，或未配置可信镜像仓库时，评审会明确失败。不会静默跳过必需的运行时验证。
+
 `readyTimeout` 默认 5 分钟，允许 1 秒至 10 分钟。部署等待计入 runner Job 的总时限。镜像尚未发布时，Kubernetes 会重试拉取；镜像等待也计入 readiness 时限。超时后不立即删除应用，agent 可以继续诊断。
 
-初版支持自包含的 Helm chart。controller 离线运行 `helm template`，不下载依赖或运行插件，不执行 schema 的外部引用。它强制设置 `image.tag=<head_sha>`，并检查实际 Deployment 镜像使用该标签。chart 文件最多 100 个，总内容最多 1 MiB，渲染结果最多 30 个资源。
+初版支持自包含的 Helm chart。controller 离线运行 `helm template`，不下载依赖或运行插件，不执行 schema 的外部引用。它强制设置操作者指定的 `image.repository` 和 `image.tag=<head_sha>`，并检查实际 Deployment 镜像完整匹配仓库和标签。SHA 标签是 CI 约定，不等同于镜像签名或不可变 digest 证明。chart 文件最多 100 个，总内容最多 1 MiB，渲染结果最多 30 个资源。
 
 允许的资源是 Deployment、ClusterIP Service 和 ConfigMap。不支持 chart 自带的 Secret、RBAC、hook、外部 Service、卷、init container、自定义 ServiceAccount 或 Pod 注解。预览应用没有 ServiceAccount token，使用 Restricted Pod Security admission、ResourceQuota 和默认拒绝网络策略。初版适合不依赖外部服务的演示应用。
 

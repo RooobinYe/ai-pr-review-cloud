@@ -17,7 +17,7 @@ lint:
 	cd go && test -z "$$(gofmt -l .)" && go vet ./...
 	cd runner && npm run -s typecheck
 	helm lint $(CHART) --set github.webhookSecret=lint
-	helm lint $(CHART) --set github.webhookSecret=lint --set preview.enabled=true --set 'preview.apiServerCIDRs[0]=192.0.2.1/32'
+	helm lint $(CHART) --set github.webhookSecret=lint --set preview.enabled=true --set 'preview.apiServerCIDRs[0]=192.0.2.1/32' --set 'preview.imageRepositories.test/repo=registry.example/test'
 	helm lint demo/preview/chart
 
 images: $(addprefix image-,$(GO_CMDS)) image-runner
