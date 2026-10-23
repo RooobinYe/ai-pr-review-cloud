@@ -11,7 +11,7 @@
 | [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论；结论为 approve 时 AI 投出的 APPROVE 计入必需审批数 | ✅ 完成 |
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
-| [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
+| [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | ✅ 完成 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
 | [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | ✅ 完成 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
@@ -146,12 +146,24 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：默认的 `vote` 模式只投票、不合并；仓库可以选择让 AI 结论驱动合并，等待人工时不占算力。
 
-- [ ] 解析仓库根目录的 `.ai-pr-review.yaml`（`approvalMode`、`failOn`、`budgetUSD`、`language`），缺省时 `approvalMode` 为 `vote`。
-- [ ] `failOn` 校验：存在 `severity` 达到阈值的评论时，把 approve 改写为 request_changes，即只发 COMMENT、不投 APPROVE。
-- [ ] `decideMerge` 与 auto 模式的合并执行。
-- [ ] manual 模式：进入 `awaiting_approval`，接收 `/merge` 评论和人工 approve（`issue_comment`、`pull_request_review` 事件）。
+- [x] 解析仓库根目录的 `.ai-pr-review.yaml`（`approvalMode`、`failOn`、`budgetUSD`、`language`），缺省时 `approvalMode` 为 `vote`。
+- [x] `failOn` 校验：存在 `severity` 达到阈值的评论时，把 approve 改写为 request_changes，即只发 COMMENT、不投 APPROVE。
+- [x] `decideMerge` 与 auto 模式的合并执行。
+- [x] manual 模式：进入 `awaiting_approval`，接收 `/merge` 评论和人工 approve（`issue_comment`、`pull_request_review` 事件）。
 
 验收：没有配置文件时只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间没有 runner Pod，评论 `/merge` 后合并。
+
+验收记录（2026-10-24，本仓库独立测试分支，Kind，`deepseek/deepseek-flash`，thinking high；每个 run 预算 $0.10）：
+
+| PR / 模式 | 触发与结果 | 耗时 / 花费 |
+| --- | --- | --- |
+| [#11](https://github.com/RooobinYe/ai-pr-review-cloud/pull/11)，默认 `vote` | base 无配置文件；真实 webhook 触发，APPROVE、Check Run success，run 到 `done`，PR 保持未合并；验收后关闭 | 33s（评审 29s） / $0.0044 |
+| [#12](https://github.com/RooobinYe/ai-pr-review-cloud/pull/12)，`auto` | 从 base SHA 读取配置，APPROVE 后由 App squash 合并，run 到 `done` | 52s（评审 17s） / $0.0022 |
+| [#13](https://github.com/RooobinYe/ai-pr-review-cloud/pull/13)，`manual` | APPROVE 后进入 `awaiting_approval`，Job、Pod 与本次凭据 Secret 已删除；重启 controller 后仍等待且无 runner Pod；有写权限的用户评论 [`/merge`](https://github.com/RooobinYe/ai-pr-review-cloud/pull/13#issuecomment-6370973909) 后由 App squash 合并 | 109s（评审 23s，含排队、重启和等待确认） / $0.0032 |
+
+三次均使用真实 GitHub App、数据库、runner 和模型，APPROVE 均无逐行评论；auto/manual 的合并者为 `ai-pr-review-cloud-robin[bot]`。总耗时从收到 webhook 到 run 终态计算，评审耗时从领取到结果回调计算，费用取 runner 上报用量。验收使用独立 namespace、数据库和测试目标分支，结束后已清理；未合并到 `main`。人工 review approve 路径由自动化测试覆盖，本次真实人工确认验证的是 `/merge`。
+
+`make test`（真实 PostgreSQL）和 `make lint` 通过。测试沿用 #1/#2 的风格：纯逻辑使用明确预期的表驱动用例，controller 分别验证状态和外部副作用，覆盖配置快照、阈值边界、确认权限、旧 head、合并拒绝与崩溃恢复；故意允许 vote 合并、跳过阈值相等两种回归均会使对应测试失败。
 
 ## M5 预览环境验证
 
