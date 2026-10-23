@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -167,13 +168,22 @@ func secretRef(jobName, key string) *kube.EnvVarSource {
 }
 
 // egressProxyURL is fetch's proxy: the controller, authenticated as the run
-// with the proxy token only fetch can read.
+// with the proxy token only fetch can read. The port is always explicit:
+// git's libcurl assumes 1080 for a proxy without one, Go assumes 80.
 func egressProxyURL(controllerURL, runID string) string {
 	scheme, host, ok := strings.Cut(controllerURL, "://")
 	if !ok {
 		scheme, host = "http", controllerURL
 	}
-	return fmt.Sprintf("%s://%s:$(PROXY_TOKEN)@%s", scheme, runID, strings.TrimSuffix(host, "/"))
+	host = strings.TrimSuffix(host, "/")
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "80"
+		if scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+	return fmt.Sprintf("%s://%s:$(PROXY_TOKEN)@%s", scheme, runID, host)
 }
 
 // RunCredentials are minted for each attempt of a run. Each key of the run

@@ -77,8 +77,17 @@ func TestBuildJob(t *testing.T) {
 	if fetchEnv["PR_NUMBER"].Value != "7" || fetchEnv["HEAD_SHA"].Value != headSHA {
 		t.Errorf("fetch env %+v", fetchEnv)
 	}
-	if got := fetchEnv["HTTPS_PROXY"].Value; got != "http://"+runID+":$(PROXY_TOKEN)@ctl.ns.svc" {
+	if got := fetchEnv["HTTPS_PROXY"].Value; got != "http://"+runID+":$(PROXY_TOKEN)@ctl.ns.svc:80" {
 		t.Errorf("fetch proxy %q", got)
+	}
+	for in, want := range map[string]string{
+		"http://ctl:8080": "http://r:$(PROXY_TOKEN)@ctl:8080",
+		"https://ctl/":    "https://r:$(PROXY_TOKEN)@ctl:443",
+		"ctl":             "http://r:$(PROXY_TOKEN)@ctl:80",
+	} {
+		if got := egressProxyURL(in, "r"); got != want {
+			t.Errorf("egressProxyURL(%q) = %q, want %q", in, got, want)
+		}
 	}
 	if fetchEnv["PROXY_TOKEN"].ValueFrom.SecretKeyRef.Key != "PROXY_TOKEN" || indexOf(spec.InitContainers[0].Env, "PROXY_TOKEN") > indexOf(spec.InitContainers[0].Env, "HTTPS_PROXY") {
 		t.Error("PROXY_TOKEN must be defined before HTTPS_PROXY refers to it")
