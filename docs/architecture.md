@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：骨架已就绪，评审流程按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M0 完成，runner 本地模式可用；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -27,7 +27,7 @@ ai-pr-review v1 是一个本地 / CI 里运行的 CLI：输入 PR URL，克隆�
 
 ## 1. 场景定位
 
-**基础能力：PR 评审。** 沿用 v1 验证过的两阶段评审和 schema v2 输出，结果以 PR Review 评论和 Check Run 的形式呈现。
+**基础能力：PR 评审。** 沿用 v1 验证过的两阶段评审（先探索、再结论）。结论由模型自己决定：approve 还是 request_changes，加上一段评审正文和逐行评论，以 PR Review 和 Check Run 的形式呈现（§4.4）。
 
 **差异化能力：预览环境验证（按仓库开启）。** 只看代码看不出的问题，在运行起来以后才暴露：配置错误、镜像起不来、探针失败、资源不足、依赖服务连不上。开启后，controller 为 PR 创建独立的 namespace 并部署，agent 用 kubectl 查看 Pod 状态、事件和日志，把运行时证据和代码评审结论合在一起，再给出结论。
 
@@ -132,40 +132,32 @@ Pod (Job: review-<run-id>)
 沿用 v1 的两阶段思路，但第二阶段从"让模型输出一段 JSON 再解析"改为"调用一个带 schema 的工具"，彻底消除 JSON 解析失败的情况。
 
 1. 读 `/workspace/pr.json`，构造系统提示词和用户提示词。提示词按 v1 的防幻觉规则重写，放在 `runner/src/prompts.ts`。
-2. **探索阶段**：内置工具 `read`、`grep`、`find`、`bash`，`cwd` 为 `/workspace/repo`。
-3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时 `bash` 里的 `kubectl` 只能访问这个 namespace。
-4. **提交阶段**：模型调用 `submit_review`，参数即 schema v2 的 `ReviewOutput` 加 `verdict`，工具的 `execute` 把结果 POST 给 controller。若模型结束时没调用，追加一次提示要求提交，最多 2 次，之后判为失败。
-5. 结束 session，进程以 0 退出。
+2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
+3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才加入 `bash`，其中的 `kubectl` 只能访问这个 namespace。
+4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。
+5. 结束 session，进程以 0 退出。集群模式把结果 POST 给 controller（M1）。
 
-本地模式（`--pr <url>`）走同样的流程，只是第 1 步自己拉取 PR，第 4 步把结果打印到 stdout。
+本地模式（`--pr <url>`）走同样的流程，只是第 1 步自己用 GitHub API 拉取 PR、部分克隆（`--filter=blob:none`，head 往前 20 个提交加 base 提交）到临时目录，最后把结果按 `--format markdown|json` 打印到 stdout，token 与金额打印到 stderr。
 
-以下示例基于 pi SDK `1.3.0`（`runner/package.json` 精确锁定），其中 `createAgentSession`、`defineTool`、`SessionManager`、`ModelRuntime` 均已确认可导入：
+prompt 和资源完全由 runner 提供：不使用 pi 默认的资源发现，被评审仓库里的 `AGENTS.md`、`.pi/` 扩展和技能都不会加载。它们是 PR 作者可控的内容，加载扩展等于执行 PR 里的代码。PR 标题、描述和 diff 在提示词里用 `*_untrusted` 标签包起来，并转义其中伪造的闭合标签。
+
+以下摘自 `runner/src/review.ts`，基于 pi SDK `1.3.0`（`runner/package.json` 精确锁定）：
 
 ```ts
-import { createAgentSession, defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
-import { ReviewOutputSchema } from "./schema.ts"; // TypeBox，与 Go 侧 schema v2 对齐
-
-const submitReview = defineTool({
-  name: "submit_review",
-  label: "Submit review",
-  description: "Submit the final structured review. Call exactly once when done.",
-  parameters: ReviewOutputSchema, // schema v2 外加 verdict
-  execute: async (_id, params) => {
-    await controller.postResult(runId, params);
-    submitted = true;
-    return { content: [{ type: "text", text: "Review submitted." }], details: {} };
-  },
-});
-
 const { session } = await createAgentSession({
-  cwd: "/workspace/repo",
+  cwd,
+  agentDir,                                          // 临时目录，不读 ~/.pi
   model,
   modelRuntime,
-  tools: ["read", "grep", "find", "bash", "submit_review"],
-  customTools: [submitReview],
-  sessionManager: await restoreOrCreateSession(runId), // 有快照用 SessionManager.open，否则 create，见 4.3
+  thinkingLevel,
+  resourceLoader: isolatedResources(systemPrompt(language)),
+  sessionManager: SessionManager.inMemory(cwd),      // M3 换成可恢复的 session，见 4.3
+  settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 3 } }),
+  tools: ["read", "grep", "find", "ls", "git", "submit_review"],
+  customTools: [gitTool(cwd), submitReviewTool(commentableLines(pr.diff), onSubmit)],
 });
 
+// 集群模式（M1、M3）：每轮结束上报快照和用量
 session.subscribe(async (e) => {
   if (e.type === "turn_end") {
     await controller.putSession(runId, await readSessionFile());   // 崩溃恢复快照
@@ -173,7 +165,8 @@ session.subscribe(async (e) => {
   }
 });
 
-await session.prompt(userPrompt);
+await session.prompt(userPrompt(pr));
+for (let i = 0; !submitted && i < MAX_SUBMIT_REMINDERS; i++) await session.prompt(SUBMIT_REMINDER);
 ```
 
 ### 4.3 崩溃恢复
@@ -186,6 +179,44 @@ await session.prompt(userPrompt);
 | `submit_review` 已调用但进程在退出前崩溃 | controller 已收到结果并推进到 `reviewed`，Job 失败被忽略 |
 | controller 重启 | 状态全在数据库，重新扫描即可；`github_action` 保证不重复评论 |
 | 超过 `attempt` 上限或总时长 | 状态置为 `failed`，在 Check Run 上标记失败并给出原因 |
+
+### 4.4 评审结论：模型决定，形状对齐 GitHub Review
+
+结论由模型自己给出：它读完代码后决定 approve 还是 request_changes，并直接写出给人看的评审正文。runner 不再像 v1 那样让模型填一份 `must_fix` / `points_of_interest` 报告、再由程序拼成 Markdown。
+
+但这个决定仍然要以结构化数据交出来，而不是让模型自己去点 GitHub 的 Approve：
+
+- runner 没有 GitHub 凭据（§5），所有写操作集中在 controller，结论只能作为数据交给它；
+- controller 要靠 `verdict` 推进状态机（`reviewed` → `merging` / `awaiting_approval` / `done`）；
+- 逐行评论需要 `path` 和 `line`；`failOn` 门禁需要 `severity`。
+
+所以结构只保留机器真正用到的字段，其余都是模型写的 Markdown。形状和一次 GitHub PR Review 一一对应：
+
+| 字段 | 含义 | 去向 |
+| --- | --- | --- |
+| `verdict` | `approve` / `request_changes` | 状态机；`APPROVE` 或 `REQUEST_CHANGES` review |
+| `body` | Markdown 正文：改了什么、结论理由、验证了什么、没看的部分、自检行 | review 正文、Check Run 摘要 |
+| `comments[]` | `path`、`line`（新文件行号）、`severity`（critical/high/medium/low）、`confidence`（high/medium/low）、`body` | 逐行评论；`severity` 供 `failOn` 使用 |
+
+runner 交给 controller 的 `ReviewResult` 在此之外加上 `schema_version: 3`、`pr`（`repo`、`number`、`head_sha`，controller 用来拒绝不属于当前 run 的结果）、`model`、`generated_at`。评论最多 15 条，所有字段必填，不允许多余字段。
+
+两侧定义：TypeScript 在 [`runner/src/schema.ts`](../runner/src/schema.ts)（TypeBox，同时作为 `submit_review` 的参数 schema），Go 在 [`go/internal/review`](../go/internal/review/review.go)。[`contract/review-result.schema.json`](../contract/review-result.schema.json) 由 TypeBox 生成，`contract/examples/` 里的合法、非法样例由两侧测试共同校验；Go 测试还会核对字段、枚举、上限与生成的 schema 一致，并检查 `verdict` 取值与数据库 CHECK 约束一致。
+
+提示词里的判定规则（`verdict_policy`）：存在中高置信度的 critical 或 high 问题时 request_changes；中低级别、风格建议和不确定的发现只作为评论，不阻塞合并；没能审到最可能出问题的部分时也应 request_changes 并说明原因。防幻觉规则沿用 v1：每条评论必须引用读到的代码，不确定的标 `[Uncertain]` 并给低置信度，critical/high 要做反向检验。
+
+### 4.5 模型接入
+
+runner 通过环境变量选择模型，`ModelRuntime` 不读写 `~/.pi`：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LLM_API_KEY` | — | 必填。集群模式下是 LiteLLM 虚拟 key（M2） |
+| `LLM_PROVIDER` | `deepseek` | pi 内置 provider 保留其模型目录（价格、兼容参数）；其他名称按 OpenAI 兼容接口注册 |
+| `LLM_MODEL` | `deepseek-flash` | |
+| `LLM_BASE_URL` | — | 覆盖 provider 地址，集群模式指向 LiteLLM |
+| `LLM_THINKING` | `high` | `off` 到 `max` |
+
+花费按 pi 模型目录的单价计算，`usage` 含 `input`、`output`、`cacheRead`、`cacheWrite`、`cost.total`。DeepSeek 会返回缓存命中量：M0 验收的三个 PR 里，缓存读取的 token 是非缓存输入的 11 到 14 倍。
 
 ## 5. 安全边界
 
@@ -237,7 +268,7 @@ func decideMerge(run ReviewRun, cfg RepoConfig) bool {
 | --- | --- |
 | 订阅事件 | `pull_request`（opened、synchronize、reopened、closed）、`issue_comment`（`/review`、`/merge`）、`pull_request_review` |
 | 权限 | Pull requests: write、Contents: write（合并）、Checks: write、Metadata: read |
-| 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review 带逐行评论（来自 `must_fix` / `points_of_interest` 每条的 `file`、`line`）；结论为 approve 时提交 APPROVE review |
+| 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review，正文为结论的 `body`，逐行评论来自 `comments` 的 `path`、`line`；review 事件按 `verdict` 取 APPROVE 或 REQUEST_CHANGES |
 
 gateway 目前已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发；`closed`、`issue_comment`、`pull_request_review` 在 M1 和 M4 接入。
 
@@ -245,7 +276,7 @@ gateway 目前已实现签名校验（`X-Hub-Signature-256`）和 `pull_request`
 
 ```yaml
 approvalMode: auto        # auto | manual
-failOn: high              # 有该级别及以上的 must_fix 时结论必须为 request_changes
+failOn: high              # 有该级别及以上的评论时结论必须为 request_changes
 budgetUSD: 0.50           # 单个 run 的预算上限
 language: zh              # 评论语言
 preview:
@@ -256,7 +287,7 @@ preview:
   readyTimeout: 5m
 ```
 
-`failOn` 在 controller 里对 `result.must_fix` 做确定性校验：模型给了 approve 但存在超标的 must_fix 时，结论改写为 request_changes。这是把原 CLI 的 `--fail-on` 门禁搬到服务端。
+`failOn` 在 controller 里对 `result.comments` 做确定性校验：模型给了 approve 但存在 `severity` 达到阈值的评论时，结论改写为 request_changes。这是把原 CLI 的 `--fail-on` 门禁搬到服务端，作为模型判断之外的一道确定性兜底。
 
 ## 7. 可观测性与成本
 
@@ -292,9 +323,9 @@ preview:
 
 | 沿用自 v1 | 在本项目中的形态 |
 | --- | --- |
-| 两阶段评审：先用工具探索仓库，再给出结构化结论 | runner 的探索阶段 + `submit_review` 工具（§4.2） |
+| 两阶段评审：先用工具探索仓库，再给出结构化结论 | runner 的探索阶段 + `submit_review` 工具（§4.2）；模型直接给出 verdict |
 | 评审提示词与防幻觉规则（XML 结构、证据要求、置信度说明） | runner 的系统提示词，按新流程重写 |
-| 输出 schema v2：`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version` | `submit_review` 的参数 schema，Go 与 TS 两侧各定义一份并用契约测试对齐 |
+| 输出 schema v2：`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version` | 改为 schema v3（§4.4）：保留严重级别和置信度，`must_fix` 的判断交给模型的 `verdict`，报告式字段换成模型直接写的正文和逐行评论；Go 与 TS 两侧用契约测试对齐 |
 | `--fail-on` 质量门禁 | controller 里对 `must_fix` 的确定性校验（§6.5） |
 | 按文件类型分类改动（code / test / config / doc） | 提示词里的文件分类与评论分组 |
 
@@ -309,12 +340,19 @@ ai-pr-review-cloud/
 │   ├── cmd/controller/              # 状态机驱动（目前只有健康检查）
 │   ├── cmd/fetch/                   # runner 的 init 容器（目前只校验参数）
 │   ├── internal/githubapp/          # webhook 签名、事件到触发的转换
+│   ├── internal/review/             # 评审结论 schema v3（与 runner 对齐）
 │   ├── internal/run/                # run 状态与合法转换
 │   ├── internal/store/migrations/   # PostgreSQL 表结构
 │   └── Dockerfile                   # 用 --build-arg CMD=<组件> 构建三个镜像
 ├── runner/                          # TypeScript，pi SDK 1.3.0
 │   ├── src/main.ts                  # 集群模式（RUN_ID）与本地模式（--pr）入口
+│   ├── src/review.ts                # pi session、工具、提交提醒
+│   ├── src/prompts.ts               # 系统提示词与用户提示词
+│   ├── src/schema.ts                # 评审结论 schema v3（TypeBox）
+│   ├── src/tools.ts                 # git、submit_review 工具
+│   ├── src/github.ts                # 本地模式拉取 PR 与克隆
 │   └── Dockerfile
+├── contract/                        # 生成的 JSON schema 与两侧共用的样例
 ├── deploy/helm/ai-pr-review-cloud/  # Helm chart
 ├── hack/kind-up.sh                  # 创建本地 Kind 集群
 ├── Makefile                         # test、lint、images、kind-up、deploy
@@ -352,10 +390,10 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 ## 10. 风险与待确认
 
 - **pi SDK 版本变动快。** 包名已从 `@mariozechner` 迁到 `@earendil-works`，初始化方式也从 `AuthStorage` 换成了 `ModelRuntime`，两周内从 1.1 发到 1.4。目前精确锁定 `1.3.0`，升级单独提交并跑一遍 M0 的验收。
-- **pi 的 `usage` 字段。** 文档确认有 `usage.input`、`usage.output`、`usage.cost.total`，cache 相关字段未确认；M0 时核对，并与 LiteLLM 的花费交叉校验。
-- **自定义模型接入。** DeepSeek 等 OpenAI 兼容接口需要在 pi 里注册 provider，并指向 LiteLLM 的 `baseUrl`；要验证工具调用在所选模型上稳定。
+- **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，M2 时与 LiteLLM 的花费交叉校验。
+- **自定义模型接入。** DeepSeek 是 pi 内置 provider，指向 LiteLLM 只需覆盖 `baseUrl`；`deepseek-flash` 在 M0 的三个 PR 上都一次调用成功 `submit_review`。换用其他模型时要重新验证工具调用的稳定性。
 - **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库）；落地前用选定版本验证 `max_budget` 是否按预期拒绝请求。
 - **工具链版本较新。** runner 用 TypeScript 7.0、Go 镜像用 `golang:1.27`，本地验证通过，GitHub Actions 上还没跑过。
-- **Go 与 TS 两份 schema 的对齐。** 契约测试在 M0 实现；在此之前两边以 §4.2 和 v1 的 schema v2 为准。
+- **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，但 controller 发布评论时 PR 可能已有新提交；M1 发布时要以结果里的 `head_sha` 为 `commit_id`。
 - **GitHub App 的 approve 是否计入 branch protection 的必需审批数。** demo 仓库可以不开必需审批来规避；需要时再确认。
 - **预览环境的镜像约定。** 需要 demo 仓库的 CI 配合推送 `:<head_sha>` 镜像。

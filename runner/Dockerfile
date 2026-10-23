@@ -7,8 +7,9 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 FROM node:24-slim
-# git is needed by the review tools to inspect history in the cloned PR.
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+# git backs the git tool; pi's grep and find tools use ripgrep and fd, and would
+# otherwise try to download them at runtime, which the runner's network policy blocks.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep fd-find \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules

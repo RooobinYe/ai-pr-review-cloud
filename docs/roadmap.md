@@ -7,7 +7,7 @@
 | 阶段 | 内容 | 验收标准 | 状态 |
 | --- | --- | --- | --- |
 | [骨架](#骨架) | 仓库结构、4 个镜像、Helm chart、Makefile、CI；gateway 签名校验；状态机与表结构 | `make lint`、`make test` 通过；Kind 上 4 个 Pod 就绪；签名正确的 webhook 返回 202，错误返回 401 | ✅ 完成 |
-| [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v2 JSON，质量不低于 v1 | 未开始 |
+| [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v3 JSON，质量不低于 v1 | ✅ 完成 |
 | [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论 | 未开始 |
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | 未开始 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | 未开始 |
@@ -20,7 +20,7 @@
 
 ```mermaid
 flowchart LR
-    S[骨架 ✅] --> M0 --> M1
+    S[骨架 ✅] --> M0[M0 ✅] --> M1
     M1 --> M2
     M1 --> M3
     M3 --> M4
@@ -45,16 +45,27 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 
 目标：不依赖集群，`runner --pr <url>` 就能产出一份质量不低于 v1 的评审。
 
-- [ ] `runner/src/schema.ts`：用 TypeBox 定义 schema v2（`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version`）加 `verdict`。
-- [ ] `runner/src/prompts.ts`：按 v1 的防幻觉规则重写系统提示词和用户提示词。
-- [ ] 本地模式拉取 PR 元信息和 diff，克隆到临时目录。
-- [ ] 接入模型：在 pi 里注册 OpenAI 兼容 provider（DeepSeek 等），读取 API key 和 `baseUrl`。
-- [ ] `submit_review` 工具；模型未调用时最多追加 2 次提示。
-- [ ] 输出 `--format markdown|json`；结束时打印 token 和金额。
-- [ ] Go 侧定义同一份 schema，加 Go / TS 契约测试。
-- [ ] 核对 pi `usage` 是否包含 cache 相关字段。
+- [x] `runner/src/schema.ts`：用 TypeBox 定义评审结论。设计调整为 schema v3：模型直接给出 `verdict` 并写评审正文，结构只保留 `comments` 的 `path`、`line`、`severity`、`confidence`（见架构 §4.4）。
+- [x] `runner/src/prompts.ts`：按 v1 的防幻觉规则重写系统提示词和用户提示词，新增判定规则和不可信输入说明。
+- [x] 本地模式拉取 PR 元信息和 diff，部分克隆到临时目录。
+- [x] 接入模型：DeepSeek 是 pi 内置 provider，`LLM_BASE_URL` 覆盖地址；非内置 provider 按 OpenAI 兼容接口注册（架构 §4.5）。
+- [x] `submit_review` 工具：校验评论锚点落在 diff 内；模型未调用时最多追加 2 次提示。
+- [x] 输出 `--format markdown|json`；结束时打印 token 和金额。
+- [x] Go 侧定义同一份 schema（`go/internal/review`），`contract/` 下的生成 schema 与样例由 Go / TS 两侧测试共同校验。
+- [x] 核对 pi `usage` 是否包含 cache 相关字段：包含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`。
+- [x] 评审阶段用只读 `git` 工具代替 `bash`；不加载被评审仓库里的扩展和 `AGENTS.md`。
 
 验收：对 3 个历史 PR 输出通过 schema 校验的 JSON，人工对比结论质量不低于 v1。
+
+验收记录（2026-10-23，`deepseek/deepseek-flash`，thinking high；v1 使用同一模型，经 DeepSeek 的 Anthropic 兼容接口）：
+
+| PR | 本项目结论 | 耗时 / 花费 | v1（同模型） | 对比 |
+| --- | --- | --- | --- | --- |
+| [ai-pr-review#15](https://github.com/RooobinYe/ai-pr-review/pull/15)：带安全问题的 webhook | request_changes，10 条评论（3 critical） | 70s / $0.020 | 9 条 must_fix，68s | 两边都找到硬编码密钥、两处 shell 注入、`rm -rf` 空路径、world-writable 权限、CI 中 PR 代码可读密钥 |
+| [ai-pr-review#14](https://github.com/RooobinYe/ai-pr-review/pull/14)：JSON 输出与 `--fail-on` | request_changes，10 条评论（2 high） | 79s / $0.025 | 8 条 must_fix，205s | 共同发现 `--fail-on` 在写 `--output` 前退出（已对照源码确认）、拼错阈值时门禁失效、`pr_info` 字段为大驼峰、前置失败没有 JSON 输出；双方各有 3 到 4 条对方没有的有效发现 |
+| [ai-pr-review#12](https://github.com/RooobinYe/ai-pr-review/pull/12)：Windows 控制台 API 修复 | approve，4 条 medium/low 评论 | 71s / $0.021 | 无 must_fix，136s | 结论一致；两边都指出 CI 里重复维护的 Go 版本 |
+
+三个 PR 的结论与 v1 一致（v1 有 must_fix 即视为 request_changes），关键问题覆盖相当，单次耗时更短。所有输出通过 schema 校验，`submit_review` 都是一次调用成功，没有触发提醒。
 
 ## M1 最小闭环
 
