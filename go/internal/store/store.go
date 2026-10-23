@@ -68,7 +68,10 @@ type Run struct {
 	Verdict        review.Verdict
 	Result         *review.Result
 	Error          string
+	BudgetUSD      float64
 	CreatedAt      time.Time
+	// FetchTimed reports whether the fetch phase's timing has been recorded.
+	FetchTimed bool
 	// Actions maps each completed GitHub action to its external ID.
 	Actions map[ActionKind]string
 }
@@ -173,7 +176,8 @@ func (s *Store) RecordTrigger(ctx context.Context, deliveryID string, nr NewRun)
 }
 
 const runColumns = `r.id, r.repo, r.pr_number, r.head_sha, r.installation_id, r.state, r.attempt,
-	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.created_at,
+	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.budget_usd::float8, r.created_at,
+	r.fetch_finished_at IS NOT NULL,
 	COALESCE((SELECT jsonb_object_agg(a.kind, a.external_id) FROM github_action a
 	          WHERE a.run_id = r.id AND a.external_id IS NOT NULL), '{}')`
 
@@ -181,7 +185,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var result, actions []byte
 	err := row.Scan(&r.ID, &r.Repo, &r.PRNumber, &r.HeadSHA, &r.InstallationID, &r.State, &r.Attempt,
-		&r.JobName, &r.Verdict, &result, &r.Error, &r.CreatedAt, &actions)
+		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &actions)
 	if err != nil {
 		return Run{}, err
 	}
@@ -248,7 +252,7 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 		for _, r := range queued {
 			r.State, r.Attempt = run.StateRunning, r.Attempt+1
 			r.JobName = jobName(r.ID, r.Attempt)
-			if _, err := tx.Exec(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, updated_at = now()
+			if _, err := tx.Exec(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, started_at = now(), updated_at = now()
 				WHERE id = $1`, r.ID, r.State, r.Attempt, r.JobName); err != nil {
 				return err
 			}
@@ -296,7 +300,7 @@ func (s *Store) SubmitResult(ctx context.Context, id string, res review.Result) 
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = 'reviewed', verdict = $2, result = $3, updated_at = now()
+	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = 'reviewed', verdict = $2, result = $3, reviewed_at = now(), updated_at = now()
 		WHERE id = $1 AND state = 'running'`, id, res.Verdict, data)
 	if err != nil {
 		return fmt.Errorf("submit result for run %s: %w", id, err)
@@ -315,8 +319,9 @@ func (s *Store) Transition(ctx context.Context, id string, from, to run.State, r
 	}
 	// Reasons quote external messages; PostgreSQL rejects invalid UTF-8.
 	reason = strings.ToValidUTF8(reason, "\uFFFD")
-	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now()
-		WHERE id = $1 AND state = $2`, id, from, to, reason)
+	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now(),
+		finished_at = CASE WHEN $5 THEN now() ELSE finished_at END
+		WHERE id = $1 AND state = $2`, id, from, to, reason, to.Terminal())
 	if err != nil {
 		return fmt.Errorf("transition run %s to %s: %w", id, to, err)
 	}

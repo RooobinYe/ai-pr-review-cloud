@@ -93,6 +93,13 @@ func TestBuildJob(t *testing.T) {
 	if _, ok := runnerEnv["LLM_BASE_URL"]; ok {
 		t.Error("empty LLM_BASE_URL passed through")
 	}
+	if _, ok := runnerEnv["REVIEW_BUDGET_USD"]; ok {
+		t.Error("a run without a budget passed REVIEW_BUDGET_USD")
+	}
+	r.BudgetUSD = 0.5
+	if got := envMap(BuildJob(cfg, r).Spec.Template.Spec.Containers[0].Env)["REVIEW_BUDGET_USD"].Value; got != "0.5" {
+		t.Errorf("REVIEW_BUDGET_USD = %q, want 0.5", got)
+	}
 	if len(JobName(strings.Repeat("f", 36), 99)) > 52 {
 		t.Error("job name leaves no room for the pod suffix within 63 characters")
 	}

@@ -31,6 +31,8 @@ type Store interface {
 	RecordAction(ctx context.Context, runID string, kind store.ActionKind, externalID string) error
 	SubmitResult(ctx context.Context, id string, res review.Result) error
 	Transition(ctx context.Context, id string, from, to run.State, reason string) error
+	RecordUsage(ctx context.Context, runID string, u store.Usage) error
+	RecordFetchTiming(ctx context.Context, runID string, started, finished time.Time) error
 }
 
 // GitHubClient is the subset of *githubapp.Client the controller uses.
@@ -313,6 +315,9 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 		return errors.New("reviewed run has no result")
 	}
 	res := *r.Result
+	if !r.FetchTimed {
+		c.recordFetchTiming(ctx, r)
+	}
 	gh := c.gh.Client(r.InstallationID)
 	// The vote actually cast. If the controller restarted after voting, the
 	// Check Run falls back to the verdict's vote.
@@ -352,6 +357,26 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 	}
 	c.runLog(r).Info("run done", "verdict", res.Verdict)
 	return nil
+}
+
+// recordFetchTiming copies when fetch ran from the runner Pod into the run, for
+// the fetch phase metric (§7.1). It only feeds metrics, so a failure is logged
+// and publishing goes on; the Pod lingers until the Job's TTL, so a later pass
+// can still record it.
+func (c *Controller) recordFetchTiming(ctx context.Context, r store.Run) {
+	pods, err := c.kube.ListPods(ctx, "job-name="+r.JobName)
+	if err != nil {
+		c.runLog(r).Warn("read runner pod for fetch timing", "err", err)
+		return
+	}
+	for _, p := range pods {
+		if started, finished, ok := FetchTiming(p); ok {
+			if err := c.store.RecordFetchTiming(ctx, r.ID, started, finished); err != nil {
+				c.runLog(r).Warn("record fetch timing", "err", err)
+			}
+			return
+		}
+	}
 }
 
 // voteEvent picks the review event. An approval is only cast while the

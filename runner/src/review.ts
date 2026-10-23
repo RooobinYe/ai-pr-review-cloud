@@ -11,9 +11,10 @@ import {
 import { commentableLines } from "./diff.ts";
 import type { PiModel, ThinkingLevel } from "./model.ts";
 import type { PRContext } from "./pr.ts";
-import { SUBMIT_REMINDER, systemPrompt, userPrompt } from "./prompts.ts";
+import { BUDGET_REMINDER, SUBMIT_REMINDER, systemPrompt, userPrompt } from "./prompts.ts";
 import type { ReviewSubmission } from "./schema.ts";
 import { gitTool, submitReviewTool } from "./tools.ts";
+import { overNudgeThreshold, type TurnUsage, turnUsage } from "./usage.ts";
 
 /** Reminders sent when the model stops without calling submit_review. */
 export const MAX_SUBMIT_REMINDERS = 2;
@@ -28,12 +29,18 @@ export interface ReviewOptions {
   modelRuntime: ModelRuntime;
   thinkingLevel: ThinkingLevel;
   language: string;
+  /** Spending at which the model is told to submit (§7.3); none when unset. */
+  budgetUSD?: number;
   onProgress?: (line: string) => void;
+  /** Called with each turn's usage as the turn ends. */
+  onTurn?: (usage: TurnUsage) => void;
 }
 
 export interface ReviewOutcome {
   submission: ReviewSubmission;
   stats: SessionStats;
+  /** Whether the budget reminder was sent. */
+  nudged: boolean;
 }
 
 export class ReviewNotSubmittedError extends Error {
@@ -90,8 +97,21 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
     customTools: [gitTool(opts.cwd), submit],
   });
 
+  let turns = 0;
+  let spent = 0;
+  let nudged = false;
   const unsubscribe = session.subscribe((event) => {
-    if (event.type === "tool_execution_start") {
+    if (event.type === "turn_end") {
+      const usage = turnUsage(++turns, event.message);
+      if (!usage) return;
+      spent += usage.cost_usd;
+      opts.onTurn?.(usage);
+      if (!nudged && !submission && overNudgeThreshold(spent, opts.budgetUSD)) {
+        nudged = true;
+        opts.onProgress?.(`spent $${spent.toFixed(4)} of the $${opts.budgetUSD} budget; asking the model to submit`);
+        session.steer(BUDGET_REMINDER).catch((err: unknown) => opts.onProgress?.(`budget reminder failed: ${String(err)}`));
+      }
+    } else if (event.type === "tool_execution_start") {
       opts.onProgress?.(describeToolCall(event.toolName, event.args ?? {}));
     } else if (event.type === "tool_execution_end" && event.isError) {
       const text: unknown = event.result?.content?.[0]?.text;
@@ -108,7 +128,7 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
     }
     const stats = session.getSessionStats();
     if (!submission) throw new ReviewNotSubmittedError(stats);
-    return { submission, stats };
+    return { submission, stats, nudged };
   } finally {
     unsubscribe();
     session.dispose();

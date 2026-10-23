@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -100,6 +101,10 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 			runnerEnv = append(runnerEnv, kube.EnvVar{Name: name, Value: v})
 		}
 	}
+	if r.BudgetUSD > 0 {
+		// The runner asks the model to wrap up at 80% of it (§7.3).
+		runnerEnv = append(runnerEnv, kube.EnvVar{Name: "REVIEW_BUDGET_USD", Value: strconv.FormatFloat(r.BudgetUSD, 'f', -1, 64)})
+	}
 
 	return kube.Job{
 		Metadata: kube.ObjectMeta{Name: r.JobName, Labels: labels},
@@ -171,6 +176,17 @@ func BuildRunSecret(job kube.Job, githubToken, runToken string) kube.Secret {
 		Type:       "Opaque",
 		StringData: map[string]string{"GITHUB_TOKEN": githubToken, "RUN_TOKEN": runToken},
 	}
+}
+
+// FetchTiming returns when the fetch init container of a runner Pod ran, and
+// false until it has finished successfully.
+func FetchTiming(pod kube.Pod) (started, finished time.Time, ok bool) {
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if t := cs.State.Terminated; cs.Name == "fetch" && t != nil && t.ExitCode == 0 && !t.StartedAt.IsZero() && !t.FinishedAt.IsZero() {
+			return t.StartedAt, t.FinishedAt, true
+		}
+	}
+	return time.Time{}, time.Time{}, false
 }
 
 // PodFailure explains why a runner Pod failed, from its container states.

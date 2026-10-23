@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
-import { postResult, ResultRejectedError } from "./controller.ts";
+import { postResult, putUsage, ResultRejectedError } from "./controller.ts";
 import type { ReviewResult } from "./schema.ts";
 
 const RESULT = JSON.parse(readFileSync(join(import.meta.dirname, "../../contract/examples/valid-approve.json"), "utf8")) as ReviewResult;
@@ -53,4 +53,18 @@ test("postResult gives up after the last attempt", async () => {
     (_req, _body, res) => res.writeHead(500).end("down"),
     (url) => assert.rejects(postResult(url, "run-1", RESULT, { token: "t", attempts: 2, retryDelayMs: 1 }), /after 2 attempts: 500 down/),
   );
+});
+
+test("putUsage PUTs one turn and gives up quickly", async () => {
+  const usage = { turn: 2, model: "deepseek/deepseek-flash", input_tokens: 10, output_tokens: 5, cache_read_tokens: 100, cache_write_tokens: 0, cost_usd: 0.001 };
+  const seen: string[] = [];
+  await withServer(
+    (req, body, res) => {
+      seen.push(`${req.method} ${req.url}`);
+      assert.deepEqual(JSON.parse(body), usage);
+      res.writeHead(503).end("busy");
+    },
+    (url) => assert.rejects(putUsage(url, "run-1", usage, { token: "t", retryDelayMs: 1 }), /send usage after 3 attempts/),
+  );
+  assert.deepEqual(seen, Array(3).fill("PUT /runs/run-1/usage"));
 });

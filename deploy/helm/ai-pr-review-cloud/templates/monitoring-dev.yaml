@@ -1,0 +1,174 @@
+{{- if .Values.monitoring.dev.enabled }}
+{{- $prom := dict "root" . "component" "prometheus" -}}
+{{- $graf := dict "root" . "component" "grafana" -}}
+# Development-only Prometheus and Grafana with the cost dashboard
+# (docs/architecture.md §7.1): one replica each, data lost on restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aprc.fullname" . }}-prometheus
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: {{ .Values.monitoring.dev.scrapeInterval }}
+    scrape_configs:
+      # Metrics are computed from the database on every scrape, so any one
+      # controller replica reports the whole system.
+      - job_name: controller
+        static_configs:
+          - targets: ["{{ include "aprc.fullname" . }}-controller:80"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aprc.fullname" . }}-prometheus
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "aprc.selector" $prom | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aprc.selector" $prom | nindent 8 }}
+      annotations:
+        checksum/config: {{ .Values.monitoring.dev.scrapeInterval | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "aprc.podSecurityContext" . | nindent 8 }}
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: {{ .Values.monitoring.dev.prometheus.image }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.monitoring.dev.prometheus.retention }}
+          ports:
+            - { name: http, containerPort: 9090 }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+          securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
+          resources: {{- toYaml .Values.monitoring.dev.prometheus.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "aprc.fullname" . }}-prometheus
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aprc.fullname" . }}-prometheus
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus
+spec:
+  selector: {{- include "aprc.selector" $prom | nindent 4 }}
+  ports:
+    - { name: http, port: 9090, targetPort: http }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aprc.fullname" . }}-grafana
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ include "aprc.fullname" . }}-prometheus:9090
+        isDefault: true
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: ai-pr-review-cloud
+        type: file
+        options:
+          path: /var/lib/grafana-dashboards
+  review-cost.json: |
+    {{- .Files.Get "dashboards/review-cost.json" | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aprc.fullname" . }}-grafana
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "aprc.selector" $graf | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aprc.selector" $graf | nindent 8 }}
+      annotations:
+        checksum/dashboard: {{ .Files.Get "dashboards/review-cost.json" | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "aprc.podSecurityContext" . | nindent 8 }}
+        runAsUser: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: {{ .Values.monitoring.dev.grafana.image }}
+          env:
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: {{ .Values.monitoring.dev.grafana.adminPassword | quote }} }
+            # Viewers need no login, so the dashboard opens straight away.
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer }
+            - { name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana-dashboards/review-cost.json }
+            - { name: GF_ANALYTICS_REPORTING_ENABLED, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false" }
+            - { name: GF_PATHS_PROVISIONING, value: /etc/grafana/provisioning }
+          ports:
+            - { name: http, containerPort: 3000 }
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+          securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
+          resources: {{- toYaml .Values.monitoring.dev.grafana.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml, subPath: datasources.yaml }
+            - { name: config, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml, subPath: dashboards.yaml }
+            - { name: config, mountPath: /var/lib/grafana-dashboards/review-cost.json, subPath: review-cost.json }
+            - { name: data, mountPath: /var/lib/grafana }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "aprc.fullname" . }}-grafana
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aprc.fullname" . }}-grafana
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  selector: {{- include "aprc.selector" $graf | nindent 4 }}
+  ports:
+    - { name: http, port: 3000, targetPort: http }
+{{- end }}

@@ -188,5 +188,8 @@ Review this pull request following your instructions, then call submit_review wi
 </review_request>`;
 }
 
+export const BUDGET_REMINDER =
+  "You have used most of this review's budget. Stop exploring: call submit_review now with what you have verified so far, and name the parts you could not check in the body.";
+
 export const SUBMIT_REMINDER =
   "You have not submitted the review yet. Call submit_review now with your verdict, body and comments. Do not reply with plain text.";

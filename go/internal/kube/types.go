@@ -3,6 +3,8 @@ package kube
 // The subset of the Kubernetes API types the controller reads and writes.
 // Field names and JSON tags follow k8s.io/api.
 
+import "time"
+
 // Ptr returns a pointer to v, for optional API fields.
 func Ptr[T any](v T) *T { return &v }
 
@@ -185,7 +187,9 @@ type ContainerStateWaiting struct {
 }
 
 type ContainerStateTerminated struct {
-	ExitCode int32  `json:"exitCode"`
-	Reason   string `json:"reason,omitempty"`
-	Message  string `json:"message,omitempty"`
+	ExitCode   int32     `json:"exitCode"`
+	Reason     string    `json:"reason,omitempty"`
+	Message    string    `json:"message,omitempty"`
+	StartedAt  time.Time `json:"startedAt,omitzero"`
+	FinishedAt time.Time `json:"finishedAt,omitzero"`
 }

@@ -46,6 +46,27 @@ postgres:
     image: postgres:17
     password: dev-only-password
 
+monitoring:
+  dev:
+    # Single-replica, non-persistent Prometheus and Grafana with the cost
+    # dashboard (dashboards/review-cost.json), for local Kind clusters only.
+    # Elsewhere, scrape the controller Service's /metrics and import the JSON.
+    enabled: true
+    scrapeInterval: 15s
+    prometheus:
+      image: prom/prometheus:v3.5.0
+      retention: 7d
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 512Mi }
+    grafana:
+      image: grafana/grafana:12.1.0
+      # Anonymous viewers can read the dashboard; editing needs admin.
+      adminPassword: dev-only-password
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 256Mi }
+
 gateway:
   replicas: 2
   resources:
