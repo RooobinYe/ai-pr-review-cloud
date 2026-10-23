@@ -2,4 +2,4 @@ preview:
   enabled: true
   helm:
     chart: demo/preview/chart
-  readyTimeout: 5m
+  readyTimeout: 2m
