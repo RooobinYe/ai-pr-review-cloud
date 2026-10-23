@@ -116,10 +116,19 @@ spec:
             httpGet: { path: /health/readiness, port: http }
             periodSeconds: 5
             failureThreshold: 60
+          # LiteLLM answers probes from the same event loop that relays model
+          # streams; under a long review it can take seconds to respond. A
+          # liveness restart drops every in-flight run's request, so only
+          # restart after a minute of silence.
           readinessProbe:
             httpGet: { path: /health/readiness, port: http }
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: { path: /health/liveliness, port: http }
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
           resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
           securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
       volumes:
