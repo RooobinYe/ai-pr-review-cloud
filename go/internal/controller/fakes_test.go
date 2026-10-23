@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -17,13 +18,24 @@ import (
 
 // fakeStore mirrors the semantics of *store.Store in memory.
 type fakeStore struct {
-	mu   sync.Mutex
-	runs map[string]*store.Run
-	seq  int
+	mu       sync.Mutex
+	runs     map[string]*store.Run
+	seq      int
+	sessions map[string]session
+	usage    map[string]map[int]store.Usage
+	now      func() time.Time
+	// crashOn makes the next RecordAction of that kind fail, as if the
+	// controller stopped right after the GitHub write.
+	crashOn store.ActionKind
+}
+
+type session struct {
+	jsonl []byte
+	turn  int
 }
 
 func newFakeStore(runs ...store.Run) *fakeStore {
-	s := &fakeStore{runs: map[string]*store.Run{}}
+	s := &fakeStore{runs: map[string]*store.Run{}, sessions: map[string]session{}, usage: map[string]map[int]store.Usage{}, now: time.Now}
 	for _, r := range runs {
 		s.seq++
 		r.Actions = map[store.ActionKind]string{}
@@ -63,6 +75,7 @@ func (s *fakeStore) Claim(_ context.Context, maxRunning int, jobName func(string
 		}
 		r.State, r.Attempt = run.StateRunning, r.Attempt+1
 		r.JobName = jobName(r.ID, r.Attempt)
+		r.ClaimedAt = s.now()
 		inFlight++
 		claimed = append(claimed, s.copyOf(r))
 	}
@@ -74,12 +87,65 @@ func (s *fakeStore) Active(context.Context) ([]store.Run, error) {
 	defer s.mu.Unlock()
 	var out []store.Run
 	for _, r := range s.sorted() {
-		unreported := r.State == run.StateFailed && !r.Done(store.ActionCheckRunComplete)
+		unreported := (r.State == run.StateFailed || r.State == run.StateSuperseded) && !r.Done(store.ActionCheckRunComplete)
 		if r.State == run.StateRunning || r.State == run.StateReviewed || unreported {
 			out = append(out, s.copyOf(r))
 		}
 	}
 	return out, nil
+}
+
+func (s *fakeStore) Supersede(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []string
+	for _, r := range s.sorted() {
+		switch r.State {
+		case run.StateQueued, run.StateRunning, run.StatePreviewing, run.StateAwaitingApproval:
+		default:
+			continue
+		}
+		for _, n := range s.runs {
+			if n.Repo == r.Repo && n.PRNumber == r.PRNumber && n.CreatedAt.After(r.CreatedAt) {
+				r.State = run.StateSuperseded
+				ids = append(ids, r.ID)
+				break
+			}
+		}
+	}
+	return ids, nil
+}
+
+func (s *fakeStore) PutSession(_ context.Context, id string, turn int, jsonl []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runs[id].State != run.StateRunning {
+		return store.ErrConflict
+	}
+	if cur, ok := s.sessions[id]; !ok || cur.turn <= turn {
+		s.sessions[id] = session{jsonl: jsonl, turn: turn}
+	}
+	return nil
+}
+
+func (s *fakeStore) GetSession(_ context.Context, id string) ([]byte, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.sessions[id]
+	if !ok {
+		return nil, 0, store.ErrNotFound
+	}
+	return cur.jsonl, cur.turn, nil
+}
+
+func (s *fakeStore) PutUsage(_ context.Context, id string, u store.Usage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.usage[id] == nil {
+		s.usage[id] = map[int]store.Usage{}
+	}
+	s.usage[id][u.Turn] = u
+	return nil
 }
 
 func (s *fakeStore) Get(_ context.Context, id string) (store.Run, error) {
@@ -95,6 +161,10 @@ func (s *fakeStore) Get(_ context.Context, id string) (store.Run, error) {
 func (s *fakeStore) RecordAction(_ context.Context, id string, kind store.ActionKind, ext string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if kind == s.crashOn {
+		s.crashOn = ""
+		return fmt.Errorf("controller stopped before recording %s", kind)
+	}
 	s.runs[id].Actions[kind] = ext
 	return nil
 }
@@ -127,7 +197,8 @@ func (s *fakeStore) Transition(_ context.Context, id string, from, to run.State,
 	return nil
 }
 
-// fakeGitHub records every write.
+// fakeGitHub records every write. Reviews it accepts show up in ListReviews
+// as the bot's, like on GitHub.
 type fakeGitHub struct {
 	mu          sync.Mutex
 	head        string
@@ -138,6 +209,8 @@ type fakeGitHub struct {
 	checkRuns   map[int64][]githubapp.CheckRun
 	tokens      []string
 	writeErr    error
+	deliveries  []githubapp.Delivery
+	redelivered []int64
 }
 
 func (g *fakeGitHub) Client(int64) GitHubClient { return g }
@@ -176,7 +249,15 @@ func (g *fakeGitHub) CreateReview(_ context.Context, _ string, _ int, r githubap
 		return 0, &githubapp.APIError{Status: http.StatusUnprocessableEntity, Message: "Line could not be resolved"}
 	}
 	g.posted = append(g.posted, r)
-	return int64(900 + len(g.posted)), nil
+	id := int64(900 + len(g.posted))
+	state := "COMMENTED"
+	if r.Event == "APPROVE" {
+		state = "APPROVED"
+	}
+	rv := githubapp.Review{ID: id, State: state, CommitID: r.CommitID, Body: r.Body}
+	rv.User.Login = bot
+	g.reviews = append(g.reviews, rv)
+	return id, nil
 }
 
 func (g *fakeGitHub) CreateCheckRun(_ context.Context, _ string, cr githubapp.CheckRun) (int64, error) {
@@ -186,6 +267,24 @@ func (g *fakeGitHub) CreateCheckRun(_ context.Context, _ string, cr githubapp.Ch
 	id := int64(100 + len(g.checkRuns))
 	g.checkRuns[id] = []githubapp.CheckRun{cr}
 	return id, nil
+}
+
+func (g *fakeGitHub) FindCheckRun(_ context.Context, _ string, sha, name, externalID string) (int64, error) {
+	for id, updates := range g.checkRuns {
+		if cr := updates[0]; cr.HeadSHA == sha && cr.Name == name && cr.ExternalID == externalID {
+			return id, nil
+		}
+	}
+	return 0, nil
+}
+
+func (g *fakeGitHub) ListDeliveries(context.Context) ([]githubapp.Delivery, error) {
+	return g.deliveries, nil
+}
+
+func (g *fakeGitHub) Redeliver(_ context.Context, id int64) error {
+	g.redelivered = append(g.redelivered, id)
+	return nil
 }
 
 func (g *fakeGitHub) UpdateCheckRun(_ context.Context, _ string, id int64, cr githubapp.CheckRun) error {
@@ -198,6 +297,7 @@ type fakeKube struct {
 	jobs    map[string]kube.Job
 	secrets map[string]kube.Secret
 	pods    []kube.Pod
+	deleted []string
 }
 
 func newFakeKube() *fakeKube {
@@ -219,6 +319,17 @@ func (k *fakeKube) GetJob(_ context.Context, name string) (kube.Job, error) {
 		return kube.Job{}, kube.ErrNotFound
 	}
 	return job, nil
+}
+
+// DeleteJob removes the Job and, as the owner reference would, its Secret.
+func (k *fakeKube) DeleteJob(_ context.Context, name string) error {
+	if _, ok := k.jobs[name]; !ok {
+		return kube.ErrNotFound
+	}
+	delete(k.jobs, name)
+	delete(k.secrets, runSecretName(name))
+	k.deleted = append(k.deleted, name)
+	return nil
 }
 
 func (k *fakeKube) CreateSecret(_ context.Context, s kube.Secret) error {
@@ -245,7 +356,11 @@ func (k *fakeKube) GetSecret(_ context.Context, name string) (kube.Secret, error
 func (k *fakeKube) ListPods(context.Context, string) ([]kube.Pod, error) { return k.pods, nil }
 
 func (k *fakeKube) finish(name, condition string) {
+	k.finishWith(name, condition, "BackoffLimitExceeded")
+}
+
+func (k *fakeKube) finishWith(name, condition, reason string) {
 	job := k.jobs[name]
-	job.Status.Conditions = append(job.Status.Conditions, kube.JobCondition{Type: condition, Status: "True", Reason: "BackoffLimitExceeded"})
+	job.Status.Conditions = append(job.Status.Conditions, kube.JobCondition{Type: condition, Status: "True", Reason: reason})
 	k.jobs[name] = job
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -31,17 +32,31 @@ type harness struct {
 	gh    *fakeGitHub
 	kube  *fakeKube
 	mux   *http.ServeMux
+	clock time.Time
 }
 
 func newHarness() *harness {
 	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued})
 	gh := &fakeGitHub{head: headSHA}
 	k := newFakeKube()
-	cfg := Config{MaxRunning: 2, BotLogin: bot, Job: JobConfig{FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMSecret: "llm"}}
-	c := New(cfg, s, gh, k, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	mux := http.NewServeMux()
-	c.Routes(mux)
-	return &harness{c: c, store: s, gh: gh, kube: k, mux: mux}
+	h := &harness{store: s, gh: gh, kube: k, clock: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
+	s.now = h.now
+	h.restart()
+	return h
+}
+
+func (h *harness) now() time.Time { return h.clock }
+
+// restart replaces the controller with a fresh one over the same store,
+// GitHub and cluster, as a controller Pod restart would.
+func (h *harness) restart() {
+	cfg := Config{MaxRunning: 2, MaxAttempts: 3, BotLogin: bot, Job: JobConfig{
+		FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMSecret: "llm", ActiveDeadlineSeconds: 1800,
+	}}
+	h.c = New(cfg, h.store, h.gh, h.kube, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.c.now = h.now
+	h.mux = http.NewServeMux()
+	h.c.Routes(h.mux)
 }
 
 func (h *harness) reconcile() { h.c.Reconcile(context.Background()) }
@@ -60,11 +75,16 @@ func (h *harness) post(res review.Result) int { return h.postWithToken(res, h.ru
 
 func (h *harness) postWithToken(res review.Result, token string) int {
 	body, _ := json.Marshal(res)
-	req := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/result", bytes.NewReader(body))
+	return h.call(http.MethodPost, "/runs/"+runID+"/result", token, body).Code
+}
+
+// call sends a runner callback with the given bearer token.
+func (h *harness) call(method, path, token string, body []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	h.mux.ServeHTTP(rec, req)
-	return rec.Code
+	return rec
 }
 
 func result(v review.Verdict, comments ...review.Comment) review.Result {
@@ -195,13 +215,13 @@ func TestJobFailureIsReported(t *testing.T) {
 	h.reconcile()
 	job := h.state().JobName
 	h.kube.pods = []kube.Pod{{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
-		{Name: "fetch", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: "fetch: 404 Not Found"}}},
+		{Name: "fetch", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: run.ExitFinal, Message: "fetch: 404 Not Found"}}},
 	}}}}
 	h.kube.finish(job, kube.JobFailed)
 	h.reconcile()
 
 	r := h.state()
-	if r.State != run.StateFailed || !strings.Contains(r.Error, "fetch exited with code 1: fetch: 404 Not Found") {
+	if r.State != run.StateFailed || !strings.Contains(r.Error, "fetch exited with code 3: fetch: 404 Not Found") {
 		t.Fatalf("run %+v", r)
 	}
 	cr := h.gh.checkRuns[100]

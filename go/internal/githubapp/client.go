@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -180,6 +181,7 @@ type Review struct {
 	// State is APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, or PENDING.
 	State    string `json:"state"`
 	CommitID string `json:"commit_id"`
+	Body     string `json:"body"`
 }
 
 func (c *Client) ListReviews(ctx context.Context, repo string, number int) ([]Review, error) {
@@ -243,6 +245,138 @@ func (c *Client) CreateCheckRun(ctx context.Context, repo string, cr CheckRun) (
 	return out.ID, err
 }
 
+// FindCheckRun returns the ID of the named Check Run on sha whose external ID
+// is externalID, or 0 if there is none.
+func (c *Client) FindCheckRun(ctx context.Context, repo, sha, name, externalID string) (int64, error) {
+	var out struct {
+		CheckRuns []struct {
+			ID         int64  `json:"id"`
+			ExternalID string `json:"external_id"`
+		} `json:"check_runs"`
+	}
+	path := fmt.Sprintf("/repos/%s/commits/%s/check-runs?check_name=%s&filter=all&per_page=100", repo, sha, url.QueryEscape(name))
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return 0, err
+	}
+	for _, cr := range out.CheckRuns {
+		if cr.ExternalID == externalID {
+			return cr.ID, nil
+		}
+	}
+	return 0, nil
+}
+
 func (c *Client) UpdateCheckRun(ctx context.Context, repo string, id int64, cr CheckRun) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/check-runs/%d", repo, id), cr, nil)
+}
+
+// graphQLPath locates the GraphQL endpoint next to the REST API: /graphql on
+// GitHub.com, /api/graphql on GitHub Enterprise Server (REST at /api/v3).
+func (c *Client) graphQLPath() (base, path string) {
+	base = strings.TrimSuffix(c.BaseURL, "/")
+	if b, ok := strings.CutSuffix(base, "/api/v3"); ok {
+		return b, "/api/graphql"
+	}
+	return base, "/graphql"
+}
+
+// graphQL runs a query and decodes its data into out.
+func (c *Client) graphQL(ctx context.Context, query string, vars map[string]any, out any) error {
+	base, path := c.graphQLPath()
+	gql := *c
+	gql.BaseURL = base
+	var res struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := gql.do(ctx, http.MethodPost, path, map[string]any{"query": query, "variables": vars}, &res); err != nil {
+		return err
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("GitHub GraphQL: %s", res.Errors[0].Message)
+	}
+	return json.Unmarshal(res.Data, out)
+}
+
+// ReviewThread is an inline review thread, represented by its first comment.
+type ReviewThread struct {
+	Path string
+	// Line is the thread's line in the current diff, or in the commit it was
+	// left on when the line no longer exists.
+	Line        int
+	Resolved    bool
+	Outdated    bool
+	AuthorLogin string
+	Body        string
+}
+
+const reviewThreadsQuery = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(last: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(first: 1) { nodes { author { login } body } }
+        }
+      }
+    }
+  }
+}`
+
+// ListReviewThreads returns the PR's most recent 100 review threads. Whether a
+// thread is resolved is only exposed through GraphQL.
+func (c *Client) ListReviewThreads(ctx context.Context, repo string, number int) ([]ReviewThread, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	var data struct {
+		Repository struct {
+			PullRequest struct {
+				ReviewThreads struct {
+					Nodes []struct {
+						IsResolved   bool   `json:"isResolved"`
+						IsOutdated   bool   `json:"isOutdated"`
+						Path         string `json:"path"`
+						Line         *int   `json:"line"`
+						OriginalLine *int   `json:"originalLine"`
+						Comments     struct {
+							Nodes []struct {
+								Author *struct {
+									Login string `json:"login"`
+								} `json:"author"`
+								Body string `json:"body"`
+							} `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}
+	err := c.graphQL(ctx, reviewThreadsQuery, map[string]any{"owner": owner, "name": name, "number": number}, &data)
+	if err != nil {
+		return nil, fmt.Errorf("list review threads of %s#%d: %w", repo, number, err)
+	}
+	var threads []ReviewThread
+	for _, n := range data.Repository.PullRequest.ReviewThreads.Nodes {
+		if len(n.Comments.Nodes) == 0 {
+			continue
+		}
+		first := n.Comments.Nodes[0]
+		t := ReviewThread{Path: n.Path, Resolved: n.IsResolved, Outdated: n.IsOutdated, Body: first.Body}
+		if first.Author != nil {
+			t.AuthorLogin = first.Author.Login
+		}
+		switch {
+		case n.Line != nil:
+			t.Line = *n.Line
+		case n.OriginalLine != nil:
+			t.Line = *n.OriginalLine
+		}
+		threads = append(threads, t)
+	}
+	return threads, nil
 }

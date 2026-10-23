@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
 
@@ -27,6 +28,8 @@ type JobConfig struct {
 	FetchImage      string
 	RunnerImage     string
 	ImagePullPolicy string
+	// BotLogin is the App's bot user; fetch collects its earlier comments.
+	BotLogin string
 	// ControllerURL is where the runner posts its result.
 	ControllerURL string
 	// LLMSecret names the Secret holding the model API key under LLM_API_KEY.
@@ -131,6 +134,7 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 							{Name: "REPO", Value: r.Repo},
 							{Name: "PR_NUMBER", Value: strconv.Itoa(r.PRNumber)},
 							{Name: "HEAD_SHA", Value: r.HeadSHA},
+							{Name: "BOT_LOGIN", Value: cfg.BotLogin},
 							{Name: "WORKSPACE", Value: "/workspace"},
 							{Name: "HOME", Value: "/tmp"},
 						},
@@ -173,9 +177,10 @@ func BuildRunSecret(job kube.Job, githubToken, runToken string) kube.Secret {
 	}
 }
 
-// PodFailure explains why a runner Pod failed, from its container states.
-// It returns "" when no container has failed.
-func PodFailure(pod kube.Pod) string {
+// PodFailure explains why a runner Pod failed, from its container states, and
+// reports whether the container said retrying cannot help (run.ExitFinal). It
+// returns "" when no container has failed.
+func PodFailure(pod kube.Pod) (reason string, final bool) {
 	for _, group := range [][]kube.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
 		for _, cs := range group {
 			if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
@@ -183,14 +188,14 @@ func PodFailure(pod kube.Pod) string {
 				if msg == "" {
 					msg = t.Reason
 				}
-				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncate(msg, 1500))
+				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncate(msg, 1500)), t.ExitCode == run.ExitFinal
 			}
 			if w := cs.State.Waiting; w != nil && w.Reason != "" && w.Reason != "PodInitializing" && w.Reason != "ContainerCreating" {
-				return fmt.Sprintf("%s is stuck: %s %s", cs.Name, w.Reason, truncate(w.Message, 500))
+				return fmt.Sprintf("%s is stuck: %s %s", cs.Name, w.Reason, truncate(w.Message, 500)), false
 			}
 		}
 	}
-	return ""
+	return "", false
 }
 
 // truncate cuts s to at most n bytes without splitting a UTF-8 sequence.

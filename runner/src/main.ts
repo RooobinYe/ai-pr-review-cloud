@@ -7,14 +7,15 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { postResult } from "./controller.ts";
+import { getSession, postResult, putSession, putUsage, RejectedError } from "./controller.ts";
 import { clonePR, fetchPR } from "./github.ts";
 import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } from "./model.ts";
 import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import { ReviewNotSubmittedError, review } from "./review.ts";
+import { ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
 import { ReviewResultSchema, SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 
 const USAGE = `usage: runner --pr <github-pr-url> [--format markdown|json] [--language <name>] [--keep]
@@ -42,8 +43,26 @@ const { values } = parseArgs({
 
 const log = (line: string) => console.error(`runner: ${line}`);
 
+/**
+ * Exit code for failures another attempt cannot fix; the controller retries
+ * any other exit. Mirrors run.ExitFinal in go/internal/run/exit.go.
+ */
+const EXIT_FINAL = 3;
+
+/** A failure that is final however often the run is retried. */
+class FinalError extends Error {}
+
+const isFinal = (err: unknown) => err instanceof FinalError || err instanceof RejectedError || err instanceof ReviewNotSubmittedError;
+
 /** Reviews a checked-out PR and returns the validated result; shared by both modes. */
-async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: ModelConfig, language: string): Promise<ReviewResult> {
+async function reviewPR(
+  pr: PRContext,
+  cwd: string,
+  agentDir: string,
+  cfg: ModelConfig,
+  language: string,
+  checkpoint: Pick<ReviewOptions, "resumeFrom" | "onTurn"> = {},
+): Promise<ReviewResult> {
   const started = Date.now();
   const thinkingLevel = parseThinking(cfg.thinking);
   const { model, modelRuntime } = await resolveModel(cfg, agentDir);
@@ -58,6 +77,7 @@ async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: Model
       thinkingLevel,
       language,
       onProgress: (line) => log(`  ${line}`),
+      ...checkpoint,
     });
     log(formatUsage({ ...stats.tokens, cost: stats.cost }, (Date.now() - started) / 1000));
     const result: ReviewResult = {
@@ -105,14 +125,36 @@ async function local(url: string, format: string): Promise<number> {
 
 async function cluster(runId: string): Promise<number> {
   const { CONTROLLER_URL: controllerUrl, RUN_TOKEN: token } = process.env;
-  if (!controllerUrl || !token) throw new Error("CONTROLLER_URL and RUN_TOKEN must be set");
+  if (!controllerUrl || !token) throw new FinalError("CONTROLLER_URL and RUN_TOKEN must be set");
   const cfg = modelConfigFromEnv(process.env);
   const workspace = process.env.WORKSPACE || "/workspace";
-  const pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
+  let pr: PRContext;
+  try {
+    pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
+  } catch (err) {
+    throw new FinalError(`read pr.json: ${err instanceof Error ? err.message : String(err)}`);
+  }
   const agentDir = await mkdtemp(join(tmpdir(), "pi-"));
-  log(`run ${runId}: ${pr.files.length} files changed`);
-  const result = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, process.env.REVIEW_LANGUAGE || values.language!);
-  await postResult(controllerUrl, runId, result, { token, log });
+  const remote = { token, log };
+  log(`run ${runId}: ${pr.files.length} files changed, ${pr.previousComments?.length ?? 0} earlier comments`);
+
+  // A failed earlier attempt left its session behind; continue from there.
+  const saved = await getSession(controllerUrl, runId, remote);
+  const resumeFrom = saved ? parseSessionEntries(saved) : undefined;
+  if (resumeFrom) log(`run ${runId}: resuming from a snapshot with ${resumeFrom.length} entries`);
+  const result = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, process.env.REVIEW_LANGUAGE || values.language!, {
+    resumeFrom,
+    onTurn: async (t) => {
+      await putSession(controllerUrl, runId, t.turn, t.jsonl, remote);
+      await putUsage(
+        controllerUrl,
+        runId,
+        { turn: t.turn, model: t.model, input_tokens: t.input, output_tokens: t.output, cache_read_tokens: t.cacheRead, cache_write_tokens: t.cacheWrite, cost_usd: t.cost },
+        remote,
+      );
+    },
+  });
+  await postResult(controllerUrl, runId, result, remote);
   log(`run ${runId}: posted ${result.verdict} with ${result.comments.length} comments`);
   return 0;
 }
@@ -132,6 +174,6 @@ main().then(
   (code) => process.exit(code),
   (err: unknown) => {
     log(err instanceof Error ? err.message : String(err));
-    process.exit(1);
+    process.exit(isFinal(err) ? EXIT_FINAL : 1);
   },
 );

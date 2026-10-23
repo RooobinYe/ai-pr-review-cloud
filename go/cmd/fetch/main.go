@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/fetch"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 )
 
 func main() {
@@ -37,13 +40,34 @@ func main() {
 		Workspace: os.Getenv("WORKSPACE"),
 		GitURL:    envOr("GITHUB_URL", "https://github.com"),
 		Token:     token,
+		BotLogin:  os.Getenv("BOT_LOGIN"),
+		Warnf:     func(format string, args ...any) { fmt.Fprintf(os.Stderr, "fetch: warning: "+format+"\n", args...) },
 	}
 	if err := fetch.Run(ctx, gh, opts); err != nil {
 		// The message becomes the container's termination message, which the
 		// controller reports on the Check Run.
-		fail("%v", err)
+		code := 1
+		if final(err) {
+			code = run.ExitFinal
+		}
+		fmt.Fprintf(os.Stderr, "fetch: %v\n", err)
+		os.Exit(code)
 	}
 	fmt.Fprintf(os.Stderr, "fetch: checked out %s#%d at %s\n", opts.Repo, opts.PRNumber, opts.HeadSHA)
+}
+
+// final reports whether another attempt would fail the same way: the PR moved
+// on to a newer commit, or GitHub refused the request for good.
+func final(err error) bool {
+	var moved *fetch.HeadMovedError
+	if errors.As(err, &moved) {
+		return true
+	}
+	switch githubapp.StatusOf(err) {
+	case http.StatusUnauthorized, http.StatusNotFound, http.StatusGone, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
 }
 
 func fail(format string, args ...any) {
