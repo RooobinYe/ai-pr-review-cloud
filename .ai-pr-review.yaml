@@ -1,0 +1,4 @@
+approvalMode: auto
+failOn: high
+budgetUSD: 0.10
+language: zh
