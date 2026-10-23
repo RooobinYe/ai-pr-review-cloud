@@ -1,0 +1,49 @@
+{{- $sel := dict "root" . "component" "gateway" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aprc.fullname" . }}-gateway
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels: {{- include "aprc.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aprc.selector" $sel | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "aprc.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "aprc.image" $sel }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.githubSecret" . }}, key: webhook-secret }
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.databaseSecret" . }}, key: DATABASE_URL }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aprc.fullname" . }}-gateway
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  selector: {{- include "aprc.selector" $sel | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }

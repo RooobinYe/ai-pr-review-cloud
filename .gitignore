@@ -1,0 +1,19 @@
+# Go
+/go/bin/
+*.test
+*.out
+
+# Node
+node_modules/
+/runner/dist/
+
+# Local secrets and planning
+.env
+.env.*
+*.pem
+.plans/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

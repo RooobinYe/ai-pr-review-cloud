@@ -1,0 +1,34 @@
+image:
+  # Images are named <registry>/ai-pr-review-cloud-<component>:<tag>.
+  registry: local
+  tag: dev
+  pullPolicy: IfNotPresent
+
+github:
+  # Existing Secret with key `webhook-secret` (later also `app-id` and `private-key`).
+  existingSecret: ""
+  # Used to create that Secret when existingSecret is empty. Development only.
+  webhookSecret: ""
+
+database:
+  # Existing Secret with key `DATABASE_URL`. Ignored when postgres.dev.enabled is true.
+  existingSecret: ""
+
+postgres:
+  dev:
+    # Single-replica, non-persistent PostgreSQL for local Kind clusters only.
+    enabled: true
+    image: postgres:17
+    password: dev-only-password
+
+gateway:
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+controller:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }

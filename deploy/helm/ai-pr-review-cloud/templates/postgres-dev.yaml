@@ -1,0 +1,47 @@
+{{- if .Values.postgres.dev.enabled }}
+{{- $sel := dict "root" . "component" "postgres" -}}
+# Development-only PostgreSQL: one replica, data lost on restart.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aprc.fullname" . }}-postgres
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "aprc.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aprc.selector" $sel | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.dev.image }}
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.dev.password | quote }}
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aprc.fullname" . }}-postgres
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector: {{- include "aprc.selector" $sel | nindent 4 }}
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+{{- end }}

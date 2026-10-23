@@ -1,0 +1,91 @@
+{{- $sel := dict "root" . "component" "controller" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "aprc.fullname" . }}-controller
+  labels: {{- include "aprc.labels" . | nindent 4 }}
+---
+# The controller creates and observes runner Jobs in its own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "aprc.fullname" . }}-controller
+  labels: {{- include "aprc.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "aprc.fullname" . }}-controller
+  labels: {{- include "aprc.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "aprc.fullname" . }}-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "aprc.fullname" . }}-controller
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aprc.fullname" . }}-controller
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels: {{- include "aprc.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "aprc.selector" $sel | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "aprc.fullname" . }}-controller
+      securityContext: {{- include "aprc.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ include "aprc.image" $sel }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.databaseSecret" . }}, key: DATABASE_URL }
+            - name: RUNNER_IMAGE
+              value: {{ include "aprc.image" (dict "root" . "component" "runner") }}
+            - name: FETCH_IMAGE
+              value: {{ include "aprc.image" (dict "root" . "component" "fetch") }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources: {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
+---
+# Runner callbacks (result, session snapshot, usage) arrive here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aprc.fullname" . }}-controller
+  labels:
+    {{- include "aprc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  selector: {{- include "aprc.selector" $sel | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }
