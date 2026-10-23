@@ -74,6 +74,7 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 - [x] 注册 demo 用的 GitHub App；本地 Kind 通过 webhook 转发工具（如 smee 或 cloudflared）接收事件。
 - [x] GitHub App 认证：App JWT 换取 installation token。
 - [x] controller 启动时执行 `store.Migrations`。
+- [x] draft PR 不触发评审；转为正式 PR 的 `ready_for_review` 事件触发评审，覆盖解析与 gateway 回归测试。
 - [x] gateway 写入 `review_run`（按 delivery ID 去重，`(repo, pr, head_sha)` 唯一）。
 - [x] controller 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 run，创建 Job（fetch init 容器 + runner）。
 - [x] fetch：浅克隆 head、拉取 base、写出 `/workspace/pr.json`。

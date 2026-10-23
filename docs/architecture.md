@@ -73,7 +73,7 @@ flowchart LR
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: pull_request opened / synchronize 或 /review 评论
+    [*] --> queued: 非 draft PR opened / synchronize / reopened / ready_for_review
     queued --> running: controller 领取并创建 Job
     running --> previewing: 仓库开启了预览，且评审阶段完成
     previewing --> running: 预览就绪或等待超时，进入验证阶段
@@ -360,11 +360,11 @@ controller 查询确认人当前的仓库权限，只允许 write、maintain、a
 
 | 项 | 取值 |
 | --- | --- |
-| 订阅事件 | `pull_request`（opened、synchronize、reopened、closed）、`issue_comment`（`/review`、`/merge`）、`pull_request_review` |
+| 订阅事件 | `pull_request`（opened、synchronize、reopened、ready_for_review、closed）、`issue_comment`（`/review`、`/merge`）、`pull_request_review` |
 | 权限 | Pull requests: write（投票、撤销旧票）、Contents: write（见下）、Checks: write、Metadata: read |
 | 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review，正文为结论的 `body`，逐行评论来自 `comments` 的 `path`、`line`；review 事件按 `verdict` 取 APPROVE 或 COMMENT（§6.3） |
 
-gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；M4 已接入 `issue_comment.created` 的 `/merge` 和 `pull_request_review.submitted` 的人工 approve，gateway 只记录确认；`closed` webhook 与 `/review` 命令尚未接入。等待合并期间由 controller 查询 PR 状态处理关闭。
+gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened、ready_for_review 四种触发，仅在 payload 的 `pull_request.draft=false` 时记录评审；draft PR 的事件返回 204，不写入 run，转为正式 PR 时由 `ready_for_review` 触发当前 head 的评审。此过滤只控制新评审触发，转回 draft 不取消已创建的 run。按 delivery ID 去重后写入 `queued` 的 run；M4 已接入 `issue_comment.created` 的 `/merge` 和 `pull_request_review.submitted` 的人工 approve，gateway 只记录确认；`closed` webhook 与 `/review` 命令尚未接入。等待合并期间由 controller 查询 PR 状态处理关闭。
 
 GitHub 只投递一次 webhook，失败不会自动重试，所以有两道保护。一是 gateway 的就绪检查（`/readyz`）确认最新的迁移已执行，数据库还没就绪时不接流量。二是 controller 每 5 分钟（`REDELIVER_INTERVAL`）用 App JWT 列出最近 100 次投递（`GET /app/hook/deliveries`），按 GUID 分组：24 小时内、每次尝试都没拿到 2xx、尝试不满 5 次的，重投最新那次（`POST /app/hook/deliveries/{id}/attempts`）。gateway 按 delivery ID 去重，重投与迟到的成功撞在一起也安全。这一步不依赖 controller 自己的状态，重启后照常工作。
 

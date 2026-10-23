@@ -42,13 +42,14 @@ type Trigger struct {
 
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// reviewActions are the pull_request actions that produce a new revision to review.
-var reviewActions = map[string]bool{"opened": true, "synchronize": true, "reopened": true}
+// reviewActions are the pull_request actions that can request a review.
+var reviewActions = map[string]bool{"opened": true, "synchronize": true, "reopened": true, "ready_for_review": true}
 
 type pullRequestEvent struct {
 	Action      string `json:"action"`
 	PullRequest struct {
-		Number int `json:"number"`
+		Number int  `json:"number"`
+		Draft  bool `json:"draft"`
 		Head   struct {
 			SHA string `json:"sha"`
 		} `json:"head"`
@@ -71,7 +72,7 @@ func TriggerFromEvent(eventType string, body []byte) (t Trigger, ok bool, err er
 	if err := json.Unmarshal(body, &ev); err != nil {
 		return Trigger{}, false, fmt.Errorf("decode pull_request event: %w", err)
 	}
-	if !reviewActions[ev.Action] {
+	if !reviewActions[ev.Action] || ev.PullRequest.Draft {
 		return Trigger{}, false, nil
 	}
 	t = Trigger{

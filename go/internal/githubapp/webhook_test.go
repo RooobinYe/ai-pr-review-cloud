@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -53,12 +54,32 @@ func TestTriggerFromEvent(t *testing.T) {
 	}{
 		{"opened", "pull_request", event("opened"), Trigger{"octo/demo", 7, sha, 42}, true, false},
 		{"synchronize", "pull_request", event("synchronize"), Trigger{"octo/demo", 7, sha, 42}, true, false},
+		{"reopened", "pull_request", event("reopened"), Trigger{"octo/demo", 7, sha, 42}, true, false},
+		{"ready for review", "pull_request", event("ready_for_review"), Trigger{"octo/demo", 7, sha, 42}, true, false},
+		{"converted to draft is ignored", "pull_request", event("converted_to_draft"), Trigger{}, false, false},
 		{"closed is ignored", "pull_request", event("closed"), Trigger{}, false, false},
 		{"other event is ignored", "push", event("opened"), Trigger{}, false, false},
 		{"malformed json", "pull_request", []byte(`{`), Trigger{}, false, true},
 		{"missing fields", "pull_request", []byte(`{"action":"opened"}`), Trigger{}, false, true},
 		{"short sha", "pull_request", []byte(`{"action":"opened","pull_request":{"number":7,"head":{"sha":"abc"}},` +
 			`"repository":{"full_name":"octo/demo"},"installation":{"id":42}}`), Trigger{}, false, true},
+	}
+	for _, action := range []string{"opened", "synchronize", "reopened", "ready_for_review"} {
+		for _, draft := range []bool{false, true} {
+			body := strings.Replace(string(event(action)), `"number":7`, fmt.Sprintf(`"number":7,"draft":%t`, draft), 1)
+			want := Trigger{"octo/demo", 7, sha, 42}
+			if draft {
+				want = Trigger{}
+			}
+			tests = append(tests, struct {
+				name      string
+				eventType string
+				body      []byte
+				want      Trigger
+				wantOK    bool
+				wantErr   bool
+			}{fmt.Sprintf("%s draft=%t", action, draft), "pull_request", []byte(body), want, !draft, false})
+		}
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
