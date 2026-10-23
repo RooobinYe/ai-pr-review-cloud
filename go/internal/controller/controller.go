@@ -263,12 +263,11 @@ func (c *Controller) createRunSecret(ctx context.Context, r store.Run, job kube.
 		return fmt.Errorf("mint virtual key: %w", err)
 	}
 	if err := c.kube.CreateSecret(ctx, BuildRunSecret(job, creds)); err != nil {
-		// No runner will ever see this key; an existing Secret holds its own.
-		if derr := c.keys.Delete(ctx, creds.LLMKey); derr != nil {
-			c.runLog(r).Warn("delete unused virtual key; it expires on its own", "err", derr)
-		}
 		if !errors.Is(err, kube.ErrAlreadyExists) {
 			return fmt.Errorf("create run secret: %w", err)
+		}
+		if derr := c.keys.Delete(ctx, creds.LLMKey); derr != nil {
+			c.runLog(r).Warn("delete unused virtual key; it expires on its own", "err", derr)
 		}
 	}
 	return nil

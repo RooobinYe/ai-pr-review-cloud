@@ -2,8 +2,31 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
+
+func TestLostSecretResponseKeepsUsableKey(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	r := h.state()
+	clear(h.kube.secrets)
+	h.kube.createSecretResponseErr = context.DeadlineExceeded
+	err := h.c.createRunSecret(context.Background(), r, h.kube.jobs[r.JobName])
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("create secret: %v, want deadline exceeded", err)
+	}
+	key := string(h.kube.secrets[runSecretName(r.JobName)].Data["LLM_API_KEY"])
+	if _, live := h.keys.live[key]; !live {
+		t.Fatal("persisted Secret references a revoked key")
+	}
+	issued := len(h.keys.issued)
+	h.kube.createSecretResponseErr = nil
+	h.reconcile()
+	if len(h.keys.issued) != issued {
+		t.Fatal("reconciliation minted another key despite the persisted Secret")
+	}
+}
 
 func TestRecreatedSecretGetsNewKey(t *testing.T) {
 	h := newHarness()

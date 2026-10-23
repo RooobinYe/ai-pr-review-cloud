@@ -196,9 +196,10 @@ func (g *fakeGitHub) UpdateCheckRun(_ context.Context, _ string, id int64, cr gi
 
 // fakeKube holds Jobs and Secrets by name.
 type fakeKube struct {
-	jobs    map[string]kube.Job
-	secrets map[string]kube.Secret
-	pods    []kube.Pod
+	jobs                    map[string]kube.Job
+	secrets                 map[string]kube.Secret
+	pods                    []kube.Pod
+	createSecretResponseErr error
 }
 
 func newFakeKube() *fakeKube {
@@ -232,7 +233,7 @@ func (k *fakeKube) CreateSecret(_ context.Context, s kube.Secret) error {
 		s.Data[key] = []byte(v)
 	}
 	k.secrets[s.Metadata.Name] = s
-	return nil
+	return k.createSecretResponseErr
 }
 
 func (k *fakeKube) GetSecret(_ context.Context, name string) (kube.Secret, error) {

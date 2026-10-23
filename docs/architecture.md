@@ -242,6 +242,8 @@ runner 通过环境变量选择模型，`ModelRuntime` 不读写 `~/.pi`：
 - LiteLLM 的 DeepSeek 适配会丢弃 `reasoning_effort`，pi 用它表达 thinking 级别，所以配置里加了 `allowed_openai_params: [reasoning_effort]`。`thinking`、assistant 消息上的 `reasoning_content`、`tools` 的 `strict` 都原样转发（v1.104.2 实测）。
 - LiteLLM 按 `llm.pricing`（每百万 token 的美元价，与 pi 目录一致）给虚拟 key 记账，`max_budget` 依赖这份价格。
 
+LiteLLM 的 readiness 和 liveness 探针超时设为 5 秒；liveness 每 10 秒检测一次，连续失败 6 次才重启，CPU request 为 250m。长评审的流式请求会延迟探针响应，默认 1 秒超时曾导致 proxy 重启、中断正在进行的模型请求。
+
 ## 5. 安全边界
 
 demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标之一，而且实现成本低。PR 内容（代码、描述、评论）全部视为不可信输入。
@@ -260,7 +262,7 @@ demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标�
 
 虚拟 key 的生命周期：
 
-- **签发。** controller 创建 Job 后、创建本 run 的 Secret 前调用 LiteLLM 的 `/key/generate`：`max_budget` 取 run 的 `budget_usd`，`models` 只含 `llm.model`，`key_alias` 为 Job 名，`duration` 为 Job 的 `activeDeadlineSeconds` 加 5 分钟。Secret 创建失败时立即删除刚签发的 key。
+- **签发。** controller 创建 Job 后、创建本 run 的 Secret 前调用 LiteLLM 的 `/key/generate`：`max_budget` 取 run 的 `budget_usd`，`models` 只含 `llm.model`，`key_alias` 为 Job 名，`duration` 为 Job 的 `activeDeadlineSeconds` 加 5 分钟。Secret 已存在时删除本次多签发的 key；其他创建错误可能是响应丢失但 Secret 已持久化，因此保留 key 并在下一轮检查 Secret，不确定未使用的 key 由到期机制兜底。
 - **吊销。** run 离开 `running` 时（收到结论后进入投票，或失败）controller 从 Secret 读出 key 并调用 `/key/delete`。吊销失败只记日志：key 到期自动失效，且预算有上限。controller 在签发与写入 Secret 之间崩溃会留下一个没人拿到的 key，同样到期失效。
 - **超预算。** LiteLLM 在请求前检查花费，超出后返回 `budget_exceeded`。pi 不重试这类错误；runner 不再追加提交提醒，以 `budget_exceeded: ...` 为失败原因退出，controller 原样写进 `review_run.error` 和 Check Run（§7.3）。
 
