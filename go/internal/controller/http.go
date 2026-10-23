@@ -144,6 +144,9 @@ func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if r.State == run.StateRunning {
+		if r.Config != nil {
+			res = r.Config.Apply(res)
+		}
 		err = c.store.SubmitResult(ctx, id, res)
 		if errors.Is(err, store.ErrConflict) {
 			r, err = c.store.Get(ctx, id)

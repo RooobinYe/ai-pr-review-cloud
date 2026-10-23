@@ -12,6 +12,7 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/litellm"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/repoconfig"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
@@ -19,6 +20,7 @@ import (
 
 // fakeStore mirrors the semantics of *store.Store in memory.
 type fakeStore struct {
+	signals      map[string][]store.MergeSignal
 	mu           sync.Mutex
 	runs         map[string]*store.Run
 	seq          int
@@ -90,7 +92,7 @@ func (s *fakeStore) Active(context.Context) ([]store.Run, error) {
 	var out []store.Run
 	for _, r := range s.sorted() {
 		unreported := (r.State == run.StateFailed || r.State == run.StateSuperseded) && !r.Done(store.ActionCheckRunComplete)
-		if r.State == run.StateRunning || r.State == run.StateReviewed || unreported {
+		if r.State == run.StateRunning || r.State == run.StateReviewed || r.State == run.StateAwaitingApproval || r.State == run.StateMerging || unreported {
 			out = append(out, s.copyOf(r))
 		}
 	}
@@ -110,6 +112,7 @@ func (s *fakeStore) Supersede(context.Context) ([]string, error) {
 		for _, n := range s.runs {
 			if n.Repo == r.Repo && n.PRNumber == r.PRNumber && n.CreatedAt.After(r.CreatedAt) {
 				r.State = run.StateSuperseded
+				delete(r.Actions, store.ActionCheckRunComplete)
 				ids = append(ids, r.ID)
 				break
 			}
@@ -203,6 +206,9 @@ func (s *fakeStore) Transition(_ context.Context, id string, from, to run.State,
 		return store.ErrConflict
 	}
 	r.State = to
+	if to == run.StateFailed || to == run.StateSuperseded {
+		delete(r.Actions, store.ActionCheckRunComplete)
+	}
 	if reason != "" {
 		r.Error = reason
 	}
@@ -222,6 +228,14 @@ func (s *fakeStore) RecordFetchTiming(_ context.Context, id string, started, fin
 
 // fakeGitHub records every write.
 type fakeGitHub struct {
+	config      []byte
+	configRefs  []string
+	configErr   error
+	writable    bool
+	merged      bool
+	closed      bool
+	merges      []string
+	mergeErr    error
 	mu          sync.Mutex
 	head        string
 	reviews     []githubapp.Review
@@ -248,6 +262,15 @@ func (g *fakeGitHub) FetchToken(_ context.Context, installationID int64, repo st
 func (g *fakeGitHub) GetPull(context.Context, string, int) (githubapp.Pull, error) {
 	var p githubapp.Pull
 	p.Head.SHA = g.head
+	p.Base.SHA = oldSHA
+	p.State = "open"
+	if g.closed || g.merged {
+		p.State = "closed"
+	}
+	p.Merged = g.merged
+	if g.merged {
+		p.MergeCommitSHA = "merged-sha"
+	}
 	return p, nil
 }
 
@@ -412,4 +435,51 @@ func (f *fakeKeys) Delete(_ context.Context, key string) error {
 	defer f.mu.Unlock()
 	delete(f.live, key)
 	return nil
+}
+
+func (s *fakeStore) SaveConfig(_ context.Context, id, sha string, cfg repoconfig.Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.runs[id]
+	if r.Config == nil && r.State == run.StateRunning {
+		r.Config = &cfg
+		r.ConfigSHA = sha
+		r.BudgetUSD = cfg.BudgetUSD
+	}
+	return nil
+}
+func (s *fakeStore) MergeSignals(_ context.Context, id string) ([]store.MergeSignal, error) {
+	return s.signals[id], nil
+}
+func (s *fakeStore) IgnoreMergeSignal(_ context.Context, id string) error {
+	for runID, signals := range s.signals {
+		for i, sig := range signals {
+			if sig.DeliveryID == id {
+				s.signals[runID] = append(signals[:i], signals[i+1:]...)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+func (g *fakeGitHub) RepositoryConfig(_ context.Context, _ string, ref string) ([]byte, error) {
+	g.configRefs = append(g.configRefs, ref)
+	return g.config, g.configErr
+}
+func (g *fakeGitHub) CanWrite(context.Context, string, string) (bool, error) { return g.writable, nil }
+func (g *fakeGitHub) GetReview(_ context.Context, _ string, _ int, id int64) (githubapp.Review, error) {
+	for _, r := range g.reviews {
+		if r.ID == id {
+			return r, nil
+		}
+	}
+	return githubapp.Review{}, &githubapp.APIError{Status: 404}
+}
+func (g *fakeGitHub) MergePull(_ context.Context, _ string, _ int, sha string) (string, error) {
+	if g.mergeErr != nil {
+		return "", g.mergeErr
+	}
+	g.merges = append(g.merges, sha)
+	g.merged = true
+	return "merged-sha", nil
 }

@@ -17,6 +17,7 @@ const maxPayloadBytes = 25 << 20
 
 // Recorder persists review triggers; *store.Store implements it.
 type Recorder interface {
+	RecordApproval(context.Context, string, store.Approval) error
 	RecordTrigger(ctx context.Context, deliveryID string, nr store.NewRun) (id string, created bool, err error)
 }
 
@@ -46,6 +47,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		approval, accepted, err := githubapp.ApprovalFromEvent(r.Header.Get("X-GitHub-Event"), body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if accepted {
+			if delivery == "" {
+				http.Error(w, "missing X-GitHub-Delivery", http.StatusBadRequest)
+				return
+			}
+			if err := h.Recorder.RecordApproval(r.Context(), delivery, store.Approval(approval)); err != nil {
+				h.Log.Error("record approval", "err", err)
+				http.Error(w, "could not record approval", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

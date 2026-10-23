@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // VerifySignature reports whether sig is a valid X-Hub-Signature-256 header
@@ -86,4 +87,77 @@ func TriggerFromEvent(eventType string, body []byte) (t Trigger, ok bool, err er
 		return Trigger{}, false, fmt.Errorf("pull_request event head sha %q is not a full commit SHA", t.HeadSHA)
 	}
 	return t, true, nil
+}
+
+// ApprovalEvent is a human confirmation, not a request to create another run.
+type ApprovalEvent struct {
+	Repo           string
+	PRNumber       int
+	InstallationID int64
+	HeadSHA        string
+	Actor          string
+	ReviewID       int64
+	CreatedAt      time.Time
+}
+
+func ApprovalFromEvent(kind string, body []byte) (ApprovalEvent, bool, error) {
+	var a ApprovalEvent
+	if kind != "issue_comment" && kind != "pull_request_review" {
+		return a, false, nil
+	}
+	type user struct {
+		Login string
+		Type  string
+	}
+	var e struct {
+		Action     string
+		Repository struct {
+			FullName string `json:"full_name"`
+		}
+		Installation struct{ ID int64 }
+		Issue        struct {
+			Number      int
+			PullRequest *struct{} `json:"pull_request"`
+		}
+		Comment struct {
+			Body      string
+			User      user
+			CreatedAt time.Time `json:"created_at"`
+		}
+		PullRequest struct{ Number int } `json:"pull_request"`
+		Review      struct {
+			ID          int64
+			State       string
+			CommitID    string `json:"commit_id"`
+			User        user
+			SubmittedAt time.Time `json:"submitted_at"`
+		}
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return a, false, fmt.Errorf("decode approval event: %w", err)
+	}
+	var actor user
+	switch kind {
+	case "issue_comment":
+		if e.Action != "created" || e.Issue.PullRequest == nil || strings.TrimSpace(e.Comment.Body) != "/merge" {
+			return a, false, nil
+		}
+		a.PRNumber, a.CreatedAt, actor = e.Issue.Number, e.Comment.CreatedAt, e.Comment.User
+	case "pull_request_review":
+		if e.Action != "submitted" || !strings.EqualFold(e.Review.State, "approved") {
+			return a, false, nil
+		}
+		a.PRNumber, a.HeadSHA, a.ReviewID, a.CreatedAt, actor = e.PullRequest.Number, e.Review.CommitID, e.Review.ID, e.Review.SubmittedAt, e.Review.User
+		if !shaPattern.MatchString(a.HeadSHA) || a.ReviewID <= 0 {
+			return a, false, fmt.Errorf("approval missing review id or commit")
+		}
+	}
+	if actor.Type != "User" || strings.HasSuffix(actor.Login, "[bot]") {
+		return a, false, nil
+	}
+	a.Repo, a.InstallationID, a.Actor = e.Repository.FullName, e.Installation.ID, actor.Login
+	if a.Repo == "" || a.PRNumber <= 0 || a.InstallationID <= 0 || a.Actor == "" || a.CreatedAt.IsZero() {
+		return a, false, fmt.Errorf("approval missing repository, PR, installation, actor or timestamp")
+	}
+	return a, true, nil
 }
