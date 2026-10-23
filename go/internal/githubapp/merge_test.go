@@ -41,6 +41,7 @@ func TestRepositoryConfigAPI(t *testing.T) {
 		})
 	}
 }
+
 func TestMergeAPIRequiresConfirmedSuccess(t *testing.T) {
 	for _, tt := range []struct {
 		status int
@@ -64,20 +65,28 @@ func TestMergeAPIRequiresConfirmedSuccess(t *testing.T) {
 		}
 	}
 }
+
 func TestPermissionAPI(t *testing.T) {
-	for _, permission := range []string{"read", "triage", "write", "maintain", "admin", "none"} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/repos/o/r/collaborators/human/permission" {
-				t.Errorf("wrong path %s", r.URL)
+	tests := []struct {
+		permission string
+		want       bool
+	}{
+		{"read", false}, {"triage", false}, {"write", true}, {"maintain", true}, {"admin", true}, {"none", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.permission, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repos/o/r/collaborators/human/permission" {
+					t.Errorf("wrong path %s", r.URL)
+				}
+				fmt.Fprintf(w, `{"permission":%q}`, tt.permission)
+			}))
+			defer server.Close()
+			c := Client{BaseURL: server.URL, Token: StaticToken("test")}
+			allowed, err := c.CanWrite(context.Background(), "o/r", "human")
+			if err != nil || allowed != tt.want {
+				t.Fatalf("allowed %v, want %v, err %v", allowed, tt.want, err)
 			}
-			fmt.Fprintf(w, `{"permission":%q}`, permission)
-		}))
-		c := Client{BaseURL: server.URL, Token: StaticToken("test")}
-		allowed, err := c.CanWrite(context.Background(), "o/r", "human")
-		server.Close()
-		want := permission == "write" || permission == "maintain" || permission == "admin"
-		if err != nil || allowed != want {
-			t.Fatalf("%s: allowed %v err %v", permission, allowed, err)
-		}
+		})
 	}
 }

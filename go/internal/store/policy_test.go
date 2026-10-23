@@ -2,11 +2,12 @@ package store
 
 import (
 	"context"
+	"testing"
+	"time"
+
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/repoconfig"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
-	"testing"
-	"time"
 )
 
 func TestPolicyAndApprovalPersistence(t *testing.T) {
@@ -118,6 +119,7 @@ func TestPolicyAndApprovalPersistence(t *testing.T) {
 		t.Fatalf("failed merge cannot report: %+v %v", active, err)
 	}
 }
+
 func TestSupersededApprovalCheckIsCancelled(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
 	id, _, err := s.RecordTrigger(ctx, "old", newRun("old"))

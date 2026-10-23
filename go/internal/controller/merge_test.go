@@ -14,21 +14,36 @@ import (
 )
 
 func TestDecideMerge(t *testing.T) {
-	for _, mode := range []string{repoconfig.Vote, repoconfig.Auto, repoconfig.Manual} {
-		for _, verdict := range review.Verdicts {
-			for _, confirmed := range []bool{false, true} {
-				r := store.Run{Config: &repoconfig.Config{ApprovalMode: mode}, Verdict: verdict}
-				want := verdict == review.VerdictApprove && (mode == repoconfig.Auto || mode == repoconfig.Manual && confirmed)
-				if decideMerge(r, confirmed) != want {
-					t.Errorf("%s %s confirmed=%v", mode, verdict, confirmed)
-				}
+	tests := []struct {
+		name, mode      string
+		verdict         review.Verdict
+		confirmed, want bool
+	}{
+		{"vote approval", repoconfig.Vote, review.VerdictApprove, false, false},
+		{"vote confirmed approval", repoconfig.Vote, review.VerdictApprove, true, false},
+		{"vote rejection", repoconfig.Vote, review.VerdictRequestChanges, true, false},
+		{"auto approval", repoconfig.Auto, review.VerdictApprove, false, true},
+		{"auto confirmed approval", repoconfig.Auto, review.VerdictApprove, true, true},
+		{"auto rejection", repoconfig.Auto, review.VerdictRequestChanges, false, false},
+		{"auto confirmed rejection", repoconfig.Auto, review.VerdictRequestChanges, true, false},
+		{"manual waits", repoconfig.Manual, review.VerdictApprove, false, false},
+		{"manual confirmed approval", repoconfig.Manual, review.VerdictApprove, true, true},
+		{"manual rejection", repoconfig.Manual, review.VerdictRequestChanges, false, false},
+		{"manual confirmed rejection", repoconfig.Manual, review.VerdictRequestChanges, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := store.Run{Config: &repoconfig.Config{ApprovalMode: tt.mode}, Verdict: tt.verdict}
+			if got := decideMerge(r, tt.confirmed); got != tt.want {
+				t.Errorf("decideMerge() = %v, want %v", got, tt.want)
 			}
-		}
+		})
 	}
 	if decideMerge(store.Run{Verdict: review.VerdictApprove}, true) {
 		t.Fatal("legacy run may not merge")
 	}
 }
+
 func TestRepositoryPolicySnapshot(t *testing.T) {
 	h := newHarness()
 	h.gh.config = []byte("approvalMode: manual\nbudgetUSD: 0.12\nlanguage: en")
@@ -56,6 +71,7 @@ func TestRepositoryPolicySnapshot(t *testing.T) {
 		t.Fatal("retry changed policy")
 	}
 }
+
 func TestInvalidPolicyFailsBeforeJob(t *testing.T) {
 	h := newHarness()
 	h.gh.config = []byte("approvalMode: typo")
@@ -71,61 +87,96 @@ func TestInvalidPolicyFailsBeforeJob(t *testing.T) {
 		t.Fatal("missing failed check")
 	}
 }
-func TestModes(t *testing.T) {
-	for _, mode := range []string{repoconfig.Vote, repoconfig.Auto, repoconfig.Manual} {
-		for _, blocked := range []bool{false, true} {
-			t.Run(mode+"/blocked="+map[bool]string{true: "yes", false: "no"}[blocked], func(t *testing.T) {
-				h := newHarness()
-				h.gh.config = []byte("approvalMode: " + mode)
-				h.reconcile()
-				res := result(review.VerdictApprove)
-				if blocked {
-					res.Comments = []review.Comment{{Path: "a.go", Line: 3, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"}}
-				}
-				if code := h.post(res); code != 204 {
-					t.Fatal(code)
-				}
-				h.reconcile()
-				if blocked || mode == repoconfig.Vote {
-					if h.state().State != run.StateDone || len(h.gh.merges) != 0 {
-						t.Fatalf("run %+v", h.state())
-					}
-					if blocked && (h.gh.posted[0].Event != "COMMENT" || h.state().Verdict != review.VerdictRequestChanges || !strings.Contains(h.state().Result.Body, "failOn=high")) {
-						t.Fatal("failOn not enforced")
-					}
-					return
-				}
-				if len(h.kube.jobs) != 0 || len(h.keys.live) != 0 {
-					t.Fatal("runner or key kept alive")
-				}
-				if mode == repoconfig.Manual {
-					if h.state().State != run.StateAwaitingApproval {
-						t.Fatal(h.state().State)
-					}
-					h.restart()
-					h.reconcile()
-					if h.state().State != run.StateAwaitingApproval {
-						t.Fatal("restart stopped waiting")
-					}
-					h.store.signals = map[string][]store.MergeSignal{runID: {{DeliveryID: "d1", Actor: "human"}}}
-					h.reconcile()
-					if len(h.store.signals[runID]) != 0 || h.state().State != run.StateAwaitingApproval {
-						t.Fatal("unprivileged confirmation allowed")
-					}
-					h.gh.writable = true
-					h.store.signals[runID] = []store.MergeSignal{{DeliveryID: "d2", Actor: "human"}}
-					h.reconcile()
-				}
-				h.reconcile()
-				h.restart()
-				h.reconcile()
-				if h.state().State != run.StateDone || len(h.gh.merges) != 1 || h.gh.merges[0] != headSHA {
-					t.Fatalf("run %+v merges %v", h.state(), h.gh.merges)
-				}
-			})
-		}
+
+func TestAutoMergeFlow(t *testing.T) {
+	h := newHarness()
+	h.gh.config = []byte("approvalMode: auto")
+	h.reconcile()
+	if code := h.post(result(review.VerdictApprove)); code != http.StatusNoContent {
+		t.Fatalf("post result: %d", code)
+	}
+	h.reconcile()
+	if got := h.state().State; got != run.StateMerging {
+		t.Fatalf("state %s, want merging", got)
+	}
+	if len(h.kube.jobs) != 0 || len(h.keys.live) != 0 {
+		t.Fatal("runner or key kept alive after review")
+	}
+	if len(h.gh.posted) != 1 || h.gh.posted[0].Event != "APPROVE" {
+		t.Fatalf("reviews %+v", h.gh.posted)
+	}
+	h.reconcile()
+	h.restart()
+	h.reconcile()
+	if h.state().State != run.StateDone || len(h.gh.merges) != 1 || h.gh.merges[0] != headSHA {
+		t.Fatalf("run %+v merges %v", h.state(), h.gh.merges)
 	}
 }
+
+func TestManualMergeWaitsForWriter(t *testing.T) {
+	h := newHarness()
+	h.gh.config = []byte("approvalMode: manual")
+	h.reconcile()
+	if code := h.post(result(review.VerdictApprove)); code != http.StatusNoContent {
+		t.Fatalf("post result: %d", code)
+	}
+	h.reconcile()
+	if got := h.state().State; got != run.StateAwaitingApproval {
+		t.Fatalf("state %s, want awaiting_approval", got)
+	}
+	if len(h.kube.jobs) != 0 || len(h.keys.live) != 0 {
+		t.Fatal("runner or key kept alive while waiting")
+	}
+	h.restart()
+	h.reconcile()
+	if h.state().State != run.StateAwaitingApproval || len(h.gh.merges) != 0 {
+		t.Fatal("restart did not preserve waiting")
+	}
+
+	h.store.signals = map[string][]store.MergeSignal{runID: {{DeliveryID: "reader", Actor: "human"}}}
+	h.reconcile()
+	if len(h.store.signals[runID]) != 0 || h.state().State != run.StateAwaitingApproval {
+		t.Fatal("unprivileged confirmation was not ignored")
+	}
+	h.gh.writable = true
+	h.store.signals[runID] = []store.MergeSignal{{DeliveryID: "writer", Actor: "human"}}
+	h.reconcile()
+	if got := h.state().State; got != run.StateMerging {
+		t.Fatalf("state %s after writer confirmation, want merging", got)
+	}
+	h.reconcile()
+	h.restart()
+	h.reconcile()
+	if h.state().State != run.StateDone || len(h.gh.merges) != 1 || h.gh.merges[0] != headSHA {
+		t.Fatalf("run %+v merges %v", h.state(), h.gh.merges)
+	}
+}
+
+func TestFailOnPreventsApprovalAndMerge(t *testing.T) {
+	for _, mode := range []string{repoconfig.Vote, repoconfig.Auto, repoconfig.Manual} {
+		t.Run(mode, func(t *testing.T) {
+			h := newHarness()
+			h.gh.config = []byte("approvalMode: " + mode)
+			h.reconcile()
+			res := result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"})
+			if code := h.post(res); code != http.StatusNoContent {
+				t.Fatalf("post result: %d", code)
+			}
+			h.reconcile()
+			if r := h.state(); r.State != run.StateDone || r.Verdict != review.VerdictRequestChanges {
+				t.Fatalf("run %+v", r)
+			}
+			if len(h.gh.posted) != 1 || h.gh.posted[0].Event != "COMMENT" || len(h.gh.merges) != 0 {
+				t.Fatalf("reviews %+v, merges %v", h.gh.posted, h.gh.merges)
+			}
+			cr := h.gh.checkRuns[100]
+			if cr[len(cr)-1].Conclusion != "neutral" {
+				t.Fatalf("check %+v, want neutral", cr[len(cr)-1])
+			}
+		})
+	}
+}
+
 func TestManualReviewConfirmation(t *testing.T) {
 	for _, tt := range []struct {
 		name, state, sha string
@@ -151,42 +202,69 @@ func TestManualReviewConfirmation(t *testing.T) {
 		})
 	}
 }
-func TestMergeRecoveryAndRejections(t *testing.T) {
-	for _, status := range []int{0, 405, 409, 422, 503} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+
+func TestRestartAfterMergeBeforeRecordDoesNotMergeTwice(t *testing.T) {
+	h := newHarness()
+	h.gh.config = []byte("approvalMode: auto")
+	h.reconcile()
+	h.post(result(review.VerdictApprove))
+	h.reconcile()
+	h.store.crashOn = store.ActionMerge
+	h.reconcile()
+	if h.state().State != run.StateMerging || h.state().Done(store.ActionMerge) || len(h.gh.merges) != 1 {
+		t.Fatalf("setup: run %+v, merges %v", h.state(), h.gh.merges)
+	}
+	h.restart()
+	h.reconcile()
+	if r := h.state(); r.State != run.StateDone || r.Actions[store.ActionMerge] != "merged-sha" || len(h.gh.merges) != 1 {
+		t.Fatalf("run %+v, merges %v", r, h.gh.merges)
+	}
+}
+
+func TestMergeErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		want   run.State
+	}{
+		{"branch protection", http.StatusMethodNotAllowed, run.StateFailed},
+		{"head changed", http.StatusConflict, run.StateFailed},
+		{"invalid request", http.StatusUnprocessableEntity, run.StateFailed},
+		{"temporary outage", http.StatusServiceUnavailable, run.StateMerging},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness()
 			h.gh.config = []byte("approvalMode: auto")
 			h.reconcile()
 			h.post(result(review.VerdictApprove))
 			h.reconcile()
-			if status == 0 {
-				h.store.crashOn = store.ActionMerge
-			} else {
-				h.gh.mergeErr = &githubapp.APIError{Status: status, Message: "cannot merge"}
-			}
+			h.gh.mergeErr = &githubapp.APIError{Status: tt.status, Message: "cannot merge"}
 			h.reconcile()
-			if status == 405 || status == 409 || status == 422 {
-				if h.state().State != run.StateFailed {
-					t.Fatal(h.state().State)
-				}
+			if got := h.state().State; got != tt.want {
+				t.Fatalf("state %s, want %s", got, tt.want)
+			}
+			if tt.want == run.StateFailed {
 				cr := h.gh.checkRuns[100]
 				if cr[len(cr)-1].Conclusion != "failure" {
 					t.Fatal("merge refusal not visible")
 				}
+				h.reconcile()
+				if len(h.gh.checkRuns[100]) != len(cr) {
+					t.Fatal("failure reported twice")
+				}
 				return
-			}
-			if h.state().State != run.StateMerging {
-				t.Fatal(h.state().State)
 			}
 			h.gh.mergeErr = nil
 			h.restart()
 			h.reconcile()
 			if h.state().State != run.StateDone || len(h.gh.merges) != 1 {
-				t.Fatalf("state %s merges %v", h.state().State, h.gh.merges)
+				t.Fatalf("run %+v, merges %v", h.state(), h.gh.merges)
 			}
 		})
 	}
 }
+
 func TestChangedOrClosedPullNeverMerges(t *testing.T) {
 	for _, mode := range []string{repoconfig.Auto, repoconfig.Manual} {
 		for _, closed := range []bool{false, true} {
@@ -208,11 +286,12 @@ func TestChangedOrClosedPullNeverMerges(t *testing.T) {
 		}
 	}
 }
+
 func TestResultThresholdStoredOnce(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
 	res := result(review.VerdictApprove, review.Comment{Path: "a", Line: 1, Severity: review.SeverityCritical, Confidence: review.ConfidenceHigh, Body: "bug"})
-	if h.post(res) != 204 || h.post(res) != 204 {
+	if h.post(res) != http.StatusNoContent || h.post(res) != http.StatusNoContent {
 		t.Fatal("callback not idempotent")
 	}
 	if strings.Count(h.state().Result.Body, "AI Review policy") != 1 {
