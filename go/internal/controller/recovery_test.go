@@ -5,7 +5,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -247,7 +246,7 @@ func TestNewCommitSupersedesRun(t *testing.T) {
 	}
 }
 
-func TestSessionAndUsageAPI(t *testing.T) {
+func TestSessionAPI(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
 	token := h.runToken()
@@ -265,20 +264,6 @@ func TestSessionAndUsageAPI(t *testing.T) {
 	h.putSession(token, 4, "four") // a delayed upload must not roll back
 	if got := h.call(http.MethodGet, "/runs/"+runID+"/session", token, nil).Body.String(); got != "five" {
 		t.Errorf("session %q, want the newest turn", got)
-	}
-
-	u := store.Usage{Turn: 2, Model: "deepseek/deepseek-flash", InputTokens: 100, OutputTokens: 20, CacheReadTokens: 900, CostUSD: 0.001}
-	body, _ := json.Marshal(u)
-	if code := h.call(http.MethodPut, "/runs/"+runID+"/usage", token, body).Code; code != http.StatusNoContent {
-		t.Errorf("put usage: %d", code)
-	}
-	if got := h.store.usage[runID][2]; got != u {
-		t.Errorf("usage %+v, want %+v", got, u)
-	}
-	for _, bad := range []string{`{"turn":1}`, `{"turn":1,"model":"m","input_tokens":-1}`, `{"turn":1,"model":"m","extra":1}`} {
-		if code := h.call(http.MethodPut, "/runs/"+runID+"/usage", token, []byte(bad)).Code; code != http.StatusBadRequest {
-			t.Errorf("usage %s: %d, want 400", bad, code)
-		}
 	}
 
 	h.post(result(review.VerdictApprove))

@@ -36,6 +36,8 @@ func TestUsageReports(t *testing.T) {
 		{"wrong token", turn(3, "0.01"), "wrong", http.StatusUnauthorized},
 		{"turn zero", turn(0, "0.01"), h.runToken(), http.StatusBadRequest},
 		{"negative cost", turn(3, "-1"), h.runToken(), http.StatusBadRequest},
+		{"missing model", `{"turn":1}`, h.runToken(), http.StatusBadRequest},
+		{"negative tokens", `{"turn":1,"model":"m","input_tokens":-1}`, h.runToken(), http.StatusBadRequest},
 		{"unknown field", `{"turn":3,"model":"m","extra":1}`, h.runToken(), http.StatusBadRequest},
 		{"not json", `turn 3`, h.runToken(), http.StatusBadRequest},
 	} {
@@ -44,7 +46,8 @@ func TestUsageReports(t *testing.T) {
 		}
 	}
 	got := h.store.usage[runID]
-	if len(got) != 2 || got[1].CostUSD != 0.02 || got[2].CacheReadTokens != 900 {
+	want := store.Usage{Turn: 2, Model: "deepseek/deepseek-flash", InputTokens: 100, OutputTokens: 20, CacheReadTokens: 900, CostUSD: 0.03}
+	if len(got) != 2 || got[1].CostUSD != 0.02 || got[2] != want {
 		t.Errorf("stored usage %+v", got)
 	}
 

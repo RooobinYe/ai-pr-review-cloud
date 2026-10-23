@@ -118,7 +118,10 @@ test("a crashed review resumes from its last snapshot", async () => {
 });
 
 test("a review submitted before the crash is reported without calling the model", async () => {
-  const first = await run(undefined, [fauxAssistantMessage(fauxToolCall("submit_review", submission))]);
+  const first = await run(undefined, [fauxAssistantMessage(fauxToolCall("submit_review", {
+    ...submission,
+    comments: [{ ...submission.comments[0]!, path: "./b/a.go" }],
+  }))]);
   const submitted = parseSessionEntries(first.snapshots.at(-1)!.jsonl);
   const second = await run(submitted, []);
   assert.deepEqual(second.outcome.submission, submission);
@@ -148,16 +151,6 @@ test("acceptedSubmission ignores rejected calls", async () => {
   const commentable = commentableLines(pr.diff);
   assert.equal(acceptedSubmission(parseSessionEntries(first.snapshots[1]!.jsonl), commentable), undefined, "rejected anchor counted as submitted");
   assert.deepEqual(acceptedSubmission(parseSessionEntries(first.snapshots.at(-1)!.jsonl), commentable), submission);
-});
-
-test("a recovered submission keeps normalized comment paths", async () => {
-  const first = await run(undefined, [fauxAssistantMessage(fauxToolCall("submit_review", {
-    ...submission,
-    comments: [{ ...submission.comments[0]!, path: "./b/a.go" }],
-  }))]);
-  const second = await run(parseSessionEntries(first.snapshots.at(-1)!.jsonl), []);
-  assert.deepEqual(second.outcome.submission, submission);
-  assert.equal(second.faux.state.callCount, 0);
 });
 
 test("a proxy budget rejection survives the recovery pipeline", async () => {
