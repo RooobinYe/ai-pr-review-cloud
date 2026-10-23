@@ -15,7 +15,7 @@ import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } fro
 import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import { ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
+import { ReviewFailedError, ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
 import { ReviewResultSchema, SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 
 const USAGE = `usage: runner --pr <github-pr-url> [--format markdown|json] [--language <name>] [--keep]
@@ -92,7 +92,7 @@ async function reviewPR(
     }
     return result;
   } catch (err) {
-    if (err instanceof ReviewNotSubmittedError) {
+    if (err instanceof ReviewFailedError) {
       log(formatUsage({ ...err.stats.tokens, cost: err.stats.cost }, (Date.now() - started) / 1000));
     }
     throw err;
@@ -169,6 +169,14 @@ async function main(): Promise<number> {
   console.error(USAGE);
   return 2;
 }
+
+// Node as PID 1 ignores SIGTERM, so a deleted Pod (a superseded run, or one
+// being evicted) would keep reviewing, and paying, through its grace period.
+// The exit is retryable; the next attempt resumes from the last snapshot.
+process.on("SIGTERM", () => {
+  log("terminated");
+  process.exit(143);
+});
 
 main().then(
   (code) => process.exit(code),

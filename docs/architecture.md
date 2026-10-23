@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：M1 完成，最小闭环在本仓库的 PR 上实测通过；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M1 完成，最小闭环在本仓库的 PR 上实测通过；M3 已实现，崩溃恢复在 Kind 上实测有效，完整验收待补；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -101,19 +101,19 @@ stateDiagram-v2
 
 ### 3.1 数据表
 
-表结构以 [`go/internal/store/migrations/0001_init.sql`](../go/internal/store/migrations/0001_init.sql) 为准，这里只说明每张表的作用和约束：
+表结构以 [`go/internal/store/migrations/`](../go/internal/store/migrations/) 下按序执行的迁移为准，这里只说明每张表的作用和约束：
 
 | 表 | 作用 | 关键约束 |
 | --- | --- | --- |
-| `review_run` | 一次评审，状态机的载体；记录 `installation_id`（controller 换 token 用）和失败原因 `error`（写到 Check Run） | `UNIQUE (repo, pr_number, head_sha)`；`state`、`verdict` 用 CHECK 限定取值；处于 `reviewed`、`awaiting_approval`、`merging`、`done` 时 `verdict` 必须非空；活跃 run 有部分索引供 controller 扫描 |
+| `review_run` | 一次评审，状态机的载体；记录 `installation_id`（controller 换 token 用）、当前尝试的序号 `attempt` 与领取时间 `claimed_at`（单次尝试的时限从这里算），以及失败原因 `error`（写到 Check Run；重试时记录上一次尝试的失败原因） | `UNIQUE (repo, pr_number, head_sha)`；`state`、`verdict` 用 CHECK 限定取值；处于 `reviewed`、`awaiting_approval`、`merging`、`done` 时 `verdict` 必须非空；活跃 run 有部分索引供 controller 扫描 |
 | `webhook_delivery` | 已记录的 webhook delivery ID，GitHub 重投时去重 | 主键 `delivery_id` |
 | `github_action` | 每个 GitHub 写操作一行：`dismiss_stale_approvals`（撤销旧票）、`check_run_create`、`check_run_complete`、`review`（投票，§6.3）、`merge`（M4） | 主键 `(run_id, kind)`；`external_id` 非空表示已完成；取值在 `go/internal/store/store.go` 里也有一份 |
-| `run_session` | runner 每轮结束上传的 pi session 快照，用于崩溃恢复 | 每个 run 只保留最新一份 |
-| `run_usage` | 每轮的模型、token 和金额 | 主键 `(run_id, turn)`，重复上报覆盖而不是累加 |
+| `run_session` | runner 每轮结束上传的 pi session 快照（JSONL），用于崩溃恢复 | 每个 run 只保留一份；轮次更早的上传被忽略，迟到的请求不会把快照回退；只在 `running` 时接受 |
+| `run_usage` | 每轮的模型、输入、输出、缓存读写 token 和金额 | 主键 `(run_id, turn)`，重复上报覆盖而不是累加；任何状态都接受，花掉的钱照记 |
 
 状态取值在 [`go/internal/run/state.go`](../go/internal/run/state.go) 里也有一份，同时定义了上图的全部合法转换，改一处必须同步另一处。
 
-controller 启动时执行嵌入的迁移（`schema_migration` 表记录已执行的版本，advisory lock 串行化多副本）。领取任务用 `SELECT ... FOR UPDATE SKIP LOCKED`，多副本 controller 也不会重复领取。GitHub 写操作前先查 `github_action`，`external_id` 非空就跳过；写成功后回填 `external_id`，再推进状态。写成功但回填前崩溃会重复这一次写操作，M3 处理。
+controller 启动时执行嵌入的迁移（`schema_migration` 表记录已执行的版本，advisory lock 串行化多副本）。领取任务用 `SELECT ... FOR UPDATE SKIP LOCKED`，多副本 controller 也不会重复领取。GitHub 写操作前先查 `github_action`，`external_id` 非空就跳过；写成功后回填 `external_id`，再推进状态。写成功但回填前崩溃的窗口由"写之前先在 GitHub 上找"补上：Check Run 按 `external_id`（即 run ID）查找，投票按 review 正文末尾的隐藏标记 `<!-- ai-pr-review run=<id> -->` 查找，找到就直接回填，不再写第二次。撤销旧票本身幂等（已撤销的票不再是 APPROVED），完成 Check Run 是 PATCH，重复执行无害。
 
 ## 4. runner 设计（pi SDK）
 
@@ -124,8 +124,9 @@ Pod (Job: review-<run-id>-<attempt>)
 ├── initContainer: fetch（alpine + git）
 │     env: GITHUB_TOKEN = 只读、1 小时有效、只能访问本仓库的 installation token
 │                         （来自 Secret review-<run-id>-<attempt>-credentials，归 Job 所有，随 Job 删除）
-│          REPO, PR_NUMBER, HEAD_SHA, WORKSPACE=/workspace
-│     作用: 克隆 head（往前 20 个提交）到 /workspace/repo、拉取 base、写出 /workspace/pr.json（元信息 + diff）
+│          REPO, PR_NUMBER, HEAD_SHA, BOT_LOGIN, WORKSPACE=/workspace
+│     作用: 克隆 head（往前 20 个提交）到 /workspace/repo、拉取 base、写出 /workspace/pr.json
+│          （元信息、diff，以及 bot 在该 PR 上留过的逐行评论）
 │     token 经 git 的环境变量配置传入，不进 argv 和 .git/config；结束后随容器退出，主容器读不到
 ├── container: runner
 │     env: RUN_ID, CONTROLLER_URL, RUN_TOKEN（回调 controller 用，同一个 Secret 的另一个 key，fetch 读不到）,
@@ -135,9 +136,11 @@ Pod (Job: review-<run-id>-<attempt>)
 └── NetworkPolicy: 出站只允许 LiteLLM proxy、controller、kube-apiserver（预览阶段）
 ```
 
-两个容器都以 UID 1000（runner 镜像的 `node` 用户）运行，git 才会信任 fetch 留下的工作区。blob 一次拉全，不用部分克隆：runner 没有凭据，之后也没有外网，无法按需补拉。fetch 发现 PR 的 head 已不是本 run 的 `head_sha` 时直接失败，新提交有自己的 run。
+两个容器都以 UID 1000（runner 镜像的 `node` 用户）运行，git 才会信任 fetch 留下的工作区。blob 一次拉全，不用部分克隆：runner 没有凭据，之后也没有外网，无法按需补拉。fetch 发现 PR 的 head 已不是本 run 的 `head_sha` 时直接失败（退出码 3，不重试），新提交有自己的 run。
 
-容器失败时，退出信息（`terminationMessagePolicy: FallbackToLogsOnError`，即日志末尾）由 controller 读出，写进 `review_run.error` 和 Check Run。
+同一 PR 再次评审时，fetch 用 GraphQL 取回 bot 自己的逐行评论线程（最近 100 个线程中最多 30 条，每条截断到 2000 字节），连同 `isResolved`、`isOutdated` 写进 `pr.json` 的 `previousComments`。提示词要求模型不重复已解决或已修复的问题，仍然存在的问题注明"上次评审未解决"，把精力放在新改动上。这些评论引用了 PR 代码，在提示词里同样按不可信输入包起来。取不到时只打警告，评审照常进行。GraphQL 里 bot 的登录名没有 REST 的 `[bot]` 后缀，比较时去掉。
+
+容器失败时，退出信息（`terminationMessagePolicy: FallbackToLogsOnError`，即日志末尾）由 controller 读出，写进 `review_run.error` 和 Check Run。退出码 3（`run.ExitFinal`）表示重试也没用：fetch 遇到 head 已变、GitHub 401/404/410/422，runner 遇到结果被 controller 拒绝、`pr.json` 不合法、模型被提醒两次仍不提交。其余失败都会重试（§4.3）。
 
 ### 4.2 执行流程
 
@@ -163,34 +166,41 @@ const { session } = await createAgentSession({
   modelRuntime,
   thinkingLevel,
   resourceLoader: isolatedResources(systemPrompt(language)),
-  sessionManager: SessionManager.inMemory(cwd),      // M3 换成可恢复的 session，见 4.3
+  sessionManager: SessionManager.inMemory(cwd, undefined, resumeFrom), // 上一次尝试的快照，见 4.3
   settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 3 } }),
   tools: ["read", "grep", "find", "ls", "git", "submit_review"],
   customTools: [gitTool(cwd), submitReviewTool(commentableLines(pr.diff), onSubmit)],
 });
 
-// 集群模式（M1、M3）：每轮结束上报快照和用量
-session.subscribe(async (e) => {
+// 集群模式：每轮结束时同步取快照，排队依次上传；上传失败只记日志
+session.subscribe((e) => {
   if (e.type === "turn_end") {
-    await controller.putSession(runId, await readSessionFile());   // 崩溃恢复快照
-    await controller.putUsage(runId, usageOf(e));                  // usage.input / output / cost.total
+    const snapshot = snapshotOf(sessionManager, e.message);        // 轮次、JSONL、本轮用量
+    uploads = uploads.then(() => onTurn(snapshot));                // PUT /session，PUT /usage
   }
 });
 
-await session.prompt(userPrompt(pr));
+await session.prompt(resumeFrom ? RESUME_PROMPT : userPrompt(pr));
 for (let i = 0; !submitted && i < MAX_SUBMIT_REMINDERS; i++) await session.prompt(SUBMIT_REMINDER);
 ```
 
 ### 4.3 崩溃恢复
 
+runner 每轮（一次模型回复加它触发的工具调用）结束时，把整个 pi session 序列化成 JSONL（header 一行，之后每个 entry 一行，与 pi 的 session 文件格式相同）`PUT /runs/{id}/session?turn=N`，再把本轮用量 `PUT /runs/{id}/usage`。快照在 `turn_end` 事件里同步取，上传在后台排队依次进行，失败只记日志，不中断评审。新 Pod 启动时 `GET /runs/{id}/session`，有快照就用 `SessionManager.inMemory(cwd, undefined, entries)` 载入，追加一条"进程中断后已恢复，从上次完成的步骤继续"的提示，否则从头开始。这三个接口和结果回调一样用本次尝试的 `RUN_TOKEN` 鉴权，旧尝试的 token 随旧 Job 的 Secret 一起失效。
+
 | 场景 | 处理 |
 | --- | --- |
-| runner Pod 被驱逐、OOM、节点故障 | Job 失败，controller 把 run 放回 `queued`、`attempt + 1`，新 Pod 启动后 `GET /runs/{id}/session`，有快照就 `SessionManager.open(file)` 继续，否则从头开始 |
-| 中途崩在某次工具调用里 | 恢复后最后一轮会重跑。探索阶段工具都是只读的，重跑安全 |
-| 模型 API 超时 / 限流 | pi 自带 `auto_retry`；仍失败则整个 Pod 失败，走上一行 |
-| `submit_review` 已调用但进程在退出前崩溃 | controller 已收到结果并推进到 `reviewed`，Job 失败被忽略 |
-| controller 重启 | 状态全在数据库，重新扫描即可；`github_action` 保证不重复评论 |
-| 超过 `attempt` 上限或总时长 | 状态置为 `failed`，在 Check Run 上标记失败并给出原因 |
+| runner Pod 被删除、驱逐、OOM、节点故障 | Job 失败（`backoffLimit: 0`）。controller 判断可重试且 `attempt` 未到上限（`MAX_ATTEMPTS`，默认 3），就把 run 放回 `queued`，Check Run 显示"第 2 次尝试"；下一轮领取时 `attempt + 1`，新 Job 带新 Secret 和新 token，runner 从快照继续 |
+| 中途崩在某次工具调用里 | 快照只在轮次结束时取，恢复后被打断的那一轮重跑。探索阶段工具都是只读的，重跑安全；那一轮已经花掉的 token 不会上报 |
+| `submit_review` 已被接受但结果还没送到 controller | 恢复时在快照里找到被接受的 `submit_review` 调用，直接上报它的参数，不再调用模型 |
+| 结果已送到、进程退出前崩溃 | controller 已推进到 `reviewed`，Job 失败被忽略 |
+| 模型 API 超时、限流、余额不足 | pi 自带重试；仍失败的请求不算"模型没提交"，不消耗提交提醒，runner 以退出码 1 退出，走第一行 |
+| 确定性失败（退出码 3，见 §4.1） | 不重试，直接 `failed` |
+| 单次尝试超时 | Job 的 `activeDeadlineSeconds` 到期（`DeadlineExceeded`）直接 `failed`，不重试。另外从 `claimed_at` 起超过时限加 5 分钟还没结果的尝试也会失败并删除 Job，覆盖 Job 一直建不出来、GitHub 调用一直失败等情况 |
+| controller 重启 | 状态全在数据库，重新扫描即可；写 GitHub 之前先查 `github_action`，再在 GitHub 上找本 run 已写过的 Check Run 和投票（§3.1），所以不会重复评论或重复投票 |
+| 超过 `attempt` 上限 | `failed`，Check Run 写明尝试次数和最后一次的原因 |
+
+每一种故障都有对应的测试：controller 侧见 `go/internal/controller/recovery_test.go`（丢 Pod 后续跑、重试上限、确定性失败、尝试超时、写 GitHub 后回填前崩溃、新提交取代旧 run），runner 侧见 `runner/src/review.test.ts`（用 pi 的 faux 模型验证从快照续跑、已提交的结论不再调用模型）。
 
 ### 4.4 评审结论：模型决定，形状对齐 GitHub Review
 
@@ -254,11 +264,12 @@ demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标�
 
 - 全局最大并发 `maxRunning`，单仓库最大并发 `maxRunningPerRepo`，超出的 run 留在 `queued`。
 - runner 所在 namespace 配 `ResourceQuota` 和 `LimitRange`，防止一次大 PR 吃光节点。
-- Job 设置 `activeDeadlineSeconds`、`ttlSecondsAfterFinished`；`backoffLimit: 0`，重试由 controller 统一决定（这样才能带上 session 快照恢复）。
+- Job 设置 `activeDeadlineSeconds`、`ttlSecondsAfterFinished`；`backoffLimit: 0`，重试由 controller 统一决定（这样才能带上 session 快照恢复，§4.3）。
 - 冷启动优化：runner 镜像预装 pi 依赖和 git（M5 再加 kubectl）；fetch 阶段浅克隆（depth 1 + 按需拉 base）。实测后再决定要不要加 git mirror 缓存。
 - 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 token；M2 起还有虚拟 key、回调 token）。M5 的预览环境需要创建 namespace，届时再加一个只含 `namespaces` 的 ClusterRole。
 - Kubernetes 访问：controller 只用到 Job、Secret、Pod 的少数几个调用，`go/internal/kube` 直接调 REST API（in-cluster token 每次请求重读），不引入 client-go，controller 镜像保持在十几 MB。M5 需要部署 Helm chart 时再评估。
-- 每轮 reconcile（5 秒一次，收到结果时立即触发）：领取 `queued`；对 `running` 依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态判定失败；对 `reviewed` 投票、完成 Check Run、推进到 `done`；对已失败但 Check Run 还没收尾的 run 补写失败结论。每一步都是幂等的，崩溃后重跑即可。
+- 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run、推进到 `done`；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。
+- 同一 PR 的新提交到达后，旧 run 只要还没到 `reviewed`（`queued`、`running`、`previewing`、`awaiting_approval`）就被取代，它的 Job 连同 Pod 和 Secret 一起删除（`propagationPolicy: Background`），之后再到的结果、快照都被拒绝。已经 `reviewed` 的 run 让它投完：投票前会检查 head（§6.3）。
 
 ### 6.2 预览环境
 
@@ -278,7 +289,8 @@ AI 的身份是 GitHub App bot（如 `ai-pr-review[bot]`）。每个 run 结束�
 
 - **发现问题时用 COMMENT，不用 REQUEST_CHANGES。** REQUEST_CHANGES 会一直阻塞合并，直到 bot 改投或有人 dismiss；AI 误判时会卡住 PR。COMMENT 把问题写清楚，是否合并留给人。
 - **新提交到达时撤销旧票。** COMMENT 不会覆盖 bot 之前的 APPROVE，旧票会一直计数。所以同一个 PR 的新 `head_sha` 的 run 开始时，controller 先 dismiss bot 在该 PR 上针对其他提交、仍然有效的 APPROVE，再评审新提交；新的 approve 只针对评审过的 `head_sha`（review 的 `commit_id`）。仓库开了"Dismiss stale pull request approvals"时 GitHub 也会自动撤销，两者不冲突。
-- **只在评审的提交仍是 head 时投 APPROVE。** 旧提交的 run 可能在新 run 撤销旧票之后才完成；此时投 APPROVE 会给没看过的代码计一票。所以投票前查一次 PR 的 head，不一致就改投 COMMENT。M3 的 `superseded` 会更早终止这类 run。
+- **只在评审的提交仍是 head 时投 APPROVE。** 旧提交的 run 可能在新 run 撤销旧票之后才完成；此时投 APPROVE 会给没看过的代码计一票。所以投票前查一次 PR 的 head，不一致就改投 COMMENT。还在评审中的旧 run 会更早被 `superseded` 终止（§6.1），这条规则只兜底已经交出结论的那些。
+- **每个 run 只投一票。** review 正文末尾带 `<!-- ai-pr-review run=<id> -->`，投票前先在 bot 的 review 里找这个标记，controller 在投票后、记录前崩溃也不会再投一次（§3.1）。
 - **逐行评论被拒时折叠进正文。** `submit_review` 已保证锚点落在 diff 内，GitHub 仍返回 422 时，controller 把评论按严重程度列进 review 正文重新提交，不丢内容。
 - **Check Run 的结论**：approve 为 `success`，request_changes 为 `neutral`（结论由投票表达；若仓库把 "AI Review" 设为必需检查，`failure` 会阻塞合并），run 失败为 `failure` 并附原因。
 - **AI 的票计入"需要 N 个 approval"的前提**是 App 对仓库有写权限（Contents: write，M1 实测，§6.4）。branch protection 要求 Code Owners 审批时，这一项只能由人满足，App 不能成为 code owner。
@@ -304,7 +316,9 @@ func decideMerge(run ReviewRun, cfg RepoConfig) bool {
 | 权限 | Pull requests: write（投票、撤销旧票）、Contents: write（见下）、Checks: write、Metadata: read |
 | 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review，正文为结论的 `body`，逐行评论来自 `comments` 的 `path`、`line`；review 事件按 `verdict` 取 APPROVE 或 COMMENT（§6.3） |
 
-gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；`closed`、`issue_comment`、`pull_request_review` 在 M3 到 M5 接入。
+gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；`closed`、`issue_comment`、`pull_request_review` 在 M4、M5 接入。
+
+GitHub 只投递一次 webhook，失败不会自动重试，所以有两道保护。一是 gateway 的就绪检查（`/readyz`）确认最新的迁移已执行，数据库还没就绪时不接流量。二是 controller 每 5 分钟（`REDELIVER_INTERVAL`）用 App JWT 列出最近 100 次投递（`GET /app/hook/deliveries`），按 GUID 分组：24 小时内、每次尝试都没拿到 2xx、尝试不满 5 次的，重投最新那次（`POST /app/hook/deliveries/{id}/attempts`）。gateway 按 delivery ID 去重，重投与迟到的成功撞在一起也安全。这一步不依赖 controller 自己的状态，重启后照常工作。
 
 **Contents 必须是 write，否则 AI 的票不算数。** 分支保护只计算对仓库有写权限的账号的审批，对 App 来说就是 Contents: write。M1 实测：App 只有 Contents: read 时，bot 的 APPROVE 显示在 PR 上，但 `reviewDecision` 仍为 `REVIEW_REQUIRED`；授予 write 后，同一张票不用重投就变成 `APPROVED`，说明 GitHub 按 App 当前的权限计算。代价是 controller 的 installation token 能写代码；它只在 controller 里，fetch 的 token 仍然限定为只读（`contents: read`）。`auto` / `manual` 模式的合并（M4）也依赖这项权限。
 
@@ -422,10 +436,10 @@ ai-pr-review-cloud/
 
 chart 目前包含：
 
-- gateway（2 副本）和 controller（1 副本）的 Deployment 与 Service，都以非 root、只读根文件系统、丢弃全部 capability 运行；
+- gateway（2 副本）和 controller（1 副本）的 Deployment 与 Service，都以非 root、只读根文件系统、丢弃全部 capability 运行；gateway 在数据库迁移完成前不就绪；
 - controller 的 ServiceAccount 和最小 Role（§6.1）；
 - GitHub App 的 webhook secret、App ID 和私钥：可以引用已有 Secret（`github.existingSecret`），开发时也可由 chart 根据 `github.*` 生成；
-- runner 使用的模型 key（`llm.existingSecret` 或 `llm.apiKey`，M2 换成 LiteLLM 虚拟 key）和模型参数，以及 `runs.*`（并发上限、单个 Job 时限、评审语言、默认预算）；
+- runner 使用的模型 key（`llm.existingSecret` 或 `llm.apiKey`，M2 换成 LiteLLM 虚拟 key）和模型参数，`runs.*`（并发上限、每个 run 的尝试次数、单个 Job 时限、评审语言、默认预算），以及 `webhooks.redeliverInterval`（失败 webhook 的重投间隔，0 关闭）；
 - 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库。
 
 LiteLLM proxy 和 runner 的 NetworkPolicy 在 M2 加入，预览环境所需的 ClusterRole 在 M5 加入。
@@ -440,7 +454,8 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 
 ## 10. 风险与待确认
 
-- **run 进行中的失败处理。** M1 没有重试：Job 失败、超时，或 GitHub 返回确定性错误（401、403（限流除外）、404、410、422）时，run 直接置为 `failed`；投票被拒也一样（`reviewed` → `failed`）。失败一律写到 Check Run，Check Run 还没创建时补建一个已失败的；连 Check Run 都写不进去时只记日志，不再重试。重试与 session 恢复在 M3。
+- **run 进行中的失败处理。** Pod 失败按 §4.3 重试并从快照续跑；超时、确定性退出码、GitHub 返回确定性错误（401、403（限流除外）、404、410、422）时，run 直接置为 `failed`；投票被拒也一样（`reviewed` → `failed`）。失败一律写到 Check Run，Check Run 还没创建时补建一个已失败的；连 Check Run 都写不进去时只记日志，不再重试。
+- **快照的体积。** 每轮上传完整 session，总流量随轮数平方增长。M3 实测 9 轮约 250 KB，集群内网可以接受；单个快照上限 32 MiB。若长评审成为瓶颈，再改为只上传新增 entry。
 - **pi SDK 版本变动快。** 包名已从 `@mariozechner` 迁到 `@earendil-works`，初始化方式也从 `AuthStorage` 换成了 `ModelRuntime`，两周内从 1.1 发到 1.4。目前精确锁定 `1.3.0`，升级单独提交并跑一遍 M0 的验收。
 - **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，M2 时与 LiteLLM 的花费交叉校验。
 - **自定义模型接入。** DeepSeek 是 pi 内置 provider，指向 LiteLLM 只需覆盖 `baseUrl`；`deepseek-flash` 在 M0 的三个 PR 上都一次调用成功 `submit_review`。换用其他模型时要重新验证工具调用的稳定性。
@@ -449,5 +464,5 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 - **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，controller 发布时以结果里的 `head_sha` 为 `commit_id`，PR 之后的推送不会让锚点错位；GitHub 仍拒绝时把评论折叠进正文（§6.3）。
 - **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；M1 已实测：App 有 Contents: write 时计入，只有 read 时不计入（§6.4）。在要求 1 个审批的分支上，bot 的一票就能满足要求；"AI 加一个人"的 2 票场景需要第二个人类账号，机制相同，留到 M7 演示时验证。
 - **撤销旧票的权限。** dismiss review 需要 App 有 Pull requests: write。M1 已在没有分支保护的仓库上验证 App 能 dismiss 自己的 APPROVE；若 branch protection 限制了谁能 dismiss review，要把 App 加入允许名单。
-- **webhook 丢失。** GitHub 不会自动重投失败的 delivery；本地开发时 smee 转发在 gateway 重启期间失败的事件同样会丢。可在 App 设置的 Advanced → Recent Deliveries 里手动重投（gateway 按 delivery ID 去重，重投安全）。生产部署需要定时对账：列出近期 delivery，重投失败的那些。
+- **webhook 丢失。** controller 会重投 GitHub 记录为失败的 delivery（§6.4）。本地开发经 smee 转发时，GitHub 看到的是 smee 返回的成功，gateway 那一侧的失败它不知道，所以重投帮不上忙；这时仍要在 App 设置的 Advanced → Recent Deliveries 里手动重投。列表只取最近 100 次投递，更早的失败不会被发现。
 - **预览环境的镜像约定。** 需要 demo 仓库的 CI 配合推送 `:<head_sha>` 镜像。

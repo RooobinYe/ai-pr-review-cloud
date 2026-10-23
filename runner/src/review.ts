@@ -60,13 +60,24 @@ export interface ReviewOutcome {
   stats: SessionStats;
 }
 
-export class ReviewNotSubmittedError extends Error {
+/** A review that ended without a submission; carries the usage spent on it. */
+export class ReviewFailedError extends Error {
   readonly stats: SessionStats;
-  constructor(stats: SessionStats) {
-    super(`model did not call submit_review after ${MAX_SUBMIT_REMINDERS} reminders`);
+  constructor(message: string, stats: SessionStats) {
+    super(message);
     this.stats = stats;
   }
 }
+
+/** The model answered but never called submit_review. Retrying would not help. */
+export class ReviewNotSubmittedError extends ReviewFailedError {
+  constructor(stats: SessionStats) {
+    super(`model did not call submit_review after ${MAX_SUBMIT_REMINDERS} reminders`, stats);
+  }
+}
+
+/** The model request failed after pi's own retries, e.g. rate limits or an exhausted balance. */
+export class ModelRequestError extends ReviewFailedError {}
 
 /**
  * A resource loader that discovers nothing. The default one would load
@@ -122,6 +133,21 @@ export function acceptedSubmission(entries: FileEntry[], commentable: Map<string
 function sessionJSONL(sm: SessionManager): string {
   const header = sm.getHeader();
   return [...(header ? [header] : []), ...sm.getEntries()].map((e) => JSON.stringify(e)).join("\n") + "\n";
+}
+
+/**
+ * Returns the error of the last model response, if it failed. A failed
+ * request is not the model declining to submit, so it must not use up the
+ * reminders or count as a final failure.
+ */
+function lastRequestError(sm: SessionManager): string | undefined {
+  const entries = sm.getEntries();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]!;
+    if (e.type !== "message" || e.message.role !== "assistant") continue;
+    return e.message.stopReason === "error" ? e.message.errorMessage || "model request failed" : undefined;
+  }
+  return undefined;
 }
 
 /** Counts assistant turns; stable across attempts because resumed turns are kept. */
@@ -187,13 +213,21 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
   });
 
   try {
+    const prompt = async (text: string) => {
+      await session.prompt(text);
+      const failed = !submission && lastRequestError(sessionManager);
+      if (failed) {
+        await uploads;
+        throw new ModelRequestError(`model request failed: ${failed.slice(0, 500)}`, session.getSessionStats());
+      }
+    };
     if (!submission) {
       if (resumed) opts.onProgress?.(`resuming after turn ${turns(sessionManager)} of an earlier attempt`);
-      await session.prompt(resumed ? RESUME_PROMPT : userPrompt(opts.pr));
+      await prompt(resumed ? RESUME_PROMPT : userPrompt(opts.pr));
     }
     for (let i = 0; !submission && i < MAX_SUBMIT_REMINDERS; i++) {
       opts.onProgress?.("model stopped without submitting; reminding it");
-      await session.prompt(SUBMIT_REMINDER);
+      await prompt(SUBMIT_REMINDER);
     }
     await uploads;
     const stats = session.getSessionStats();

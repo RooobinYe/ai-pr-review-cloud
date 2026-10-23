@@ -9,7 +9,7 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-wo
 import { ModelRuntime, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import type { PRContext } from "./pr.ts";
 import { RESUME_PROMPT } from "./prompts.ts";
-import { acceptedSubmission, review, type TurnSnapshot } from "./review.ts";
+import { acceptedSubmission, ModelRequestError, review, type TurnSnapshot } from "./review.ts";
 import { commentableLines } from "./diff.ts";
 
 const pr: PRContext = {
@@ -113,4 +113,13 @@ test("acceptedSubmission ignores rejected calls", async () => {
   const commentable = commentableLines(pr.diff);
   assert.equal(acceptedSubmission(parseSessionEntries(first.snapshots[1]!.jsonl), commentable), undefined, "rejected anchor counted as submitted");
   assert.deepEqual(acceptedSubmission(parseSessionEntries(first.snapshots.at(-1)!.jsonl), commentable), submission);
+});
+
+test("a failed model request is retryable, not a missing submission", async () => {
+  const failed = fauxAssistantMessage("", { stopReason: "error", errorMessage: "402 Insufficient Balance" });
+  await assert.rejects(run(undefined, [fauxAssistantMessage(fauxToolCall("read", { path: "a.go" })), failed, failed, failed]), (err: Error) => {
+    assert.ok(err instanceof ModelRequestError, `got ${err.name}: ${err.message}`);
+    assert.match(err.message, /Insufficient Balance/);
+    return true;
+  });
 });
