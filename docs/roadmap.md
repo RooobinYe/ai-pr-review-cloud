@@ -116,6 +116,7 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 - [ ] runner 每轮结束上传 session 快照（`PUT /runs/{id}/session`）和用量。
 - [ ] Pod 失败时 controller 放回 `queued`、`attempt + 1`；新 Pod 用 `SessionManager.open` 恢复。
+- [ ] 不丢 webhook：gateway 的就绪检查确认数据库表已就位；controller 定时列出 App 的近期 delivery，重投失败的那些（gateway 按 delivery ID 去重）。
 - [ ] 同一 PR 的新提交评审时，把 bot 之前的逐行评论（及是否已解决）写进 `pr.json`，提示模型不要重复已提过的问题，只说新问题和仍未修复的问题。
 - [ ] 同一 PR 推送新提交时，旧 run 标记为 `superseded` 并删除 Job。
 - [ ] Job 超时（`activeDeadlineSeconds`）与总重试上限，失败原因写到 Check Run。
