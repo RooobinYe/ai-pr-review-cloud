@@ -35,6 +35,7 @@ const (
 	ReasonFetch    = "fetch"     // the fetch init container failed
 	ReasonNoReview = "no_review" // the model never called submit_review
 	ReasonBudget   = "budget"    // the model proxy refused the run's key (M2)
+	ReasonModelAPI = "model_api" // the model provider refused calls, e.g. no credit left
 	ReasonRunner   = "runner"    // the runner container failed otherwise
 	ReasonGitHub   = "github"    // GitHub refused a write
 	ReasonOther    = "other"
@@ -42,16 +43,23 @@ const (
 
 // FailureReason classifies a failed run's error message, as written by the
 // controller (PodFailure, jobFailure, once), into a small set of labels.
+// A failed container's message is the tail of its log, where earlier progress
+// lines may mention a budget or submit_review; only the last line, the fatal
+// error, decides.
 func FailureReason(msg string) string {
+	trimmed := strings.TrimRight(msg, "\n")
+	last := strings.ToLower(trimmed[strings.LastIndex(trimmed, "\n")+1:])
 	switch {
 	case strings.Contains(msg, "DeadlineExceeded"):
 		return ReasonTimeout
-	case strings.Contains(msg, "submit_review"), strings.Contains(msg, "without submitting"):
-		return ReasonNoReview
-	case strings.Contains(strings.ToLower(msg), "budget"):
-		return ReasonBudget
 	case strings.HasPrefix(msg, "fetch "):
 		return ReasonFetch
+	case strings.Contains(last, "budget"):
+		return ReasonBudget
+	case strings.Contains(last, "model api error"):
+		return ReasonModelAPI
+	case strings.Contains(last, "submit_review"), strings.Contains(last, "without submitting"):
+		return ReasonNoReview
 	case strings.HasPrefix(msg, "runner "):
 		return ReasonRunner
 	case strings.HasPrefix(msg, "mint fetch token: "):
@@ -92,7 +100,7 @@ func Write(w io.Writer, st store.Stats) error {
 		failures[FailureReason(msg)] += n
 	}
 	family(&b, "review_failures_total", "counter", "Failed runs by reason.")
-	for _, reason := range []string{ReasonTimeout, ReasonFetch, ReasonNoReview, ReasonBudget, ReasonRunner, ReasonGitHub, ReasonOther} {
+	for _, reason := range []string{ReasonTimeout, ReasonFetch, ReasonNoReview, ReasonBudget, ReasonModelAPI, ReasonRunner, ReasonGitHub, ReasonOther} {
 		sample(&b, "review_failures_total", labels("reason", reason), float64(failures[reason]))
 	}
 

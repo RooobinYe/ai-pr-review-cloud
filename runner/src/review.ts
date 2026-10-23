@@ -14,7 +14,7 @@ import type { PRContext } from "./pr.ts";
 import { BUDGET_REMINDER, SUBMIT_REMINDER, systemPrompt, userPrompt } from "./prompts.ts";
 import type { ReviewSubmission } from "./schema.ts";
 import { gitTool, submitReviewTool } from "./tools.ts";
-import { overNudgeThreshold, type TurnUsage, turnUsage } from "./usage.ts";
+import { overNudgeThreshold, turnProblem, type TurnUsage, turnUsage } from "./usage.ts";
 
 /** Reminders sent when the model stops without calling submit_review. */
 export const MAX_SUBMIT_REMINDERS = 2;
@@ -45,8 +45,8 @@ export interface ReviewOutcome {
 
 export class ReviewNotSubmittedError extends Error {
   readonly stats: SessionStats;
-  constructor(stats: SessionStats) {
-    super(`model did not call submit_review after ${MAX_SUBMIT_REMINDERS} reminders`);
+  constructor(stats: SessionStats, message = `model did not call submit_review after ${MAX_SUBMIT_REMINDERS} reminders`) {
+    super(message);
     this.stats = stats;
   }
 }
@@ -100,8 +100,13 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
   let turns = 0;
   let spent = 0;
   let nudged = false;
+  // The provider error of the latest turn, if it failed; cleared by a good turn.
+  let providerError: string | undefined;
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "turn_end") {
+      const problem = turnProblem(event.message);
+      if (problem) opts.onProgress?.(problem.text);
+      providerError = problem?.providerError ? problem.text : undefined;
       const usage = turnUsage(++turns, event.message);
       if (!usage) return;
       spent += usage.cost_usd;
@@ -122,11 +127,14 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
 
   try {
     await session.prompt(userPrompt(opts.pr));
-    for (let i = 0; !submission && i < MAX_SUBMIT_REMINDERS; i++) {
+    for (let i = 0; !submission && !providerError && i < MAX_SUBMIT_REMINDERS; i++) {
       opts.onProgress?.("model stopped without submitting; reminding it");
       await session.prompt(SUBMIT_REMINDER);
     }
     const stats = session.getSessionStats();
+    // A refused call (no credit, bad key, proxy budget) is not the model
+    // ignoring the tool; say so, so the failure is not misread.
+    if (!submission && providerError) throw new ReviewNotSubmittedError(stats, `model API error: ${providerError.replace(/^model turn ended with error: /, "")}`);
     if (!submission) throw new ReviewNotSubmittedError(stats);
     return { submission, stats, nudged };
   } finally {

@@ -13,7 +13,7 @@
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | 未开始 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
-| [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | 未开始 |
+| [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | 进行中 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
 
 ## 依赖关系
@@ -153,12 +153,15 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：回答赛题考核点 5（成本与性能）。
 
-- [ ] controller 暴露 `/metrics`（run 数、各阶段耗时、队列深度、token、金额）。
-- [ ] 部署 Prometheus 与 Grafana，提交看板 JSON。
-- [ ] runner 在花费达到预算 80% 时追加提示，要求尽快提交结论。
-- [ ] 按架构设计 §7.2 的方法测算 20 个 PR，输出成本与延迟报告和优化对比。
+- [x] controller 暴露 `/metrics`（run 数、各阶段耗时、队列深度、token、金额）：抓取时由数据库计算；runner 每轮上报用量（`PUT /runs/{id}/usage`），各阶段时间戳记在 `review_run`（架构 §7.1）。
+- [x] 部署 Prometheus 与 Grafana，提交看板 JSON：chart 的 `monitoring.dev`，看板在 `deploy/helm/ai-pr-review-cloud/dashboards/`。
+- [x] runner 在花费达到预算 80% 时追加提示，要求尽快提交结论（架构 §7.3）。
+- [ ] 按架构设计 §7.2 的方法测算 20 个 PR，输出成本与延迟报告和优化对比：基线完成 18 个 PR × 3 次，报告见 [cost-report.md](cost-report.md)；剩余 2 个 PR 和三组优化对比因模型账户余额耗尽中断，待补跑。
+- [ ] 在 Kind 上跑几次真实评审，确认看板各面板有数据并截图。
 
 验收：Grafana 看板能展示吞吐、各阶段耗时分布、每 PR 成本分布；测算报告入库到 `docs/`。
+
+进展记录（2026-10-23）：看板已在独立的 Kind 集群上部署，能采到 controller 的指标（一次部分评审的花费、缓存命中率和两次失败都显示正确）。测算途中 DeepSeek 返回 402 Insufficient Balance，此后的运行全部失败；当时 runner 把它当成"模型没有调用 `submit_review`"，于是改为：轮次以 provider 错误结束时直接以 `model API error` 失败，不再提醒；controller 的失败原因按日志最后一行归类，新增 `model_api`。
 
 ## M7 参赛交付
 

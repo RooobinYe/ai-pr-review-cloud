@@ -37,6 +37,25 @@ export function turnUsage(turn: number, message: unknown): TurnUsage | undefined
   };
 }
 
+export interface TurnProblem {
+  text: string;
+  /** The provider refused the call after pi's retries, e.g. 402 insufficient balance; reminding the model cannot help. */
+  providerError: boolean;
+}
+
+/**
+ * Describes an assistant turn that ended abnormally (a provider error, the
+ * output limit, an abort), which otherwise looks like the model stopping
+ * without submitting. Normal turns yield undefined.
+ */
+export function turnProblem(message: unknown): TurnProblem | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const m = message as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+  if (m.role !== "assistant" || (m.stopReason !== "error" && m.stopReason !== "length" && m.stopReason !== "aborted")) return undefined;
+  const detail = typeof m.errorMessage === "string" && m.errorMessage ? `: ${m.errorMessage.split("\n")[0]!.slice(0, 300)}` : "";
+  return { text: `model turn ended with ${m.stopReason}${detail}`, providerError: m.stopReason === "error" };
+}
+
 /** Reports whether spending has crossed the nudge threshold of a positive budget. */
 export function overNudgeThreshold(spentUSD: number, budgetUSD: number | undefined): boolean {
   return budgetUSD !== undefined && budgetUSD > 0 && spentUSD >= budgetUSD * BUDGET_NUDGE_SHARE;

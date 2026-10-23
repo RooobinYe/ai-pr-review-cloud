@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { overNudgeThreshold, parseBudget, turnUsage } from "./usage.ts";
+import { overNudgeThreshold, parseBudget, turnProblem, turnUsage } from "./usage.ts";
+
+test("turnProblem names abnormal turn endings", () => {
+  assert.equal(turnProblem({ role: "assistant", stopReason: "toolUse" }), undefined);
+  assert.equal(turnProblem({ role: "assistant", stopReason: "stop" }), undefined);
+  assert.equal(turnProblem({ role: "user", stopReason: "error" }), undefined);
+  assert.deepEqual(turnProblem({ role: "assistant", stopReason: "length" }), { text: "model turn ended with length", providerError: false });
+  assert.deepEqual(turnProblem({ role: "assistant", stopReason: "error", errorMessage: '402: {"message":"Insufficient Balance"}\nstack...' }), {
+    text: 'model turn ended with error: 402: {"message":"Insufficient Balance"}',
+    providerError: true,
+  });
+});
 
 test("turnUsage reads an assistant message's usage", () => {
   const message = {

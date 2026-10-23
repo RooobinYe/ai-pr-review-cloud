@@ -23,6 +23,11 @@ func TestFailureReason(t *testing.T) {
 		{"runner exited with code 1: runner: model did not call submit_review after 2 reminders", ReasonNoReview},
 		{"runner exited without submitting a review", ReasonNoReview},
 		{"runner exited with code 1: 400 Budget has been exceeded", ReasonBudget},
+		{"runner exited with code 1: runner: model API error: 402: Insufficient Balance", ReasonModelAPI},
+		// Earlier log lines do not decide: the nudge mentions the budget, the
+		// tool list mentions submit_review.
+		{"runner exited with code 1: runner:   spent $0.4 of the $0.5 budget; asking the model to submit\nrunner:   submit_review\nrunner: could not send result after 8 attempts: 503\n", ReasonRunner},
+		{"runner exited with code 1: runner:   spent $0.4 of the $0.5 budget\nrunner: model API error: 402: Insufficient Balance", ReasonModelAPI},
 		{"runner exited with code 137: OOMKilled", ReasonRunner},
 		{"review: POST /repos/o/r/pulls/1/reviews: 422 Unprocessable Entity", ReasonGitHub},
 		{"check_run_create: 403 Resource not accessible by integration", ReasonGitHub},

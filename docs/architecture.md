@@ -109,7 +109,9 @@ stateDiagram-v2
 | `webhook_delivery` | 已记录的 webhook delivery ID，GitHub 重投时去重 | 主键 `delivery_id` |
 | `github_action` | 每个 GitHub 写操作一行：`dismiss_stale_approvals`（撤销旧票）、`check_run_create`、`check_run_complete`、`review`（投票，§6.3）、`merge`（M4） | 主键 `(run_id, kind)`；`external_id` 非空表示已完成；取值在 `go/internal/store/store.go` 里也有一份 |
 | `run_session` | runner 每轮结束上传的 pi session 快照，用于崩溃恢复 | 每个 run 只保留最新一份 |
-| `run_usage` | 每轮的模型、token 和金额 | 主键 `(run_id, turn)`，重复上报覆盖而不是累加 |
+| `run_usage` | 每轮的模型、token（含缓存读写）和金额，`/metrics` 的 token 与花费来自这里（§7.1） | 主键 `(run_id, turn)`，重复上报覆盖而不是累加 |
+
+`review_run` 还记录各阶段的时间戳（`started_at`、`fetch_started_at`、`fetch_finished_at`、`reviewed_at`、`finished_at`，见 `0002_metrics.sql`），供 §7.1 的阶段耗时使用。
 
 状态取值在 [`go/internal/run/state.go`](../go/internal/run/state.go) 里也有一份，同时定义了上图的全部合法转换，改一处必须同步另一处。
 
@@ -146,7 +148,7 @@ Pod (Job: review-<run-id>-<attempt>)
 1. 读 `/workspace/pr.json`，构造系统提示词和用户提示词。提示词按 v1 的防幻觉规则重写，放在 `runner/src/prompts.ts`。
 2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
 3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才加入 `bash`，其中的 `kubectl` 只能访问这个 namespace。
-4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。
+4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。最后一轮是模型服务报错（pi 重试后仍失败，例如 402 余额不足）时不再提醒，直接以 `model API error: ...` 失败，免得被误读成模型不肯提交。
 5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`，带 `Authorization: Bearer <RUN_TOKEN>`，controller 读本 run 的 Secret 比对，不符返回 401：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
 
 本地模式（`--pr <url>`）走同样的流程，只是第 1 步自己用 GitHub API 拉取 PR、部分克隆（`--filter=blob:none`，head 往前 20 个提交加 base 提交）到临时目录，最后把结果按 `--format markdown|json` 打印到 stdout，token 与金额打印到 stderr。
@@ -335,15 +337,42 @@ preview:
 
 ### 7.1 指标
 
-| 指标 | 来源 |
-| --- | --- |
-| `review_runs_total{state}`、`review_run_duration_seconds{phase}`（排队、拉代码、探索、预览、提交） | controller |
-| `review_queue_depth`、`review_running` | controller |
-| `review_tokens_total{model,direction}`、`review_cost_usd_total{repo}` | controller（来自 runner 上报的 `usage`） |
-| 每个虚拟 key 的花费 | LiteLLM（作为核对口径） |
-| Job 失败原因、重试次数 | controller |
+controller 的 `GET /metrics`（与 runner 回调同一个端口）输出以下指标，实现在 [`go/internal/metrics`](../go/internal/metrics/metrics.go)：
 
-所有日志带 `run_id`、`repo`、`pr`、`head_sha`。Grafana 一张看板：吞吐、各阶段耗时分布、每 PR 成本分布、失败原因。
+| 指标 | 类型 | 含义 |
+| --- | --- | --- |
+| `review_runs_total{state}` | counter | 已结束的 run，`state` 为 done、failed、superseded |
+| `review_queue_depth`、`review_running` | gauge | 排队中、有 runner Job 的 run 数 |
+| `review_verdicts_total{verdict}`、`review_retries_total` | counter | done run 的结论；超出第一次的尝试次数 |
+| `review_failures_total{reason}` | counter | 失败原因：timeout、fetch、no_review（模型没提交）、budget、model_api（模型服务拒绝调用，如余额不足）、runner、github、other。由 `error` 文本归类；容器失败时 `error` 是日志末尾，只看最后一行（致命错误），因为前面的进度行可能提到预算或 `submit_review` |
+| `review_run_duration_seconds{phase}` | histogram | done run 各阶段耗时，见下表 |
+| `review_run_cost_usd` | histogram | 每个 done run 的模型花费 |
+| `review_tokens_total{model,direction}` | counter | `direction` 为 input（未命中缓存）、output、cache_read、cache_write |
+| `review_model_cost_usd_total{model}`、`review_cost_usd_total{repo}` | counter | 模型花费，按模型、按仓库 |
+
+| 阶段 | 起止 | 时间戳来源 |
+| --- | --- | --- |
+| `queue` | run 创建 → controller 领取 | `created_at` → `started_at`（`Claim` 写入） |
+| `startup` | 领取 → fetch 开始：建 Job、调度、拉镜像 | `started_at` → fetch 容器的 `startedAt` |
+| `fetch` | fetch 容器克隆代码 | Pod 状态里 fetch 容器的 `startedAt` → `finishedAt` |
+| `review` | fetch 结束 → 收到结果：模型探索与提交 | fetch 的 `finishedAt` → `reviewed_at`（`SubmitResult` 写入） |
+| `publish` | 收到结果 → done：投票、完成 Check Run | `reviewed_at` → `finished_at`（进入终态时写入） |
+| `total` | 创建 → done | `created_at` → `finished_at` |
+
+fetch 的起止时间由 controller 在发布投票前读 runner Pod 的状态得到（只用于指标，读取失败只记日志）。预览阶段在 M5 加入。
+
+**指标在抓取时由数据库计算**，controller 不在内存里累计。这样 controller 重启后计数不归零，多副本时每个副本报出的值一致，Prometheus 只需抓任意一个副本。代价是每次抓取扫描所有 done run，演示规模下可以忽略；run 数量大时改为只扫描最近一段时间，或在状态转换时累加计数。Prometheus 文本格式手写输出，不引入 client 库，与不用 client-go 的理由相同（§6.1）。
+
+**用量由 runner 每轮上报**：`turn_end` 时 runner 把本轮 assistant 消息的 `usage`（含 `cacheRead`、`cacheWrite`）`PUT /runs/{id}/usage`，带 `RUN_TOKEN`；同一轮重复上报覆盖，不累加。上报在后台按顺序进行，失败只少一个样本，不影响评审；提交结果前等待上报完成，所以 done run 的花费是完整的。run 离开 `running` 后不再接受上报（409）。
+
+| 来源 | 内容 |
+| --- | --- |
+| controller `/metrics` | 上面的全部指标 |
+| LiteLLM（M2） | 每个虚拟 key 的花费，作为核对口径 |
+
+所有日志带 `run_id`、`repo`、`pr`、`head_sha`。
+
+Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud/dashboards/review-cost.json) 随 chart 部署（`monitoring.dev.enabled`，仅开发用、不持久化），也可以导入到已有的 Grafana。面板：所选时间范围内的完成数、失败数、总花费、每次成本 P50 / P95、端到端耗时 P50 / P95、缓存命中率；吞吐（按结果）、排队与运行中；各阶段耗时 P50 / P95 与 P95 趋势；每次评审成本分布、端到端耗时分布、按仓库和按模型的花费；token 速率、失败原因、结论分布。
 
 ### 7.2 成本测算方法
 
@@ -354,8 +383,9 @@ preview:
 
 ### 7.3 预算控制
 
-- 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明。
-- runner 侧在 `turn_end` 累计 `usage.cost.total`，达到预算 80% 时追加一条提示，要求尽快提交结论。
+- 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明（M2）。这是硬上限。
+- runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`BUDGET_REMINDER`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
+- 软上限按轮检查，所以实际花费会超过阈值大约一到两轮（提示送达前的那一轮，加上提交的那一轮）。测算里预算设为 $0.02 时的实际花费见 [成本测算报告](cost-report.md)。
 
 ## 8. 与 v1 的关系、仓库结构与交付形式
 
@@ -386,6 +416,7 @@ ai-pr-review-cloud/
 │   ├── internal/fetch/              # 拉取 PR 元信息与 diff、克隆、写 pr.json
 │   ├── internal/githubapp/          # webhook 签名与触发、App JWT 与 installation token、REST 客户端
 │   ├── internal/kube/               # 最小 Kubernetes REST 客户端（Job、Secret、Pod）
+│   ├── internal/metrics/            # /metrics：由数据库快照生成 Prometheus 指标
 │   ├── internal/store/              # PostgreSQL 访问与迁移
 │   ├── internal/review/             # 评审结论 schema v3（与 runner 对齐）
 │   ├── internal/run/                # run 状态与合法转换
@@ -393,7 +424,9 @@ ai-pr-review-cloud/
 │   └── Dockerfile                   # 用 --build-arg CMD=<组件> 构建三个镜像
 ├── runner/                          # TypeScript，pi SDK 1.3.0
 │   ├── src/main.ts                  # 集群模式（RUN_ID）与本地模式（--pr）入口
-│   ├── src/controller.ts            # 集群模式回调 controller
+│   ├── src/controller.ts            # 集群模式回调 controller（结果、每轮用量）
+│   ├── src/usage.ts                 # 每轮用量、预算提示阈值
+│   ├── src/stats.ts                 # 本地模式 --stats 的测算数据
 │   ├── src/pr.ts                    # PR 上下文及 pr.json 校验
 │   ├── src/review.ts                # pi session、工具、提交提醒
 │   ├── src/prompts.ts               # 系统提示词与用户提示词
@@ -402,7 +435,8 @@ ai-pr-review-cloud/
 │   ├── src/github.ts                # 本地模式拉取 PR 与克隆
 │   └── Dockerfile
 ├── contract/                        # 生成的 JSON schema、两侧共用的样例、pr.json 与 diff 契约
-├── deploy/helm/ai-pr-review-cloud/  # Helm chart
+├── deploy/helm/ai-pr-review-cloud/  # Helm chart；dashboards/ 下是 Grafana 看板 JSON
+├── bench/                           # 成本测算：PR 列表、驱动与汇总脚本、每次运行的原始数据
 ├── hack/kind-up.sh                  # 创建本地 Kind 集群
 ├── hack/webhook-forward.sh          # smee.io → gateway 的 webhook 转发
 ├── Makefile                         # test、lint、images、kind-up、deploy
@@ -426,7 +460,8 @@ chart 目前包含：
 - controller 的 ServiceAccount 和最小 Role（§6.1）；
 - GitHub App 的 webhook secret、App ID 和私钥：可以引用已有 Secret（`github.existingSecret`），开发时也可由 chart 根据 `github.*` 生成；
 - runner 使用的模型 key（`llm.existingSecret` 或 `llm.apiKey`，M2 换成 LiteLLM 虚拟 key）和模型参数，以及 `runs.*`（并发上限、单个 Job 时限、评审语言、默认预算）；
-- 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库。
+- 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库；
+- 仅供开发用的 Prometheus 和 Grafana（`monitoring.dev.enabled`，不持久化）：Prometheus 抓取 controller 的 `/metrics`，Grafana 预置数据源和成本看板，匿名只读。生产环境关闭它，用已有的监控抓取 controller Service 并导入看板 JSON。
 
 LiteLLM proxy 和 runner 的 NetworkPolicy 在 M2 加入，预览环境所需的 ClusterRole 在 M5 加入。
 
