@@ -2,7 +2,7 @@
 
 装在 GitHub 上、跑在 Kubernetes 上的 AI PR 评审服务。PR 打开或更新时自动触发，每个 PR 在独立的 Pod 里由 agent 探索代码并给出结构化结论，结果以 Check Run 和 PR Review 呈现。AI 像人类审批人一样投票：没问题时提交 approve，可以计入"需要 N 个 approval"；有问题时只留评论、不阻塞合并。可按仓库开启自动合并和预览环境验证。
 
-> 状态：M1、M2、M3、M5、M6 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
+> 状态：M1、M2、M3、M4、M5、M6 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
 
 ## 架构
 

@@ -20,6 +20,7 @@ rules:
     verbs: ["create", "get", "patch"]
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
+    resourceNames: ["preview-reader"]
     verbs: ["create"]
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events"]

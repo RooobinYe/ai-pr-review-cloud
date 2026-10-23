@@ -82,6 +82,9 @@ func runSecretName(jobName string) string { return jobName + "-credentials" }
 // network policy only lets the Pod reach DNS, LiteLLM and the controller, so
 // fetch reaches GitHub through the controller's egress proxy.
 func BuildJob(cfg JobConfig, r store.Run) kube.Job {
+	if r.Config != nil {
+		cfg.Language = r.Config.Language
+	}
 	labels := map[string]string{labelName: "ai-pr-review-cloud", labelPart: "runner", labelRunID: r.ID}
 	mounts := []kube.VolumeMount{{Name: "workspace", MountPath: "/workspace"}, {Name: "tmp", MountPath: "/tmp"}}
 	hardened := &kube.SecurityContext{

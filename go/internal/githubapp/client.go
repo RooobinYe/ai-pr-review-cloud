@@ -134,11 +134,13 @@ func list[T any](ctx context.Context, c *Client, path string) ([]T, error) {
 
 // Pull is the subset of a pull request the service uses.
 type Pull struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	State  string `json:"state"`
-	User   struct {
+	Merged         bool   `json:"merged"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	Number         int    `json:"number"`
+	Title          string `json:"title"`
+	Body           string `json:"body"`
+	State          string `json:"state"`
+	User           struct {
 		Login string `json:"login"`
 	} `json:"user"`
 	Base struct {

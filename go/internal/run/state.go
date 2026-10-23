@@ -29,7 +29,7 @@ var transitions = map[State][]State{
 	StateRunning:          {StatePreviewing, StateReviewed, StateQueued, StateFailed, StateSuperseded},
 	StatePreviewing:       {StateRunning, StateQueued, StateFailed, StateSuperseded},
 	StateReviewed:         {StateAwaitingApproval, StateMerging, StateDone, StateFailed},
-	StateAwaitingApproval: {StateMerging, StateSuperseded},
+	StateAwaitingApproval: {StateMerging, StateSuperseded, StateFailed},
 	StateMerging:          {StateDone, StateFailed},
 }
 

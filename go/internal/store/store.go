@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/repoconfig"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 )
@@ -57,6 +58,8 @@ type NewRun struct {
 
 // Run is one row of review_run plus the GitHub actions it has completed.
 type Run struct {
+	Config         *repoconfig.Config
+	ConfigSHA      string
 	ID             string
 	Repo           string
 	PRNumber       int
@@ -179,18 +182,23 @@ func (s *Store) RecordTrigger(ctx context.Context, deliveryID string, nr NewRun)
 
 const runColumns = `r.id, r.repo, r.pr_number, r.head_sha, r.installation_id, r.state, r.attempt,
 	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.budget_usd::float8, r.created_at,
-	r.fetch_finished_at IS NOT NULL,
+	r.fetch_finished_at IS NOT NULL, r.repo_config, COALESCE(r.config_sha, ''),
 	COALESCE(r.claimed_at, r.created_at),
 	COALESCE((SELECT jsonb_object_agg(a.kind, a.external_id) FROM github_action a
 	          WHERE a.run_id = r.id AND a.external_id IS NOT NULL), '{}')`
 
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
-	var result, actions []byte
+	var result, actions, config []byte
 	err := row.Scan(&r.ID, &r.Repo, &r.PRNumber, &r.HeadSHA, &r.InstallationID, &r.State, &r.Attempt,
-		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &r.ClaimedAt, &actions)
+		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &config, &r.ConfigSHA, &r.ClaimedAt, &actions)
 	if err != nil {
 		return Run{}, err
+	}
+	if config != nil {
+		if err := json.Unmarshal(config, &r.Config); err != nil {
+			return Run{}, err
+		}
 	}
 	if result != nil {
 		var res review.Result
@@ -269,12 +277,11 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 	return claimed, nil
 }
 
-// Active returns the runs the controller still has to act on: running and
-// reviewed runs, and failed or superseded runs whose Check Run is not
-// completed yet.
+// Active includes execution, publishing, approval waiting and merging, plus
+// failed or superseded runs whose final Check Run update is still pending.
 func (s *Store) Active(ctx context.Context) ([]Run, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+runColumns+` FROM review_run r
-		WHERE r.state IN ('running', 'previewing', 'reviewed')
+		WHERE r.state IN ('running', 'previewing', 'reviewed', 'awaiting_approval', 'merging')
 		   OR (r.state IN ('failed', 'superseded')
 		       AND NOT EXISTS (SELECT 1 FROM github_action a WHERE a.run_id = r.id AND a.kind = 'check_run_complete' AND a.external_id IS NOT NULL))
 		ORDER BY r.created_at`)
@@ -292,11 +299,13 @@ func (s *Store) Active(ctx context.Context) ([]Run, error) {
 // to superseded, and returns their IDs. Reviewed runs are left to finish:
 // their vote checks the PR head before approving (docs/architecture.md §6.3).
 func (s *Store) Supersede(ctx context.Context) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `UPDATE review_run r SET state = 'superseded', updated_at = now()
+	rows, err := s.pool.Query(ctx, `WITH moved AS (UPDATE review_run r SET state = 'superseded', updated_at = now()
 		WHERE r.state IN ('queued', 'running', 'previewing', 'awaiting_approval')
 		  AND EXISTS (SELECT 1 FROM review_run n
 		              WHERE n.repo = r.repo AND n.pr_number = r.pr_number AND n.created_at > r.created_at)
-		RETURNING r.id`)
+		RETURNING r.id), cleared AS (
+            DELETE FROM github_action WHERE run_id IN (SELECT id FROM moved) AND kind = 'check_run_complete'
+        ) SELECT id FROM moved`)
 	if err != nil {
 		return nil, fmt.Errorf("supersede runs: %w", err)
 	}
@@ -342,16 +351,23 @@ func (s *Store) Transition(ctx context.Context, id string, from, to run.State, r
 	}
 	// Reasons quote external messages; PostgreSQL rejects invalid UTF-8.
 	reason = strings.ToValidUTF8(reason, "\uFFFD")
-	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now(),
-		finished_at = CASE WHEN $5 THEN now() ELSE finished_at END
-		WHERE id = $1 AND state = $2`, id, from, to, reason, to.Terminal())
-	if err != nil {
-		return fmt.Errorf("transition run %s to %s: %w", id, to, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrConflict
-	}
-	return nil
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now(),
+            finished_at = CASE WHEN $5 THEN now() ELSE finished_at END
+            WHERE id = $1 AND state = $2`, id, from, to, reason, to.Terminal())
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrConflict
+		}
+		// An approval check may already be successful; allow its final failure
+		// or cancellation to be reported and retried after a restart.
+		if to == run.StateFailed || to == run.StateSuperseded {
+			_, err = tx.Exec(ctx, "DELETE FROM github_action WHERE run_id=$1 AND kind='check_run_complete'", id)
+		}
+		return err
+	})
 }
 
 // PutSession stores the run's latest session snapshot. A snapshot of an

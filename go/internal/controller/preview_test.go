@@ -139,7 +139,7 @@ func TestCleanupClosedAndOrphanPreviews(t *testing.T) {
 	}{{"open", "open", time.Hour, false, false}, {"closed", "closed", time.Hour, false, true}, {"orphan", "open", 25 * time.Hour, false, true}, {"active", "open", 25 * time.Hour, true, false}} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness()
-			h.gh.state = tt.state
+			h.gh.closed = tt.state == "closed"
 			if tt.active {
 				h.reconcile()
 			}

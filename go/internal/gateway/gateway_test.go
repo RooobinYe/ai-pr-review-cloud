@@ -17,9 +17,10 @@ import (
 )
 
 type fakeRecorder struct {
-	calls []store.NewRun
-	seen  map[string]bool
-	err   error
+	calls     []store.NewRun
+	approvals []store.Approval
+	seen      map[string]bool
+	err       error
 }
 
 func (f *fakeRecorder) RecordTrigger(_ context.Context, delivery string, nr store.NewRun) (string, bool, error) {
@@ -79,5 +80,45 @@ func TestHandler(t *testing.T) {
 	rec.err = errors.New("db down")
 	if got := send("pull_request", opened, sign("s", opened), "d2"); got != http.StatusServiceUnavailable {
 		t.Errorf("store failure: status %d, want 503", got)
+	}
+}
+
+func (f *fakeRecorder) RecordApproval(_ context.Context, delivery string, a store.Approval) error {
+	if f.err != nil {
+		return f.err
+	}
+	if !f.seen[delivery] {
+		f.approvals = append(f.approvals, a)
+		f.seen[delivery] = true
+	}
+	return nil
+}
+
+func TestApprovalWebhook(t *testing.T) {
+	rec := &fakeRecorder{seen: map[string]bool{}}
+	h := &Handler{Secret: []byte("s"), Recorder: rec, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body := `{"action":"created","repository":{"full_name":"o/r"},"installation":{"id":42},"issue":{"number":7,"pull_request":{}},"comment":{"body":"/merge","user":{"login":"human","type":"User"},"created_at":"2026-10-24T00:00:00Z"}}`
+	for _, tt := range []struct {
+		delivery, signature string
+		failure             bool
+		want                int
+	}{
+		{"d", "bad", false, 401}, {"", sign("s", body), false, 400}, {"d", sign("s", body), false, 202}, {"d", sign("s", body), false, 202}, {"e", sign("s", body), true, 503},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("X-GitHub-Delivery", tt.delivery)
+		req.Header.Set("X-Hub-Signature-256", tt.signature)
+		if tt.failure {
+			rec.err = errors.New("db down")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != tt.want {
+			t.Fatalf("status %d want %d", w.Code, tt.want)
+		}
+	}
+	if len(rec.calls) != 0 || len(rec.approvals) != 1 || rec.approvals[0].Actor != "human" {
+		t.Fatalf("unexpected records %+v", rec)
 	}
 }
