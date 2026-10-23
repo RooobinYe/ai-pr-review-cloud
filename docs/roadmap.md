@@ -140,7 +140,7 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 | [PR #3](https://github.com/RooobinYe/ai-pr-review-cloud/pull/3)，第 5 轮删 Pod | 第 2 次尝试完成，只有一个 Check Run 和一份 COMMENT Review | $0.0621 |
 | 2026-10-24，main `209ff8d` 整合复测，第 1 轮删 Pod | 从快照恢复，第 2 次尝试 APPROVE；只有一个 Check Run 和一份 Review | $0.00445 |
 
-整合复测用签名 webhook 重放触发，重复 delivery 只创建一个 run；完成后重启 controller，状态与 GitHub 结果保持不变。本次未覆盖 GitHub → smee 实时转发。
+整合复测用签名 webhook 重放触发，重复 delivery 只创建一个 run；完成后重启 controller，状态与 GitHub 结果保持不变。本次未覆盖 GitHub -> smee 实时转发。
 
 ## M4 仓库配置与可选合并模式
 
@@ -163,7 +163,7 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 三次均使用真实 GitHub App、数据库、runner 和模型，APPROVE 均无逐行评论；auto/manual 的合并者为 `ai-pr-review-cloud-robin[bot]`。总耗时从收到 webhook 到 run 终态计算，评审耗时从领取到结果回调计算，费用取 runner 上报用量。验收使用独立 namespace、数据库和测试目标分支，结束后已清理；未合并到 `main`。人工 review approve 路径由自动化测试覆盖，本次真实人工确认验证的是 `/merge`。
 
-`make test`（真实 PostgreSQL）和 `make lint` 通过。测试沿用 #1/#2 的风格：纯逻辑使用明确预期的表驱动用例，controller 分别验证状态和外部副作用，覆盖配置快照、阈值边界、确认权限、旧 head、合并拒绝与崩溃恢复；故意允许 vote 合并、跳过阈值相等两种回归均会使对应测试失败。
+`make test`（真实 PostgreSQL）和 `make lint` 通过。
 
 ## M5 预览环境验证
 
@@ -206,7 +206,7 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 - [ ] README 的快速开始从零验证一遍（全新机器或全新 Kind 集群）。
 - [ ] 架构设计定稿，补充关键技术选型理由。
-- [ ] 录制演示视频：开 PR → 评审 → 预览验证 → AI 投票并与人工审批一起满足合并要求（再演示一次 auto 模式自动合并）；穿插一次 Pod 崩溃恢复和成本看板。
+- [ ] 录制演示视频：开 PR -> 评审 -> 预览验证 -> AI 投票并与人工审批一起满足合并要求（再演示一次 auto 模式自动合并）；穿插一次 Pod 崩溃恢复和成本看板。
 - [ ] 发布镜像与 chart 的版本 tag。
 
-验收：评委按 README 能在本机复现；视频覆盖"发现 → 分析 → 定位 → 修复建议 → 验证"的完整闭环。
+验收：评委按 README 能在本机复现；视频覆盖"发现 -> 分析 -> 定位 -> 修复建议 -> 验证"的完整闭环。
