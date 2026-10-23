@@ -1,0 +1,23 @@
+# The 20 PRs of the cost benchmark (docs/cost-report.md), by changed lines
+# (additions + deletions): small < 100, medium 100–500, large > 500.
+# tier	url
+small	https://github.com/RooobinYe/ai-pr-review/pull/17
+small	https://github.com/RooobinYe/ai-pr-review/pull/12
+small	https://github.com/RooobinYe/ai-pr-review/pull/5
+small	https://github.com/go-chi/chi/pull/1097
+small	https://github.com/go-chi/chi/pull/1159
+small	https://github.com/go-chi/chi/pull/1218
+small	https://github.com/go-chi/chi/pull/1220
+medium	https://github.com/RooobinYe/ai-pr-review/pull/15
+medium	https://github.com/RooobinYe/ai-pr-review/pull/8
+medium	https://github.com/RooobinYe/ai-pr-review/pull/11
+medium	https://github.com/RooobinYe/ai-pr-review/pull/9
+medium	https://github.com/go-chi/chi/pull/1148
+medium	https://github.com/go-chi/chi/pull/1195
+medium	https://github.com/go-chi/chi/pull/1214
+large	https://github.com/RooobinYe/ai-pr-review/pull/14
+large	https://github.com/RooobinYe/ai-pr-review/pull/10
+large	https://github.com/RooobinYe/ai-pr-review/pull/13
+large	https://github.com/RooobinYe/ai-pr-review/pull/4
+large	https://github.com/RooobinYe/ai-pr-review-cloud/pull/1
+large	https://github.com/RooobinYe/ai-pr-review-cloud/pull/2

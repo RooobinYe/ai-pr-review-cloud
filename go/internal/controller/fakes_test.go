@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -17,9 +18,11 @@ import (
 
 // fakeStore mirrors the semantics of *store.Store in memory.
 type fakeStore struct {
-	mu   sync.Mutex
-	runs map[string]*store.Run
-	seq  int
+	mu           sync.Mutex
+	runs         map[string]*store.Run
+	seq          int
+	usage        map[string]map[int]store.Usage
+	fetchSeconds map[string]float64
 }
 
 func newFakeStore(runs ...store.Run) *fakeStore {
@@ -124,6 +127,33 @@ func (s *fakeStore) Transition(_ context.Context, id string, from, to run.State,
 	if reason != "" {
 		r.Error = reason
 	}
+	return nil
+}
+
+func (s *fakeStore) RecordUsage(_ context.Context, id string, u store.Usage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.runs[id]; !ok {
+		return store.ErrNotFound
+	}
+	if s.usage == nil {
+		s.usage = map[string]map[int]store.Usage{}
+	}
+	if s.usage[id] == nil {
+		s.usage[id] = map[int]store.Usage{}
+	}
+	s.usage[id][u.Turn] = u
+	return nil
+}
+
+func (s *fakeStore) RecordFetchTiming(_ context.Context, id string, started, finished time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runs[id].FetchTimed = true
+	if s.fetchSeconds == nil {
+		s.fetchSeconds = map[string]float64{}
+	}
+	s.fetchSeconds[id] = finished.Sub(started).Seconds()
 	return nil
 }
 
