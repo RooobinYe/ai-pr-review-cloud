@@ -165,7 +165,8 @@ async function local(url: string, format: string): Promise<number> {
         result: run?.result,
         error: failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure),
       });
-      await writeFile(values.stats, `${JSON.stringify(stats, null, 2)}\n`);
+      // A stats problem must not hide why the review failed or skip the cleanup.
+      await writeFile(values.stats, `${JSON.stringify(stats, null, 2)}\n`).catch((err: unknown) => log(`could not write ${values.stats}: ${String(err)}`));
     }
     if (values.keep) log(`kept ${scratch}`);
     else await rm(scratch, { recursive: true, force: true });

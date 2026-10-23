@@ -1,7 +1,8 @@
 // Cost benchmark driver (docs/architecture.md §7.2, docs/cost-report.md).
 // Runs the runner in local mode over bench/prs.tsv and keeps one --stats file
 // per run under bench/results/<variant>/. Finished runs are skipped, so an
-// interrupted benchmark resumes where it stopped.
+// interrupted benchmark resumes where it stopped; runs the model API refused
+// are not finished and run again.
 //
 //   node --env-file=.env bench/run.mjs --variant baseline --runs 3
 //   node --env-file=.env bench/run.mjs --variant thinking-low --thinking low
@@ -10,9 +11,10 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-const root = dirname(dirname(new URL(import.meta.url).pathname));
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const { values } = parseArgs({
   options: {
     variant: { type: "string", default: "baseline" },
@@ -49,8 +51,17 @@ for (const pr of prs) {
   const [, owner, repo, number] = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
   for (let i = 1; i <= Number(values.runs); i++) {
     const name = `${owner}-${repo}-${number}-${i}`;
-    if (!existsSync(join(outDir, `${name}.json`))) jobs.push({ ...pr, name });
+    if (!finished(join(outDir, `${name}.json`))) jobs.push({ ...pr, name });
   }
+}
+
+// A run counts as finished once it has a stats file, unless the model API
+// refused it (no credit, bad key): that says nothing about the review, so it
+// runs again. A model that never submitted is a real result and is kept.
+function finished(statsFile) {
+  if (!existsSync(statsFile)) return false;
+  const { error } = JSON.parse(readFileSync(statsFile, "utf8"));
+  return !error?.startsWith("model API error");
 }
 console.log(`${values.variant}: ${jobs.length} runs to go`);
 
