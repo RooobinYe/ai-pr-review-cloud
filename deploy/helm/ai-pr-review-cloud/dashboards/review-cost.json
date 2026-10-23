@@ -71,10 +71,11 @@
 
     { "type": "row", "title": "吞吐与排队", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "id": 10, "panels": [] },
     {
-      "type": "timeseries", "title": "吞吐（每小时结束的评审，按结果）", "id": 11,
+      "type": "timeseries", "title": "吞吐（每 5 分钟结束的评审，按结果）", "id": 11,
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "interval": "5m",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [{ "refId": "A", "legendFormat": "{{state}}", "expr": "sum by (state) (rate(review_runs_total[$__rate_interval])) * 3600" }],
+      "targets": [{ "refId": "A", "legendFormat": "{{state}}", "expr": "round(sum by (state) (increase(review_runs_total[$__interval])))" }],
       "fieldConfig": {
         "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" }, "lineWidth": 1 } },
         "overrides": [
@@ -142,10 +143,11 @@
       "options": { "orientation": "vertical", "displayMode": "gradient", "showUnfilled": true, "valueMode": "color", "namePlacement": "auto", "sizing": "auto", "minVizHeight": 16, "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
     },
     {
-      "type": "timeseries", "title": "模型花费速率（USD / 小时，按仓库）", "id": 33,
+      "type": "timeseries", "title": "模型花费（每 5 分钟，按仓库）", "id": 33,
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "interval": "5m",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [{ "refId": "A", "legendFormat": "{{repo}}", "expr": "sum by (repo) (rate(review_cost_usd_total[$__rate_interval])) * 3600" }],
+      "targets": [{ "refId": "A", "legendFormat": "{{repo}}", "expr": "sum by (repo) (increase(review_cost_usd_total[$__interval]))" }],
       "fieldConfig": { "defaults": { "unit": "currencyUSD", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
     },

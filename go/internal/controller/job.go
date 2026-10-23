@@ -199,7 +199,8 @@ func PodFailure(pod kube.Pod) string {
 				if msg == "" {
 					msg = t.Reason
 				}
-				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncate(msg, 1500))
+				// The message is the tail of the log; its last line is the fatal error.
+				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncateFront(strings.TrimSpace(msg), 1500))
 			}
 			if w := cs.State.Waiting; w != nil && w.Reason != "" && w.Reason != "PodInitializing" && w.Reason != "ContainerCreating" {
 				return fmt.Sprintf("%s is stuck: %s %s", cs.Name, w.Reason, truncate(w.Message, 500))
@@ -218,4 +219,16 @@ func truncate(s string, n int) string {
 		n--
 	}
 	return s[:n] + "…"
+}
+
+// truncateFront keeps the last n bytes of s, without splitting a UTF-8 sequence.
+func truncateFront(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return "…" + s[i:]
 }

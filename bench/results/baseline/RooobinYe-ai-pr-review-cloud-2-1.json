@@ -1,0 +1,34 @@
+{
+  "pr": "RooobinYe/ai-pr-review-cloud#2",
+  "head_sha": "f38f726251f2d570f141b36a11f9c9f99b712b99",
+  "model": "deepseek/deepseek-flash",
+  "thinking": "high",
+  "budget_usd": null,
+  "files": 50,
+  "changed_lines": 4752,
+  "seconds": {
+    "fetch": 2.062,
+    "clone": 3.782,
+    "review": 217.426,
+    "total": 223.676
+  },
+  "turns": 18,
+  "tool_calls": 33,
+  "tokens": {
+    "input": 103114,
+    "output": 33850,
+    "cache_read": 1682944,
+    "cache_write": 0
+  },
+  "cost_usd": 0.081651864,
+  "nudged": false,
+  "verdict": "approve",
+  "comments": {
+    "critical": 0,
+    "high": 0,
+    "medium": 2,
+    "low": 0
+  },
+  "error": null,
+  "tier": "large"
+}

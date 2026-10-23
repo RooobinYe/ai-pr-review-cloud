@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：M1 完成，最小闭环在本仓库的 PR 上实测通过；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M1、M6 完成，最小闭环在本仓库的 PR 上实测通过，成本测算见 [cost-report](cost-report.md)；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -380,6 +380,8 @@ Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud
 2. 每个 PR 跑 3 次，记录 token、金额、各阶段耗时。
 3. 给出每档的 P50 / P95 成本和端到端延迟，算出"每 100 个 PR 的月成本"。
 4. 找出主要瓶颈，预计在探索阶段的上下文膨胀，对比优化效果：限制探索轮数、开启 prompt cache、小模型做探索加大模型做结论。
+
+结果见 [成本测算报告](cost-report.md)：一次评审 P50 $0.029、P95 $0.068。上下文膨胀大部分被前缀缓存消化，瓶颈在输出（思考）token 和探索轮数；软预算是最有效的优化。
 
 ### 7.3 预算控制
 

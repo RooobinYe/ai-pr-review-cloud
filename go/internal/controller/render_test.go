@@ -56,6 +56,9 @@ func TestTruncateKeepsUTF8(t *testing.T) {
 	if got := truncate("评审结论", 4); got != "评…" {
 		t.Errorf("truncate = %q", got)
 	}
+	if got := truncateFront("评审结论", 4); got != "…论" {
+		t.Errorf("truncateFront = %q", got)
+	}
 }
 
 func TestBuildJob(t *testing.T) {
@@ -146,6 +149,19 @@ func TestPodFailure(t *testing.T) {
 		if got := PodFailure(tt.pod); got != tt.want {
 			t.Errorf("%s: PodFailure = %q, want %q", tt.name, got, tt.want)
 		}
+	}
+}
+
+// A runner's message is the tail of its log; the fatal error is the last line
+// and must survive truncation.
+func TestPodFailureKeepsLastLine(t *testing.T) {
+	log := strings.Repeat("runner:   read a.go\n", 200) + "runner: model API error: 402 Insufficient Balance\n"
+	pod := kube.Pod{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
+		{Name: "runner", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: log}}},
+	}}}
+	got := PodFailure(pod)
+	if !strings.HasPrefix(got, "runner exited with code 1: …") || !strings.HasSuffix(got, "runner: model API error: 402 Insufficient Balance") || len(got) > 1600 {
+		t.Errorf("PodFailure = %q", got)
 	}
 }
 
