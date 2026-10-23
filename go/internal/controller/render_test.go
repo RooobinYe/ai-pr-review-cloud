@@ -114,7 +114,7 @@ func TestTruncateKeepsUTF8(t *testing.T) {
 
 func TestBuildJob(t *testing.T) {
 	cfg := JobConfig{
-		FetchImage: "f:1", RunnerImage: "r:1", ControllerURL: "http://ctl", LLMSecret: "llm", BotLogin: bot,
+		FetchImage: "f:1", RunnerImage: "r:1", ControllerURL: "http://ctl.ns.svc/", BotLogin: bot,
 		LLMEnv: map[string]string{"LLM_MODEL": "m", "LLM_BASE_URL": ""}, ActiveDeadlineSeconds: 900,
 	}
 	r := store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, JobName: JobName(runID, 1)}
@@ -131,17 +131,42 @@ func TestBuildJob(t *testing.T) {
 	if fetchEnv["PR_NUMBER"].Value != "7" || fetchEnv["HEAD_SHA"].Value != headSHA || fetchEnv["BOT_LOGIN"].Value != bot {
 		t.Errorf("fetch env %+v", fetchEnv)
 	}
+	if got := fetchEnv["HTTPS_PROXY"].Value; got != "http://"+runID+":$(PROXY_TOKEN)@ctl.ns.svc:80" {
+		t.Errorf("fetch proxy %q", got)
+	}
+	for in, want := range map[string]string{
+		"http://ctl:8080": "http://r:$(PROXY_TOKEN)@ctl:8080",
+		"https://ctl/":    "https://r:$(PROXY_TOKEN)@ctl:443",
+		"ctl":             "http://r:$(PROXY_TOKEN)@ctl:80",
+	} {
+		if got := egressProxyURL(in, "r"); got != want {
+			t.Errorf("egressProxyURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if fetchEnv["PROXY_TOKEN"].ValueFrom.SecretKeyRef.Key != "PROXY_TOKEN" || indexOf(spec.InitContainers[0].Env, "PROXY_TOKEN") > indexOf(spec.InitContainers[0].Env, "HTTPS_PROXY") {
+		t.Error("PROXY_TOKEN must be defined before HTTPS_PROXY refers to it")
+	}
 	runnerEnv := envMap(spec.Containers[0].Env)
 	if _, leaked := runnerEnv["GITHUB_TOKEN"]; leaked {
 		t.Error("runner container gets a GitHub token")
 	}
-	if _, leaked := fetchEnv["RUN_TOKEN"]; leaked {
-		t.Error("fetch container gets the callback token")
+	for _, name := range []string{"RUN_TOKEN", "LLM_API_KEY"} {
+		if _, leaked := fetchEnv[name]; leaked {
+			t.Errorf("fetch container gets %s", name)
+		}
+	}
+	for _, name := range []string{"PROXY_TOKEN", "HTTPS_PROXY"} {
+		if _, leaked := runnerEnv[name]; leaked {
+			t.Errorf("runner container gets %s", name)
+		}
 	}
 	if ref := runnerEnv["RUN_TOKEN"].ValueFrom.SecretKeyRef; ref.Key != "RUN_TOKEN" {
 		t.Errorf("runner token ref %+v", ref)
 	}
-	if runnerEnv["RUN_ID"].Value != runID || runnerEnv["LLM_MODEL"].Value != "m" || runnerEnv["LLM_API_KEY"].ValueFrom.SecretKeyRef.Name != "llm" {
+	if ref := runnerEnv["LLM_API_KEY"].ValueFrom.SecretKeyRef; ref.Name != runSecretName(r.JobName) || ref.Key != "LLM_API_KEY" {
+		t.Errorf("runner model key ref %+v", ref)
+	}
+	if runnerEnv["RUN_ID"].Value != runID || runnerEnv["LLM_MODEL"].Value != "m" {
 		t.Errorf("runner env %+v", runnerEnv)
 	}
 	if _, ok := runnerEnv["LLM_BASE_URL"]; ok {
@@ -159,11 +184,20 @@ func TestBuildJob(t *testing.T) {
 	}
 
 	job.Metadata.UID = "u"
-	secret := BuildRunSecret(job, "tok", "run-tok")
+	secret := BuildRunSecret(job, RunCredentials{GitHubToken: "tok", ProxyToken: "p", RunToken: "run-tok", LLMKey: "sk-v"})
 	data, _ := json.Marshal(secret)
 	if !strings.Contains(string(data), `"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job","name":"`+r.JobName+`","uid":"u"}]`) {
 		t.Errorf("secret %s", data)
 	}
+}
+
+func indexOf(env []kube.EnvVar, name string) int {
+	for i, e := range env {
+		if e.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 func envMap(env []kube.EnvVar) map[string]kube.EnvVar {
@@ -195,6 +229,9 @@ func TestPodFailure(t *testing.T) {
 		{"image missing", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
 			{Name: "fetch", State: kube.ContainerState{Waiting: &kube.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "not found"}}},
 		}}}, "fetch is stuck: ImagePullBackOff not found", false},
+		{"budget spent", kube.Pod{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
+			{Name: "runner", State: terminated(1, "Error", "budget_exceeded: spent $0.51 of $0.50")},
+		}}}, "budget_exceeded: spent $0.51 of $0.50", true},
 		{"healthy", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
 			{Name: "fetch", State: kube.ContainerState{Waiting: &kube.ContainerStateWaiting{Reason: "PodInitializing"}}},
 		}}}, "", false},

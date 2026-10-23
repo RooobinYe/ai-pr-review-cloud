@@ -9,7 +9,7 @@
 | [骨架](#骨架) | 仓库结构、4 个镜像、Helm chart、Makefile、CI；gateway 签名校验；状态机与表结构 | `make lint`、`make test` 通过；Kind 上 4 个 Pod 就绪；签名正确的 webhook 返回 202，错误返回 401 | ✅ 完成 |
 | [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v3 JSON，质量不低于 v1 | ✅ 完成 |
 | [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论；结论为 approve 时 AI 投出的 APPROVE 计入必需审批数 | ✅ 完成 |
-| [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | 未开始 |
+| [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
@@ -102,15 +102,33 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：模型和 runner 拿不到任何真实凭据，也连不上外网。
 
-- [ ] chart 加入 LiteLLM proxy，真实模型 key 只放在 proxy 里。
-- [ ] controller 为每个 run 签发带 `max_budget` 的虚拟 key，存进本 run 的 Secret，run 结束吊销。
+- [x] chart 加入 LiteLLM proxy（`v1.104.2`），真实模型 key 只放在 proxy 里。
+- [x] controller 为每个 run 签发带 `max_budget` 的虚拟 key，存进本 run 的 Secret，run 结束吊销；key 另设到期时间兜底。
 - [x] 每个 run 生成独立的回调 token（`RUN_TOKEN`），controller 校验。（M1 提前实现：伪造的结论能让 bot 投出计入审批数的 APPROVE）
-- [ ] runner 的 NetworkPolicy：出站只允许 DNS、LiteLLM、controller。
-- [ ] 验证 `max_budget` 超出后 proxy 拒绝请求，run 以 `failed(budget_exceeded)` 结束。
+- [x] runner 的 NetworkPolicy：出站只允许 DNS、LiteLLM、controller。策略对整个 Pod 生效，fetch 改为经 controller 的 CONNECT 代理访问 GitHub，凭据只注入 fetch（架构 §4.1）。
+- [x] 验证 `max_budget` 超出后 proxy 拒绝请求，run 以 `failed(budget_exceeded)` 结束。
 
 验收：在 runner 容器里执行 `env` 看不到真实密钥；`curl` 任意外网地址失败。
 
+验收记录（2026-10-23，Kind，单独的 `ai-pr-review-m2` namespace，LiteLLM `v1.104.2`，评审对象为本仓库 [PR #5](https://github.com/RooobinYe/ai-pr-review-cloud/pull/5)）：
+
+| 检查 | 结果 |
+| --- | --- |
+| fetch 经 controller 代理拉代码 | 第一次失败：libcurl 对不带端口的代理地址默认用 1080；改为显式端口后，`api.github.com` 和 `github.com` 都经代理访问成功 |
+| runner 容器的 `env` | 只有 `LLM_API_KEY`（25 个字符的 LiteLLM 虚拟 key）和 `RUN_TOKEN` 两个凭据；没有 GitHub token、代理凭据、App 私钥、webhook secret、master key |
+| runner 容器访问外网 | `https://example.com`、`https://api.github.com`、`http://1.1.1.1`、`https://api.deepseek.com` 全部超时；controller 和 LiteLLM 可达（runner 镜像没有 curl，用 `node` 的 `fetch` 测） |
+| runner 容器使用 controller 的代理 | 不带凭据 407；用 `RUN_TOKEN` 或虚拟 key 冒充代理凭据 403 |
+| 预算 | 预算为 0 的 run：LiteLLM 拒绝第一个请求，run 以 `failed`、原因 `budget_exceeded: ...` 结束，Check Run 显示同一原因；本地对 mock 上游验证了花费累积到上限后拒绝 |
+| 吊销 | 上面两次失败的 run 结束后，LiteLLM 里不再有有效 key |
+| 经 LiteLLM 调用 DeepSeek | 初次因账户余额不足返回 402；充值后首轮在 197 秒因 proxy 探针重启中断。修复探针后完整评审通过，见下方补测记录 |
+
+补测（2026-10-24，北京时间；同一 namespace，PR #5 head `65ec539`）：run `157416dc-3c28-40a1-a31e-de74e8955a66` 完成，经 LiteLLM 的流式输出、thinking、工具调用和 `submit_review` 全链路成功。模型耗时 258 秒、花费 $0.0880，最终 `done / approve`，GitHub review `5630996582` 为 APPROVED，Check Run `120514245680` 为 success。LiteLLM 全程 0 次重启，结束后当前 run 的虚拟 key 已删除；旧失败 run 遗留 key 已过期，无有效 key 遗留。
+
+本次复测确认 runner 的凭据环境变量仅 `LLM_API_KEY`（25 字符虚拟 key）和 `RUN_TOKEN`；四个外网目标全部超时，controller 和 LiteLLM 健康接口均返回 200。代理凭据隔离沿用首次 407/403 验收及 `TestEgressProxy` 单元测试，本次未重复执行真实凭据冒充探测。完整评审提出一条 medium：Secret 创建响应丢失时不应吊销可能已经被 Pod 使用的 key；已修复并用 `TestLostSecretResponseKeepsUsableKey` 覆盖。`make test`、`make lint` 和连接真实 PostgreSQL 的 store 测试通过。
+
 ## M3 可靠性
+
+M2 与 M3/M6 整合验收（2026-10-24）：重试 key 的预算扣除已上报的跨轮花费，预算耗尽不签发新 key；重试、超时及 superseded 在删除旧 Job/Secret 前吊销 key。对应控制器回归测试、真实 PostgreSQL 用量汇总测试以及 runner 的预算错误/恢复测试通过。未上报的崩溃窗口花费不在扣减数内，限制见架构 §7.3。
 
 目标：任何组件在任何时刻崩溃，评审都能继续且不产生重复的 GitHub 副作用。
 

@@ -31,15 +31,16 @@ type harness struct {
 	store *fakeStore
 	gh    *fakeGitHub
 	kube  *fakeKube
+	keys  *fakeKeys
 	mux   *http.ServeMux
 	clock time.Time
 }
 
 func newHarness() *harness {
-	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued})
+	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued, BudgetUSD: 0.5})
 	gh := &fakeGitHub{head: headSHA}
 	k := newFakeKube()
-	h := &harness{store: s, gh: gh, kube: k, clock: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
+	h := &harness{store: s, gh: gh, kube: k, keys: &fakeKeys{}, clock: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
 	s.now = h.now
 	h.restart()
 	return h
@@ -50,10 +51,10 @@ func (h *harness) now() time.Time { return h.clock }
 // restart replaces the controller with a fresh one over the same store,
 // GitHub and cluster, as a controller Pod restart would.
 func (h *harness) restart() {
-	cfg := Config{MaxRunning: 2, MaxAttempts: 3, BotLogin: bot, Job: JobConfig{
-		FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMSecret: "llm", ActiveDeadlineSeconds: 1800,
+	cfg := Config{MaxRunning: 2, MaxAttempts: 3, BotLogin: bot, EgressHosts: []string{"github.com:443"}, Job: JobConfig{
+		FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMEnv: map[string]string{"LLM_MODEL": "deepseek-flash"}, ActiveDeadlineSeconds: 1800,
 	}}
-	h.c = New(cfg, h.store, h.gh, h.kube, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.c = New(cfg, h.store, h.gh, h.kube, h.keys, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h.c.now = h.now
 	h.mux = http.NewServeMux()
 	h.c.Routes(h.mux)
@@ -128,8 +129,13 @@ func TestApproveFlow(t *testing.T) {
 		t.Fatal("job not created")
 	}
 	secret := h.kube.secrets[runSecretName(r.JobName)]
-	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || len(secret.StringData["RUN_TOKEN"]) != 64 || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
+	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || len(secret.StringData["RUN_TOKEN"]) != 64 || len(secret.StringData["PROXY_TOKEN"]) != 64 ||
+		secret.StringData["RUN_TOKEN"] == secret.StringData["PROXY_TOKEN"] || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
 		t.Errorf("run secret %+v", secret)
+	}
+	key, ok := h.keys.live[secret.StringData["LLM_API_KEY"]]
+	if !ok || key.MaxBudgetUSD != 0.5 || key.Alias != r.JobName || key.Duration != 35*time.Minute || len(key.Models) != 1 || key.Models[0] != "deepseek-flash" {
+		t.Errorf("virtual key %+v (live %v)", key, ok)
 	}
 
 	h.reconcile() // nothing new while the job runs
@@ -145,6 +151,9 @@ func TestApproveFlow(t *testing.T) {
 
 	if got := h.state(); got.State != run.StateDone {
 		t.Fatalf("state %s, want done", got.State)
+	}
+	if len(h.keys.live) != 0 {
+		t.Errorf("virtual keys still live after the vote: %v", h.keys.live)
 	}
 	if len(h.gh.posted) != 1 {
 		t.Fatalf("posted %d reviews", len(h.gh.posted))
@@ -224,6 +233,9 @@ func TestJobFailureIsReported(t *testing.T) {
 	if r.State != run.StateFailed || !strings.Contains(r.Error, "fetch exited with code 3: fetch: 404 Not Found") {
 		t.Fatalf("run %+v", r)
 	}
+	if len(h.keys.live) != 0 {
+		t.Errorf("virtual keys still live after the failure: %v", h.keys.live)
+	}
 	cr := h.gh.checkRuns[100]
 	if last := cr[len(cr)-1]; last.Conclusion != "failure" || !strings.Contains(last.Output.Summary, "404") {
 		t.Errorf("check run %+v", last)
@@ -234,6 +246,19 @@ func TestJobFailureIsReported(t *testing.T) {
 	}
 	if code := h.post(result(review.VerdictApprove)); code != http.StatusConflict {
 		t.Errorf("late result: %d, want 409", code)
+	}
+}
+
+func TestBudgetExceeded(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.kube.pods = []kube.Pod{{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
+		{Name: "runner", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: "budget_exceeded: the run spent its model budget"}}},
+	}}}}
+	h.kube.finish(h.state().JobName, kube.JobFailed)
+	h.reconcile()
+	if r := h.state(); r.State != run.StateFailed || r.Error != "budget_exceeded: the run spent its model budget" {
+		t.Errorf("run %+v", r)
 	}
 }
 

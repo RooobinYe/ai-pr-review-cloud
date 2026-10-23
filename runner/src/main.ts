@@ -3,6 +3,7 @@
 //     /workspace and results go back to the controller.
 //   - local mode: --pr <url>; fetches the PR itself and prints the result,
 //     for development and CI use without a cluster.
+import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +16,7 @@ import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } fro
 import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import { ReviewFailedError, ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
+import { BudgetExceededError, ReviewFailedError, ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
 import { ReviewResultSchema, SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 import { buildRunStats } from "./stats.ts";
 import { parseBudget } from "./usage.ts";
@@ -59,7 +60,7 @@ const EXIT_FINAL = 3;
 /** A failure that is final however often the run is retried. */
 class FinalError extends Error {}
 
-const isFinal = (err: unknown) => err instanceof FinalError || err instanceof RejectedError || err instanceof ReviewNotSubmittedError;
+const isFinal = (err: unknown) => err instanceof FinalError || err instanceof RejectedError || err instanceof ReviewNotSubmittedError || err instanceof BudgetExceededError;
 
 interface ReviewRun {
   result: ReviewResult;
@@ -217,6 +218,18 @@ async function main(): Promise<number> {
   return 2;
 }
 
+/**
+ * In cluster mode the failure reason goes to the termination log, which the
+ * controller copies to the run's Check Run; Kubernetes keeps up to 4 KiB.
+ */
+function reportFailure(message: string): void {
+  if (!process.env.RUN_ID) return;
+  try {
+    writeFileSync(process.env.TERMINATION_LOG || "/dev/termination-log", message.slice(0, 4000));
+  } catch {
+    // Outside Kubernetes there is no termination log; the message is logged anyway.
+  }
+}
 // Node as PID 1 ignores SIGTERM, so a deleted Pod (a superseded run, or one
 // being evicted) would keep reviewing, and paying, through its grace period.
 // The exit is retryable; the next attempt resumes from the last snapshot.
@@ -228,7 +241,9 @@ process.on("SIGTERM", () => {
 main().then(
   (code) => process.exit(code),
   (err: unknown) => {
-    log(err instanceof Error ? err.message : String(err));
+    const message = err instanceof Error ? err.message : String(err);
+    log(message);
+    reportFailure(message);
     process.exit(isFinal(err) ? EXIT_FINAL : 1);
   },
 );

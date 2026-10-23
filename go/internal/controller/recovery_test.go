@@ -210,11 +210,12 @@ func TestNewCommitSupersedesRun(t *testing.T) {
 	h.reconcile()
 	oldJob := h.state().JobName
 	oldToken := h.runToken()
+	oldKey := string(h.kube.secrets[runSecretName(oldJob)].Data["LLM_API_KEY"])
 
 	const newID = "0b4c1f6e-0000-4000-8000-000000000002"
 	const queuedID = "0b4c1f6e-0000-4000-8000-000000000003"
 	h.store.runs[newID] = &store.Run{ID: newID, Repo: "o/r", PRNumber: 7, HeadSHA: "3333333333333333333333333333333333333333",
-		InstallationID: 42, State: run.StateQueued, CreatedAt: time.Unix(2, 0), Actions: map[store.ActionKind]string{}}
+		InstallationID: 42, State: run.StateQueued, BudgetUSD: 0.5, CreatedAt: time.Unix(2, 0), Actions: map[store.ActionKind]string{}}
 	// A run of a third commit never got to start.
 	h.store.runs[queuedID] = &store.Run{ID: queuedID, Repo: "o/r", PRNumber: 7, HeadSHA: "4444444444444444444444444444444444444444",
 		InstallationID: 42, State: run.StateQueued, CreatedAt: time.Unix(1, 0), Actions: map[store.ActionKind]string{}}
@@ -225,6 +226,9 @@ func TestNewCommitSupersedesRun(t *testing.T) {
 	}
 	if _, ok := h.kube.jobs[oldJob]; ok {
 		t.Error("superseded run's job still exists")
+	}
+	if _, ok := h.keys.live[oldKey]; ok {
+		t.Error("superseded run's key was not revoked before its Secret was deleted")
 	}
 	if cr := h.gh.checkRuns[100]; cr[len(cr)-1].Conclusion != "cancelled" {
 		t.Errorf("old check run %+v, want cancelled", cr[len(cr)-1])

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -53,17 +54,25 @@ func matchResult(r store.Run, res review.Result) error {
 // authorized reports whether the request carries the run's callback token.
 func (c *Controller) authorized(req *http.Request, r store.Run) (bool, error) {
 	got, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
-	if !ok || got == "" || r.JobName == "" {
+	if !ok {
 		return false, nil
 	}
-	secret, err := c.kube.GetSecret(req.Context(), runSecretName(r.JobName))
+	return c.tokenMatches(req.Context(), r, "RUN_TOKEN", got)
+}
+
+// tokenMatches compares got with the token stored under key in the run's Secret.
+func (c *Controller) tokenMatches(ctx context.Context, r store.Run, key, got string) (bool, error) {
+	if got == "" || r.JobName == "" {
+		return false, nil
+	}
+	secret, err := c.kube.GetSecret(ctx, runSecretName(r.JobName))
 	if errors.Is(err, kube.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	want := secret.Data["RUN_TOKEN"]
+	want := secret.Data[key]
 	return len(want) > 0 && subtle.ConstantTimeCompare([]byte(got), want) == 1, nil
 }
 

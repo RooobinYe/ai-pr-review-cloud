@@ -11,6 +11,7 @@ import (
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/litellm"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
@@ -147,6 +148,16 @@ func (s *fakeStore) PutUsage(_ context.Context, id string, u store.Usage) error 
 	}
 	s.usage[id][u.Turn] = u
 	return nil
+}
+
+func (s *fakeStore) RunCostUSD(_ context.Context, id string) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cost float64
+	for _, usage := range s.usage[id] {
+		cost += usage.CostUSD
+	}
+	return cost, nil
 }
 
 func (s *fakeStore) Get(_ context.Context, id string) (store.Run, error) {
@@ -305,10 +316,11 @@ func (g *fakeGitHub) UpdateCheckRun(_ context.Context, _ string, id int64, cr gi
 
 // fakeKube holds Jobs and Secrets by name.
 type fakeKube struct {
-	jobs    map[string]kube.Job
-	secrets map[string]kube.Secret
-	pods    []kube.Pod
-	deleted []string
+	jobs                    map[string]kube.Job
+	secrets                 map[string]kube.Secret
+	pods                    []kube.Pod
+	createSecretResponseErr error
+	deleted                 []string
 }
 
 func newFakeKube() *fakeKube {
@@ -353,7 +365,7 @@ func (k *fakeKube) CreateSecret(_ context.Context, s kube.Secret) error {
 		s.Data[key] = []byte(v)
 	}
 	k.secrets[s.Metadata.Name] = s
-	return nil
+	return k.createSecretResponseErr
 }
 
 func (k *fakeKube) GetSecret(_ context.Context, name string) (kube.Secret, error) {
@@ -374,4 +386,30 @@ func (k *fakeKube) finishWith(name, condition, reason string) {
 	job := k.jobs[name]
 	job.Status.Conditions = append(job.Status.Conditions, kube.JobCondition{Type: condition, Status: "True", Reason: reason})
 	k.jobs[name] = job
+}
+
+// fakeKeys stands in for the LiteLLM proxy's key management.
+type fakeKeys struct {
+	mu     sync.Mutex
+	issued []litellm.Key
+	live   map[string]litellm.Key
+}
+
+func (f *fakeKeys) Generate(_ context.Context, k litellm.Key) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = map[string]litellm.Key{}
+	}
+	key := fmt.Sprintf("sk-virtual-%d", len(f.issued))
+	f.issued = append(f.issued, k)
+	f.live[key] = k
+	return key, nil
+}
+
+func (f *fakeKeys) Delete(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.live, key)
+	return nil
 }

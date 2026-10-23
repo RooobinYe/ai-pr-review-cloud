@@ -9,8 +9,28 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-wo
 import { ModelRuntime, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import type { PRContext } from "./pr.ts";
 import { RESUME_PROMPT } from "./prompts.ts";
-import { acceptedSubmission, ModelRequestError, review, type TurnSnapshot } from "./review.ts";
+import type { SessionStats } from "@earendil-works/pi-coding-agent";
+import { BudgetExceededError, ModelError, modelError, acceptedSubmission, ModelRequestError, review, type TurnSnapshot } from "./review.ts";
 import { commentableLines } from "./diff.ts";
+
+const stats = {} as SessionStats;
+
+test("modelError recognizes LiteLLM's budget rejection", () => {
+  // As pi records it for LiteLLM v1.104.
+  const raw =
+    '422: {"message":"Budget has been exceeded! Key=review-x-1 (sk-...xDtA) Current cost: 0.08399999999999999, Max budget: 0.05","type":"budget_exceeded","param":null,"code":"422"}';
+  const err = modelError(raw, stats);
+  assert.ok(err instanceof BudgetExceededError);
+  assert.equal(err.message, "budget_exceeded: the model proxy refused further requests; the run spent $0.084 of its $0.05 budget");
+  assert.equal(modelError('{"type":"budget_exceeded"}', stats).message, "budget_exceeded: the model proxy refused further requests; the run spent its budget");
+});
+
+test("modelError keeps other failures generic", () => {
+  const err = modelError("401: Authentication Error, Invalid proxy server token passed.", stats);
+  assert.ok(err instanceof ModelError && !(err instanceof BudgetExceededError));
+  assert.match(err.message, /^model request failed: 401: Authentication Error/);
+});
+
 
 const pr: PRContext = {
   repo: "o/r",
@@ -138,6 +158,11 @@ test("a recovered submission keeps normalized comment paths", async () => {
   const second = await run(parseSessionEntries(first.snapshots.at(-1)!.jsonl), []);
   assert.deepEqual(second.outcome.submission, submission);
   assert.equal(second.faux.state.callCount, 0);
+});
+
+test("a proxy budget rejection survives the recovery pipeline", async () => {
+  const failed = fauxAssistantMessage("", { stopReason: "error", errorMessage: '{"type":"budget_exceeded"}' });
+  await assert.rejects(run(undefined, [failed, failed, failed]), BudgetExceededError);
 });
 
 test("a failed model request is retryable, not a missing submission", async () => {

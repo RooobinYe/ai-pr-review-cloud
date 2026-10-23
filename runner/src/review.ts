@@ -81,8 +81,27 @@ export class ReviewNotSubmittedError extends ReviewFailedError {
   }
 }
 
-/** The model request failed after pi's own retries, e.g. rate limits or an exhausted balance. */
+/** The model API refused a request and pi's retries did not help. */
 export class ModelRequestError extends ReviewFailedError {}
+export class ModelError extends ModelRequestError {}
+
+/**
+ * LiteLLM refused the run's virtual key because its budget is spent
+ * (docs/architecture.md §7.3). The message starts with "budget_exceeded:",
+ * which the controller reports as the run's failure reason.
+ */
+export class BudgetExceededError extends ModelError {}
+
+/** Classifies the error pi recorded for a failed model request. */
+export function modelError(errorMessage: string, stats: SessionStats): ModelError {
+  if (!/budget_exceeded|Budget has been exceeded/i.test(errorMessage)) {
+    return new ModelError(`model request failed: ${errorMessage.slice(0, 500)}`, stats);
+  }
+  const spent = /Current cost: ([\d.]+), Max budget: ([\d.]+)/.exec(errorMessage);
+  const usd = (v: string) => `$${Number(Number(v).toFixed(4))}`;
+  const detail = spent ? `spent ${usd(spent[1]!)} of its ${usd(spent[2]!)} budget` : "spent its budget";
+  return new BudgetExceededError(`budget_exceeded: the model proxy refused further requests; the run ${detail}`, stats);
+}
 
 /**
  * A resource loader that discovers nothing. The default one would load
@@ -235,7 +254,7 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
       const failed = !submission && lastRequestError(sessionManager);
       if (failed) {
         await uploads;
-        throw new ModelRequestError(`model request failed: ${failed.slice(0, 500)}`, session.getSessionStats());
+        throw modelError(failed, session.getSessionStats());
       }
     };
     if (!submission) {

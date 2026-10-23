@@ -29,6 +29,11 @@ func TestUsageAndStats(t *testing.T) {
 	if err := s.RecordUsage(ctx, failed, Usage{Turn: 1, Model: "deepseek/deepseek-v4-pro", InputTokens: 7, CostUSD: 0.005}); err != nil {
 		t.Fatal(err)
 	}
+	for runID, want := range map[string]float64{done: 0.03, failed: 0.005, queued: 0} {
+		if got, err := s.RunCostUSD(ctx, runID); err != nil || got != want {
+			t.Errorf("run cost: got %v, %v; want %v", got, err, want)
+		}
+	}
 	if err := s.RecordUsage(ctx, "00000000-0000-0000-0000-000000000000", turn1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("usage for an unknown run: err %v, want ErrNotFound", err)
 	}

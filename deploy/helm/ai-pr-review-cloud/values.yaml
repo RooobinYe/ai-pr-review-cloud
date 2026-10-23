@@ -15,15 +15,42 @@ github:
   privateKey: ""
 
 llm:
-  # Existing Secret with key `LLM_API_KEY`, handed to runner Pods.
-  # M2 replaces it with per-run LiteLLM virtual keys.
+  # Existing Secret with key `LLM_API_KEY`: the real model key. Only the
+  # LiteLLM proxy reads it; runners get per-run virtual keys.
   existingSecret: ""
   # Used to create that Secret when existingSecret is empty. Development only.
   apiKey: ""
+  # What runners ask for: a pi provider and model id (docs/architecture.md §4.5).
   provider: deepseek
   model: deepseek-flash
-  baseUrl: ""
   thinking: high
+  # Where LiteLLM sends those requests (its litellm_params).
+  upstream:
+    model: deepseek/deepseek-flash
+    # Overrides the provider's default endpoint.
+    apiBase: ""
+    # Request fields LiteLLM would otherwise drop; pi sends reasoning_effort
+    # for DeepSeek's thinking levels.
+    allowedParams: [reasoning_effort]
+  # USD per million tokens. LiteLLM charges each run's virtual key at these
+  # prices and refuses requests once the run's budget is spent.
+  pricing:
+    input: 0.3
+    output: 1.2
+    cacheRead: 0.006
+
+litellm:
+  image: ghcr.io/berriai/litellm:v1.104.2
+  # Master key for managing virtual keys; generated and kept across upgrades
+  # when empty. Must start with "sk-".
+  masterKey: ""
+  # Existing Secret with key `DATABASE_URL` for LiteLLM's own database. With
+  # postgres.dev.enabled a `litellm` database is created on the dev server.
+  database:
+    existingSecret: ""
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 1Gi }
 
 runs:
   # Budget recorded for each run until repositories configure their own (M4).
@@ -34,9 +61,20 @@ runs:
   language: English
   # Hard limit on one runner Job (activeDeadlineSeconds). A run that hits it fails.
   deadlineSeconds: 1800
-  # Runner Jobs per run. A lost or crashed Pod is retried from the last
-  # session snapshot until then.
+  # host:port pairs fetch may reach through the controller's egress proxy.
+  # The runner network policy blocks every other destination outside the cluster.
+  fetchEgressHosts: [github.com:443, api.github.com:443]
+
   maxAttempts: 3
+
+networkPolicy:
+  # Confine runner Pods to DNS, LiteLLM and the controller. Needs a CNI that
+  # enforces NetworkPolicy (Kind's kindnet does).
+  enabled: true
+  # Where cluster DNS runs.
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
 
 webhooks:
   # How often the controller redelivers webhooks the gateway failed to

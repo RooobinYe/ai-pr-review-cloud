@@ -6,8 +6,6 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +33,7 @@ type Store interface {
 	PutSession(ctx context.Context, id string, turn int, jsonl []byte) error
 	GetSession(ctx context.Context, id string) ([]byte, int, error)
 	PutUsage(ctx context.Context, id string, u store.Usage) error
+	RunCostUSD(ctx context.Context, id string) (float64, error)
 	RecordFetchTiming(ctx context.Context, runID string, started, finished time.Time) error
 }
 
@@ -77,7 +76,9 @@ type Config struct {
 	MaxAttempts int
 	// BotLogin is the App's bot user, "<slug>[bot]", whose approvals it dismisses.
 	BotLogin string
-	Job      JobConfig
+	// EgressHosts are the host:port pairs fetch may reach through EgressProxy.
+	EgressHosts []string
+	Job         JobConfig
 }
 
 type Controller struct {
@@ -85,16 +86,17 @@ type Controller struct {
 	store Store
 	gh    GitHub
 	kube  Kube
+	keys  Keys
 	log   *slog.Logger
 	wake  chan struct{}
 	now   func() time.Time
 }
 
-func New(cfg Config, s Store, gh GitHub, k Kube, log *slog.Logger) *Controller {
+func New(cfg Config, s Store, gh GitHub, k Kube, keys Keys, log *slog.Logger) *Controller {
 	if cfg.MaxAttempts < 1 {
 		cfg.MaxAttempts = 1
 	}
-	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, log: log, wake: make(chan struct{}, 1), now: time.Now}
+	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, keys: keys, log: log, wake: make(chan struct{}, 1), now: time.Now}
 }
 
 // startupGrace is how long an attempt may take to get its Job going before
@@ -175,7 +177,7 @@ func (c *Controller) advance(ctx context.Context, r store.Run) error {
 			step = c.publish
 		}
 		err := step(ctx, r)
-		if permanent(err) {
+		if permanent(err) || errors.Is(err, errBudgetExceeded) {
 			// Retrying cannot help; the run would be retried forever and a
 			// running one would hold its slot.
 			return c.fail(ctx, r, r.State, err.Error())
@@ -221,6 +223,7 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 	if elapsed := c.now().Sub(r.ClaimedAt); elapsed > c.attemptDeadline() {
 		// Also covers attempts whose Job could never be created, or whose
 		// GitHub calls kept failing.
+		c.revokeKey(ctx, r)
 		if err := c.deleteJob(ctx, r.JobName); err != nil {
 			return err
 		}
@@ -298,21 +301,32 @@ func (c *Controller) startJob(ctx context.Context, r store.Run) error {
 	return c.createRunSecret(ctx, r, job)
 }
 
-// createRunSecret mints fetch's read-only GitHub token and the runner's
-// callback token. The Secret is created after the Job so it can be owned by
-// it; the Pod's containers wait until it exists.
+// createRunSecret mints the run's credentials: fetch's read-only GitHub token
+// and proxy token, the runner's callback token and LiteLLM virtual key. The
+// Secret is created after the Job so it can be owned by it; the Pod's
+// containers wait until it exists.
 func (c *Controller) createRunSecret(ctx context.Context, r store.Run, job kube.Job) error {
-	githubToken, err := c.gh.FetchToken(ctx, r.InstallationID, r.Repo)
-	if err != nil {
+	var creds RunCredentials
+	var err error
+	if creds.GitHubToken, err = c.gh.FetchToken(ctx, r.InstallationID, r.Repo); err != nil {
 		return fmt.Errorf("mint fetch token: %w", err)
 	}
-	runToken := make([]byte, 32)
-	if _, err := rand.Read(runToken); err != nil {
+	if creds.ProxyToken, err = randomToken(); err != nil {
 		return err
 	}
-	err = c.kube.CreateSecret(ctx, BuildRunSecret(job, githubToken, hex.EncodeToString(runToken)))
-	if err != nil && !errors.Is(err, kube.ErrAlreadyExists) {
-		return fmt.Errorf("create run secret: %w", err)
+	if creds.RunToken, err = randomToken(); err != nil {
+		return err
+	}
+	if creds.LLMKey, err = c.mintKey(ctx, r); err != nil {
+		return fmt.Errorf("mint virtual key: %w", err)
+	}
+	if err := c.kube.CreateSecret(ctx, BuildRunSecret(job, creds)); err != nil {
+		if !errors.Is(err, kube.ErrAlreadyExists) {
+			return fmt.Errorf("create run secret: %w", err)
+		}
+		if derr := c.keys.Delete(ctx, creds.LLMKey); derr != nil {
+			c.runLog(r).Warn("delete unused virtual key; it expires on its own", "err", derr)
+		}
 	}
 	return nil
 }
@@ -345,6 +359,10 @@ func (c *Controller) retryOrFail(ctx context.Context, r store.Run, reason string
 	}
 	if r.Attempt >= c.cfg.MaxAttempts {
 		return c.fail(ctx, r, run.StateRunning, fmt.Sprintf("gave up after %d attempts; the last one failed: %s", r.Attempt, reason))
+	}
+	c.revokeKey(ctx, r)
+	if err := c.deleteJob(ctx, r.JobName); err != nil {
+		return err
 	}
 	err := c.store.Transition(ctx, r.ID, run.StateRunning, run.StateQueued, reason)
 	if errors.Is(err, store.ErrConflict) {
@@ -402,6 +420,7 @@ func checkRun(ctx context.Context, gh GitHubClient, r store.Run) (int64, error) 
 // reportFailure completes the run's Check Run as failed, creating one if the
 // run failed before opening it, so every failure is visible on the PR.
 func (c *Controller) reportFailure(ctx context.Context, r store.Run) error {
+	c.revokeKey(ctx, r)
 	gh := c.gh.Client(r.InstallationID)
 	return c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
 		id, err := checkRun(ctx, gh, r)
@@ -422,6 +441,7 @@ func (c *Controller) reportFailure(ctx context.Context, r store.Run) error {
 // completes the Check Run it opened. A run superseded while queued opened
 // none and needs none.
 func (c *Controller) cancel(ctx context.Context, r store.Run) error {
+	c.revokeKey(ctx, r)
 	if err := c.deleteJob(ctx, r.JobName); err != nil {
 		return err
 	}
@@ -444,6 +464,8 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 		return errors.New("reviewed run has no result")
 	}
 	res := *r.Result
+	// The runner has nothing left to ask the model.
+	c.revokeKey(ctx, r)
 	if !r.FetchTimed {
 		c.recordFetchTiming(ctx, r)
 	}

@@ -152,6 +152,9 @@ func TestRecordTriggerDeduplicates(t *testing.T) {
 	if err != nil || !created || id == "" {
 		t.Fatalf("first trigger: id=%q created=%v err=%v", id, created, err)
 	}
+	if r, err := s.Get(ctx, id); err != nil || r.BudgetUSD != 0.5 {
+		t.Errorf("recorded run %+v, err %v; want budget 0.5", r, err)
+	}
 	if _, created, err := s.RecordTrigger(ctx, "d1", newRun("b")); err != nil || created {
 		t.Errorf("redelivery: created=%v err=%v, want ignored", created, err)
 	}

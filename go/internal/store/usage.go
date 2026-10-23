@@ -24,6 +24,15 @@ type Usage struct {
 	CostUSD          float64 `json:"cost_usd"`
 }
 
+func (s *Store) RunCostUSD(ctx context.Context, runID string) (float64, error) {
+	var cost float64
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(sum(cost_usd), 0)::float8 FROM run_usage WHERE run_id = $1`, runID).Scan(&cost)
+	if err != nil {
+		return 0, fmt.Errorf("read run cost: %w", err)
+	}
+	return cost, nil
+}
+
 // RecordUsage stores one turn of a run's usage. A repeated report of the same
 // turn replaces the earlier one instead of adding to it.
 func (s *Store) RecordUsage(ctx context.Context, runID string, u Usage) error {

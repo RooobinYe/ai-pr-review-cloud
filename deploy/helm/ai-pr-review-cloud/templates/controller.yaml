@@ -6,7 +6,7 @@ metadata:
   labels: {{- include "aprc.labels" . | nindent 4 }}
 ---
 # The controller creates and observes runner Jobs in its own namespace, and
-# creates each Job's Secret holding fetch's read-only GitHub token.
+# creates each Job's Secret holding the run's credentials.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -81,14 +81,20 @@ spec:
                 fieldRef: { fieldPath: metadata.namespace }
             - name: CONTROLLER_URL
               value: {{ printf "http://%s-controller.%s.svc" (include "aprc.fullname" .) .Release.Namespace | quote }}
-            - name: LLM_SECRET
-              value: {{ include "aprc.llmSecret" . }}
+            - name: LITELLM_URL
+              value: {{ include "aprc.litellmURL" . | quote }}
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ include "aprc.litellmSecret" . }}, key: master-key }
+            - name: FETCH_EGRESS_HOSTS
+              value: {{ join "," .Values.runs.fetchEgressHosts | quote }}
             - name: LLM_PROVIDER
               value: {{ .Values.llm.provider | quote }}
             - name: LLM_MODEL
               value: {{ .Values.llm.model | quote }}
+            # Runners reach the model only through LiteLLM.
             - name: LLM_BASE_URL
-              value: {{ .Values.llm.baseUrl | quote }}
+              value: {{ include "aprc.litellmURL" . | quote }}
             - name: LLM_THINKING
               value: {{ .Values.llm.thinking | quote }}
             - name: REVIEW_LANGUAGE
@@ -110,7 +116,8 @@ spec:
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
           securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
 ---
-# Runner callbacks (result, session snapshot, usage) arrive here.
+# Runner callbacks (result, session snapshot, usage) and fetch's egress proxy
+# to GitHub arrive here.
 apiVersion: v1
 kind: Service
 metadata:

@@ -127,24 +127,28 @@ controller 启动时执行嵌入的迁移（`schema_migration` 表记录已执�
 Pod (Job: review-<run-id>-<attempt>)
 ├── initContainer: fetch（alpine + git）
 │     env: GITHUB_TOKEN = 只读、1 小时有效、只能访问本仓库的 installation token
-│                         （来自 Secret review-<run-id>-<attempt>-credentials，归 Job 所有，随 Job 删除）
+│          PROXY_TOKEN  = 使用 controller 出站代理的凭据
+│                         （两者都来自 Secret review-<run-id>-<attempt>-credentials，归 Job 所有，随 Job 删除）
+│          HTTPS_PROXY  = http://<run-id>:$(PROXY_TOKEN)@<controller>
 │          REPO, PR_NUMBER, HEAD_SHA, BOT_LOGIN, WORKSPACE=/workspace
-│     作用: 克隆 head（往前 20 个提交）到 /workspace/repo、拉取 base、写出 /workspace/pr.json
-│          （元信息、diff，以及 bot 在该 PR 上留过的逐行评论）
+│     作用: 经 controller 的代理克隆 head（往前 20 个提交）到 /workspace/repo、拉取 base、写出 /workspace/pr.json（元信息、diff、bot 之前的逐行评论）
 │     token 经 git 的环境变量配置传入，不进 argv 和 .git/config；结束后随容器退出，主容器读不到
 ├── container: runner
-│     env: RUN_ID, CONTROLLER_URL, RUN_TOKEN（回调 controller 用，同一个 Secret 的另一个 key，fetch 读不到）,
-│          LLM_API_KEY（M1 为共享 Secret，M2 换成 LiteLLM 虚拟 key）
+│     env: RUN_ID, CONTROLLER_URL, RUN_TOKEN（回调 controller 用）,
+│          LLM_API_KEY（本次 run 的 LiteLLM 虚拟 key）, LLM_BASE_URL（LiteLLM 的 Service）
+│          两个 key 来自同一个 Secret，fetch 读不到；GITHUB_TOKEN、PROXY_TOKEN 不注入主容器
 │     volume: /workspace、/tmp (emptyDir)；根文件系统只读
 │     serviceAccount: 不挂载 token；预览阶段使用绑定到 PR namespace 的只读 SA
-└── NetworkPolicy: 出站只允许 LiteLLM proxy、controller、kube-apiserver（预览阶段）
+└── NetworkPolicy: 整个 Pod 出站只允许 DNS、LiteLLM、controller；入站全部拒绝（M5 预览阶段再放行 kube-apiserver）
 ```
+
+NetworkPolicy 作用于整个 Pod，init 容器也连不上外网，所以 fetch 通过 controller 访问 GitHub：controller 的 HTTP 端口同时是一个只做 CONNECT 的代理，目标限定为 `runs.fetchEgressHosts`（默认 `github.com:443`、`api.github.com:443`），并要求 `Proxy-Authorization` 带上本 run 的 ID 和 `PROXY_TOKEN`，且 run 仍处于 `running`。TLS 在 fetch 与 GitHub 之间端到端建立，controller 看不到 GitHub token。主容器能连到 controller，但没有 `PROXY_TOKEN`，用不了这个代理。
 
 两个容器都以 UID 1000（runner 镜像的 `node` 用户）运行，git 才会信任 fetch 留下的工作区。blob 一次拉全，不用部分克隆：runner 没有凭据，之后也没有外网，无法按需补拉。fetch 发现 PR 的 head 已不是本 run 的 `head_sha` 时直接失败（退出码 3，不重试），新提交有自己的 run。
 
 同一 PR 再次评审时，fetch 用 GraphQL 取回 bot 自己的逐行评论线程（最近 100 个线程中最多 30 条，每条截断到 2000 字节），连同 `isResolved`、`isOutdated` 写进 `pr.json` 的 `previousComments`。提示词要求模型不重复已解决或已修复的问题，仍然存在的问题注明"上次评审未解决"，把精力放在新改动上。这些评论引用了 PR 代码，在提示词里同样按不可信输入包起来。取不到时只打警告，评审照常进行。GraphQL 里 bot 的登录名没有 REST 的 `[bot]` 后缀，比较时去掉。
 
-容器失败时，退出信息（`terminationMessagePolicy: FallbackToLogsOnError`，即日志末尾）由 controller 读出，写进 `review_run.error` 和 Check Run。退出码 3（`run.ExitFinal`）表示重试也没用：fetch 遇到 head 已变、GitHub 401/404/410/422，runner 遇到结果被 controller 拒绝、`pr.json` 不合法、模型被提醒两次仍不提交。其余失败都会重试（§4.3）。
+runner 在集群模式下把失败原因写进 `/dev/termination-log`。容器失败时，退出信息（`terminationMessagePolicy: FallbackToLogsOnError`，即日志末尾）由 controller 读出，写进 `review_run.error` 和 Check Run。退出码 3（`run.ExitFinal`）表示重试也没用：fetch 遇到 head 已变、GitHub 401/404/410/422，runner 遇到结果被 controller 拒绝、`pr.json` 不合法、模型被提醒两次仍不提交、预算耗尽。其余失败都会重试（§4.3）。
 
 ### 4.2 执行流程
 
@@ -238,13 +242,20 @@ runner 通过环境变量选择模型，`ModelRuntime` 不读写 `~/.pi`：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LLM_API_KEY` | — | 必填。集群模式下是 LiteLLM 虚拟 key（M2） |
+| `LLM_API_KEY` | — | 必填。集群模式下是本次 run 的 LiteLLM 虚拟 key |
 | `LLM_PROVIDER` | `deepseek` | pi 内置 provider 保留其模型目录（价格、兼容参数）；其他名称按 OpenAI 兼容接口注册 |
 | `LLM_MODEL` | `deepseek-flash` | |
-| `LLM_BASE_URL` | — | 覆盖 provider 地址，集群模式指向 LiteLLM |
+| `LLM_BASE_URL` | — | 覆盖 provider 地址，集群模式指向 LiteLLM 的 Service |
 | `LLM_THINKING` | `high` | `off` 到 `max` |
 
 花费按 pi 模型目录的单价计算，`usage` 含 `input`、`output`、`cacheRead`、`cacheWrite`、`cost.total`。DeepSeek 会返回缓存命中量：M0 验收的三个 PR 里，缓存读取的 token 是非缓存输入的 11 到 14 倍。
+
+集群模式下 pi 仍使用内置的 `deepseek` provider（保留模型目录和兼容参数），只把 `baseUrl` 指向 LiteLLM。LiteLLM 的配置由 chart 从 `llm.*` 生成：`model_name` 与 `llm.model` 一致，`litellm_params.model` 取 `llm.upstream.model`（`deepseek/deepseek-flash`），真实 key 从 `llm.existingSecret` 注入。两处需要注意：
+
+- LiteLLM 的 DeepSeek 适配会丢弃 `reasoning_effort`，pi 用它表达 thinking 级别，所以配置里加了 `allowed_openai_params: [reasoning_effort]`。`thinking`、assistant 消息上的 `reasoning_content`、`tools` 的 `strict` 都原样转发（v1.104.2 实测）。
+- LiteLLM 按 `llm.pricing`（每百万 token 的美元价，与 pi 目录一致）给虚拟 key 记账，`max_budget` 依赖这份价格。
+
+LiteLLM 的 readiness 和 liveness 探针超时设为 5 秒；liveness 每 10 秒检测一次，连续失败 6 次才重启，CPU request 为 250m。长评审的流式请求会延迟探针响应，默认 1 秒超时曾导致 proxy 重启、中断正在进行的模型请求。
 
 ## 5. 安全边界
 
@@ -253,12 +264,22 @@ demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标�
 | 凭据 / 能力 | 谁持有 | runner 主容器能否拿到 |
 | --- | --- | --- |
 | 模型厂商真实 API key | LiteLLM proxy | 否。只有本次 run 的虚拟 key，带预算上限，run 结束即吊销 |
+| LiteLLM master key | controller、LiteLLM | 否 |
 | GitHub App 私钥 | controller | 否 |
 | GitHub 只读 installation token | fetch initContainer | 否。initContainer 退出后不可见 |
+| 出站代理凭据（`PROXY_TOKEN`） | controller、本 run 的 fetch | 否。只注入 fetch；没有它，主容器无法经 controller 访问 GitHub |
 | 回调 token（`RUN_TOKEN`） | controller、本 run 的 runner 主容器 | 是，只能为本 run 提交结果；没有它无法伪造结论让 bot 投 APPROVE |
 | GitHub 写操作（评论、approve、merge） | controller | 否。runner 只能提交结论 |
 | 集群访问 | 预览阶段的只读 SA | 只限 PR 自己的 namespace：pods、pods/log、events、deployments 的 get/list/watch |
-| 外网访问 | — | 否。NetworkPolicy 只放行 proxy、controller 和 apiserver |
+| 外网访问 | — | 否。NetworkPolicy 只放行 DNS、LiteLLM 和 controller（M5 预览阶段加 apiserver） |
+
+虚拟 key 的生命周期：
+
+- **签发。** controller 创建 Job 后、创建本 run 的 Secret 前调用 LiteLLM 的 `/key/generate`：`max_budget` 取 run 的 `budget_usd` 减去已上报的 `run_usage.cost_usd`，余额小于等于 0 则以 `budget_exceeded` 失败，不再签发；`models` 只含 `llm.model`，`key_alias` 为 Job 名，`duration` 为 Job 的 `activeDeadlineSeconds` 加 5 分钟。Secret 已存在时删除本次多签发的 key；其他创建错误可能是响应丢失但 Secret 已持久化，因此保留 key 并在下一轮检查 Secret，不确定未使用的 key 由到期机制兜底。
+- **吊销。** run 离开 `running` 时（收到结论后进入投票、失败、重试或被新提交取代）controller 从 Secret 读出 key 并调用 `/key/delete`；超时、重试和 superseded 路径先吊销再删除旧 Job，避免 Secret 被级联删除后失去 key。吊销失败只记日志：key 到期自动失效，且预算有上限。controller 在签发与写入 Secret 之间崩溃会留下一个没人拿到的 key，同样到期失效。
+- **超预算。** LiteLLM 在请求前检查花费，超出后返回 `budget_exceeded`。pi 不重试这类错误；runner 不再追加提交提醒，以 `budget_exceeded: ...` 为失败原因退出，controller 原样写进 `review_run.error` 和 Check Run（§7.3）。
+
+LiteLLM 自己的入站也用 NetworkPolicy 限定为 runner 和 controller。
 
 被注入的模型最多能做到：浪费本次 run 的预算、给出错误结论。默认的 `vote` 模式下，错误的 approve 只是一票，仍要满足仓库其余的审批要求；`auto` 模式下错误结论可能导致合并，这是 §0 里明确接受的风险。
 
@@ -270,7 +291,7 @@ demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标�
 - runner 所在 namespace 配 `ResourceQuota` 和 `LimitRange`，防止一次大 PR 吃光节点。
 - Job 设置 `activeDeadlineSeconds`、`ttlSecondsAfterFinished`；`backoffLimit: 0`，重试由 controller 统一决定（这样才能带上 session 快照恢复，§4.3）。
 - 冷启动优化：runner 镜像预装 pi 依赖和 git（M5 再加 kubectl）；fetch 阶段浅克隆（depth 1 + 按需拉 base）。实测后再决定要不要加 git mirror 缓存。
-- 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 token；M2 起还有虚拟 key、回调 token）。M5 的预览环境需要创建 namespace，届时再加一个只含 `namespaces` 的 ClusterRole。
+- 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 GitHub token 和代理凭据、runner 的回调 token 和虚拟 key）。M5 的预览环境需要创建 namespace，届时再加一个只含 `namespaces` 的 ClusterRole。
 - Kubernetes 访问：controller 只用到 Job、Secret、Pod 的少数几个调用，`go/internal/kube` 直接调 REST API（in-cluster token 每次请求重读），不引入 client-go，controller 镜像保持在十几 MB。M5 需要部署 Helm chart 时再评估。
 - 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run、推进到 `done`；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。
 - 同一 PR 的新提交到达后，旧 run 只要还没到 `reviewed`（`queued`、`running`、`previewing`、`awaiting_approval`）就被取代，它的 Job 连同 Pod 和 Secret 一起删除（`propagationPolicy: Background`），之后再到的结果、快照都被拒绝。已经 `reviewed` 的 run 让它投完：投票前会检查 head（§6.3）。
@@ -401,7 +422,7 @@ Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud
 
 ### 7.3 预算控制
 
-- 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明（M2）。这是硬上限。
+- 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明（§5）。LiteLLM 在请求前检查预算，单次尝试可能超出最后一个请求的花费；重试签发按 run 的预算减去已上报的 `run_usage.cost_usd`，余额耗尽不再发 key。这里的用量按 pi 模型目录计价，需与 LiteLLM 的 `llm.pricing` 保持一致；崩溃前未上报的请求花费可能遗漏，代理花费落库也有延迟，因此不是严格的账单硬上限。
 - runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`BUDGET_REMINDER`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
 - 软上限按轮检查，所以实际花费会超过阈值大约一到两轮（提示送达前的那一轮，加上提交的那一轮）。测算里预算设为 $0.02 时的实际花费见 [成本测算报告](cost-report.md)。
 
@@ -430,10 +451,11 @@ ai-pr-review-cloud/
 │   ├── cmd/controller/              # 状态机驱动（装配、迁移）
 │   ├── cmd/fetch/                   # runner 的 init 容器（装配）
 │   ├── internal/gateway/            # webhook 处理：验签、解析触发、写入 run
-│   ├── internal/controller/         # reconcile 循环、Job 模板、投票与 Check Run 呈现、结果回调
+│   ├── internal/controller/         # reconcile 循环、Job 模板、投票与 Check Run 呈现、结果回调、fetch 的出站代理
 │   ├── internal/fetch/              # 拉取 PR 元信息与 diff、克隆、写 pr.json
 │   ├── internal/githubapp/          # webhook 签名与触发、App JWT 与 installation token、REST 客户端
 │   ├── internal/kube/               # 最小 Kubernetes REST 客户端（Job、Secret、Pod）
+│   ├── internal/litellm/            # LiteLLM 虚拟 key 的签发与吊销
 │   ├── internal/metrics/            # /metrics：由数据库快照生成 Prometheus 指标
 │   ├── internal/store/              # PostgreSQL 访问与迁移
 │   ├── internal/review/             # 评审结论 schema v3（与 runner 对齐）
@@ -477,13 +499,16 @@ chart 目前包含：
 - gateway（2 副本）和 controller（1 副本）的 Deployment 与 Service，都以非 root、只读根文件系统、丢弃全部 capability 运行；gateway 在数据库迁移完成前不就绪；
 - controller 的 ServiceAccount 和最小 Role（§6.1）；
 - GitHub App 的 webhook secret、App ID 和私钥：可以引用已有 Secret（`github.existingSecret`），开发时也可由 chart 根据 `github.*` 生成；
-- runner 使用的模型 key（`llm.existingSecret` 或 `llm.apiKey`，M2 换成 LiteLLM 虚拟 key）和模型参数，`runs.*`（并发上限、每个 run 的尝试次数、单个 Job 时限、评审语言、默认预算），以及 `webhooks.redeliverInterval`（失败 webhook 的重投间隔，0 关闭）；
+- LiteLLM proxy（`litellm.image`，单副本，非 root、只读根文件系统）：真实模型 key 来自 `llm.existingSecret` 或 `llm.apiKey`，只注入 LiteLLM；master key 未指定时由 chart 生成并在升级时保留；它自己的数据库在开发模式下是 dev PostgreSQL 上的 `litellm` 库（init 容器创建），否则通过 `litellm.database.existingSecret` 接入；
+- 模型参数 `llm.*`，以及 `runs.*`（并发上限、每个 run 尝试次数、单个 Job 时限、评审语言、默认预算、fetch 可访问的 GitHub 地址）；
+- runner 与 LiteLLM 的 NetworkPolicy（`networkPolicy.enabled`，默认开启，DNS 的位置由 `networkPolicy.dns` 指定）；
+- `webhooks.redeliverInterval` 配置失败 webhook 的重投间隔，0 关闭；
 - 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库。
 - 仅供开发用的 Prometheus 和 Grafana（`monitoring.dev.enabled`，不持久化）：Prometheus 抓取 controller 的 `/metrics`，Grafana 预置数据源和成本看板，匿名只读。生产环境关闭它，用已有的监控抓取 controller Service 并导入看板 JSON。
 
-LiteLLM proxy 和 runner 的 NetworkPolicy 在 M2 加入，预览环境所需的 ClusterRole 在 M5 加入。
+预览环境所需的 ClusterRole 在 M5 加入。
 
-`make deploy` 的密钥只从环境变量读取：`GITHUB_WEBHOOK_SECRET`（缺省时用一个固定的开发值）、`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY_FILE`、`LLM_API_KEY`。没有 App ID 时 controller 照常启动，但 run 停在 `queued`，所以不配置 GitHub App 也能把整套服务拉起来。
+`make deploy` 的密钥只从环境变量读取：`GITHUB_WEBHOOK_SECRET`（缺省时用一个固定的开发值）、`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY_FILE`、`LLM_API_KEY`（真实模型 key，交给 LiteLLM）。没有 App ID 时 controller 照常启动，但 run 停在 `queued`，所以不配置 GitHub App 也能把整套服务拉起来。
 
 runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` 即为本地模式，等价于 v1 的 CLI 用法。
 
@@ -496,9 +521,11 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 - **run 进行中的失败处理。** Pod 失败按 §4.3 重试并从快照续跑；超时、确定性退出码、GitHub 返回确定性错误（401、403（限流除外）、404、410、422）时，run 直接置为 `failed`；投票被拒也一样（`reviewed` → `failed`）。失败一律写到 Check Run，Check Run 还没创建时补建一个已失败的；连 Check Run 都写不进去时只记日志，不再重试。
 - **快照的体积。** 每轮上传完整 session，总流量随轮数平方增长。M3 实测 9 轮约 250 KB，集群内网可以接受；单个快照上限 32 MiB。若长评审成为瓶颈，再改为只上传新增 entry。
 - **pi SDK 版本变动快。** 包名已从 `@mariozechner` 迁到 `@earendil-works`，初始化方式也从 `AuthStorage` 换成了 `ModelRuntime`，两周内从 1.1 发到 1.4。目前精确锁定 `1.3.0`，升级单独提交并跑一遍 M0 的验收。
-- **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，M2 时与 LiteLLM 的花费交叉校验。
+- **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，LiteLLM 按 `llm.pricing` 单独记账，两者的交叉校验在 M6 的测算里做。
 - **自定义模型接入。** DeepSeek 是 pi 内置 provider，指向 LiteLLM 只需覆盖 `baseUrl`；`deepseek-flash` 在 M0 的三个 PR 上都一次调用成功 `submit_review`。换用其他模型时要重新验证工具调用的稳定性。
-- **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库）；落地前用选定版本验证 `max_budget` 是否按预期拒绝请求。
+- **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库，不能与本系统共用一个库的不同 schema：v1.104.2 的迁移在非 `public` schema 下失败）。已用 v1.104.2 验证 `max_budget` 在花费达到上限后拒绝请求（422，`type: budget_exceeded`），删除后的 key 立即失效；`/key/info` 里的 `spend` 是批量写库的，比实际花费滞后，不能用来判断是否超预算。
+- **DNS 仍是一条出站通道。** runner 可以查询任意域名，集群 DNS 会替它递归解析，理论上能把少量数据编码进查询名带出去。代价是必须先拿到值得带出的数据：runner 只有本 run 的虚拟 key（有预算、会吊销）和被评审的代码。需要堵住时，可以给 CoreDNS 配置只解析集群内域名的视图。
+- **NetworkPolicy 依赖 CNI。** Kind 的 kindnet 通过 kube-network-policies 实施，策略对新 Pod 的生效有几秒延迟（Pod IP 被异步加入规则集，此前 fail-open）。runner Pod 里先跑的是 fetch，模型在这之后才启动，所以这段窗口里没有不可信代码在运行；不实施 NetworkPolicy 的 CNI 上这层隔离不存在，chart 无法替你检查。
 - **工具链版本较新。** runner 用 TypeScript 7.0、Go 镜像用 `golang:1.27`，本地验证通过，GitHub Actions 上还没跑过。
 - **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，controller 发布时以结果里的 `head_sha` 为 `commit_id`，PR 之后的推送不会让锚点错位；GitHub 仍拒绝时把评论折叠进正文（§6.3）。
 - **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；M1 已实测：App 有 Contents: write 时计入，只有 read 时不计入（§6.4）。在要求 1 个审批的分支上，bot 的一票就能满足要求；"AI 加一个人"的 2 票场景需要第二个人类账号，机制相同，留到 M7 演示时验证。

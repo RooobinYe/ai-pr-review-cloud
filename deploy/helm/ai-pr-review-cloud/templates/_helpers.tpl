@@ -27,6 +27,22 @@ app.kubernetes.io/component: {{ .component }}
 {{- .Values.llm.existingSecret | default (printf "%s-llm" (include "aprc.fullname" .)) -}}
 {{- end -}}
 
+{{- define "aprc.litellmSecret" -}}
+{{- printf "%s-litellm" (include "aprc.fullname" .) -}}
+{{- end -}}
+
+{{- define "aprc.litellmURL" -}}
+{{- printf "http://%s-litellm.%s.svc:4000" (include "aprc.fullname" .) .Release.Namespace -}}
+{{- end -}}
+
+{{- define "aprc.litellmDatabaseSecret" -}}
+{{- if .Values.postgres.dev.enabled -}}
+{{ include "aprc.litellmSecret" . }}
+{{- else -}}
+{{ required "litellm.database.existingSecret is required when postgres.dev.enabled is false" .Values.litellm.database.existingSecret }}
+{{- end -}}
+{{- end -}}
+
 {{- define "aprc.databaseSecret" -}}
 {{- if .Values.postgres.dev.enabled -}}
 {{ include "aprc.fullname" . }}-database

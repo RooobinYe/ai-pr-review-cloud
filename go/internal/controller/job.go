@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -29,13 +30,11 @@ type JobConfig struct {
 	FetchImage      string
 	RunnerImage     string
 	ImagePullPolicy string
-	// BotLogin is the App's bot user; fetch collects its earlier comments.
-	BotLogin string
-	// ControllerURL is where the runner posts its result.
+	BotLogin        string
+	// ControllerURL is where the runner posts its result, and fetch's proxy to GitHub.
 	ControllerURL string
-	// LLMSecret names the Secret holding the model API key under LLM_API_KEY.
-	LLMSecret string
 	// LLMEnv is passed to the runner as is (LLM_PROVIDER, LLM_MODEL, ...).
+	// LLM_BASE_URL points at the LiteLLM proxy.
 	LLMEnv                map[string]string
 	Language              string
 	ActiveDeadlineSeconds int64
@@ -74,13 +73,14 @@ func JobName(runID string, attempt int) string {
 	return fmt.Sprintf("review-%s-%d", runID, attempt)
 }
 
-// runSecretName names the per-run Secret holding fetch's GitHub token and the
-// runner's callback token.
+// runSecretName names the per-run Secret holding the run's credentials (RunCredentials).
 func runSecretName(jobName string) string { return jobName + "-credentials" }
 
 // BuildJob renders the runner Job for a run (docs/architecture.md §4.1): the
 // fetch init container clones the PR with a read-only token, then the runner
-// container reviews the workspace without any GitHub credential.
+// container reviews the workspace without any GitHub credential. The runner
+// network policy only lets the Pod reach DNS, LiteLLM and the controller, so
+// fetch reaches GitHub through the controller's egress proxy.
 func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 	labels := map[string]string{labelName: "ai-pr-review-cloud", labelPart: "runner", labelRunID: r.ID}
 	mounts := []kube.VolumeMount{{Name: "workspace", MountPath: "/workspace"}, {Name: "tmp", MountPath: "/tmp"}}
@@ -96,8 +96,8 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 		{Name: "WORKSPACE", Value: "/workspace"},
 		{Name: "REVIEW_LANGUAGE", Value: cfg.Language},
 		{Name: "HOME", Value: "/tmp"},
-		{Name: "RUN_TOKEN", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: runSecretName(r.JobName), Key: "RUN_TOKEN"}}},
-		{Name: "LLM_API_KEY", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: cfg.LLMSecret, Key: "LLM_API_KEY"}}},
+		{Name: "RUN_TOKEN", ValueFrom: secretRef(r.JobName, "RUN_TOKEN")},
+		{Name: "LLM_API_KEY", ValueFrom: secretRef(r.JobName, "LLM_API_KEY")},
 	}
 	for _, name := range []string{"LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "LLM_THINKING"} {
 		if v := cfg.LLMEnv[name]; v != "" {
@@ -135,7 +135,11 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 						Image:           cfg.FetchImage,
 						ImagePullPolicy: cfg.ImagePullPolicy,
 						Env: []kube.EnvVar{
-							{Name: "GITHUB_TOKEN", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: runSecretName(r.JobName), Key: "GITHUB_TOKEN"}}},
+							{Name: "GITHUB_TOKEN", ValueFrom: secretRef(r.JobName, "GITHUB_TOKEN")},
+							{Name: "PROXY_TOKEN", ValueFrom: secretRef(r.JobName, "PROXY_TOKEN")},
+							// Both git and Go's HTTP client honor HTTPS_PROXY; Kubernetes
+							// expands $(PROXY_TOKEN) from the variable above.
+							{Name: "HTTPS_PROXY", Value: egressProxyURL(cfg.ControllerURL, r.ID)},
 							{Name: "REPO", Value: r.Repo},
 							{Name: "PR_NUMBER", Value: strconv.Itoa(r.PRNumber)},
 							{Name: "HEAD_SHA", Value: r.HeadSHA},
@@ -167,20 +171,62 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 	}
 }
 
-// BuildRunSecret holds fetch's GitHub token and the runner's callback token,
-// each exposed to one container only. It is owned by the Job, so Kubernetes
-// deletes it together with the Job.
-func BuildRunSecret(job kube.Job, githubToken, runToken string) kube.Secret {
+func secretRef(jobName, key string) *kube.EnvVarSource {
+	return &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: runSecretName(jobName), Key: key}}
+}
+
+// egressProxyURL is fetch's proxy: the controller, authenticated as the run
+// with the proxy token only fetch can read. The port is always explicit:
+// git's libcurl assumes 1080 for a proxy without one, Go assumes 80.
+func egressProxyURL(controllerURL, runID string) string {
+	scheme, host, ok := strings.Cut(controllerURL, "://")
+	if !ok {
+		scheme, host = "http", controllerURL
+	}
+	host = strings.TrimSuffix(host, "/")
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "80"
+		if scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+	return fmt.Sprintf("%s://%s:$(PROXY_TOKEN)@%s", scheme, runID, host)
+}
+
+// RunCredentials are minted for each attempt of a run. Each key of the run
+// Secret is exposed to one container only.
+type RunCredentials struct {
+	// GitHubToken is fetch's read-only installation token.
+	GitHubToken string
+	// ProxyToken lets fetch use the controller's egress proxy to GitHub.
+	ProxyToken string
+	// RunToken authenticates the runner's callbacks.
+	RunToken string
+	// LLMKey is the runner's LiteLLM virtual key, capped at the run's budget.
+	LLMKey string
+}
+
+// BuildRunSecret holds a run's credentials. It is owned by the Job, so
+// Kubernetes deletes it together with the Job.
+func BuildRunSecret(job kube.Job, creds RunCredentials) kube.Secret {
 	return kube.Secret{
 		Metadata: kube.ObjectMeta{
 			Name:            runSecretName(job.Metadata.Name),
 			Labels:          job.Metadata.Labels,
 			OwnerReferences: []kube.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: job.Metadata.Name, UID: job.Metadata.UID}},
 		},
-		Type:       "Opaque",
-		StringData: map[string]string{"GITHUB_TOKEN": githubToken, "RUN_TOKEN": runToken},
+		Type: "Opaque",
+		StringData: map[string]string{
+			"GITHUB_TOKEN": creds.GitHubToken,
+			"PROXY_TOKEN":  creds.ProxyToken,
+			"RUN_TOKEN":    creds.RunToken,
+			"LLM_API_KEY":  creds.LLMKey,
+		},
 	}
 }
+
+const BudgetExceeded = "budget_exceeded"
 
 // FetchTiming returns when the fetch init container of a runner Pod ran, and
 // false until it has finished successfully.
@@ -203,6 +249,9 @@ func PodFailure(pod kube.Pod) (reason string, final bool) {
 				msg := t.Message
 				if msg == "" {
 					msg = t.Reason
+				}
+				if strings.HasPrefix(msg, BudgetExceeded+":") {
+					return truncateFront(msg, 1500), true
 				}
 				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncateFront(strings.TrimSpace(msg), 1500)), t.ExitCode == run.ExitFinal
 			}

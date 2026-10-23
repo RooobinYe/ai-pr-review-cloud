@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/controller"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/litellm"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/metrics"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
@@ -47,7 +49,19 @@ func run(log *slog.Logger) error {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	})
-	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// CONNECT requests carry no path for the mux to route on; they are fetch's
+	// egress to GitHub once the controller is up.
+	var egress atomic.Pointer[controller.Controller]
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			mux.ServeHTTP(w, r)
+		} else if ctl := egress.Load(); ctl != nil {
+			ctl.EgressProxy(w, r)
+		} else {
+			http.Error(w, "controller is not ready", http.StatusServiceUnavailable)
+		}
+	})
+	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("controller listening", "addr", srv.Addr)
@@ -78,6 +92,7 @@ func run(log *slog.Logger) error {
 	}
 	if ctl != nil {
 		ctl.Routes(mux)
+		egress.Store(ctl)
 		go ctl.Run(ctx, 5*time.Second)
 		redeliver, err := time.ParseDuration(envOr("REDELIVER_INTERVAL", "5m"))
 		if err != nil {
@@ -157,18 +172,19 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 		llmEnv[name] = os.Getenv(name)
 	}
 
+	keys := &litellm.Client{BaseURL: os.Getenv("LITELLM_URL"), MasterKey: os.Getenv("LITELLM_MASTER_KEY")}
 	bot := slug + "[bot]"
 	cfg := controller.Config{
 		MaxRunning:  maxRunning,
 		MaxAttempts: maxAttempts,
 		BotLogin:    bot,
+		EgressHosts: strings.Split(envOr("FETCH_EGRESS_HOSTS", "github.com:443,api.github.com:443"), ","),
 		Job: controller.JobConfig{
 			FetchImage:            os.Getenv("FETCH_IMAGE"),
 			RunnerImage:           os.Getenv("RUNNER_IMAGE"),
 			ImagePullPolicy:       envOr("IMAGE_PULL_POLICY", "IfNotPresent"),
 			BotLogin:              bot,
 			ControllerURL:         os.Getenv("CONTROLLER_URL"),
-			LLMSecret:             os.Getenv("LLM_SECRET"),
 			LLMEnv:                llmEnv,
 			Language:              envOr("REVIEW_LANGUAGE", "English"),
 			ActiveDeadlineSeconds: deadline,
@@ -176,13 +192,14 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 		},
 	}
 	for name, v := range map[string]string{"FETCH_IMAGE": cfg.Job.FetchImage, "RUNNER_IMAGE": cfg.Job.RunnerImage,
-		"CONTROLLER_URL": cfg.Job.ControllerURL, "LLM_SECRET": cfg.Job.LLMSecret, "POD_NAMESPACE": k.Namespace} {
+		"CONTROLLER_URL": cfg.Job.ControllerURL, "POD_NAMESPACE": k.Namespace,
+		"LITELLM_URL": keys.BaseURL, "LITELLM_MASTER_KEY": keys.MasterKey, "LLM_BASE_URL": llmEnv["LLM_BASE_URL"]} {
 		if v == "" {
 			return nil, fmt.Errorf("%s is required", name)
 		}
 	}
 	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning, "max_attempts", maxAttempts)
-	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, log), nil
+	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, keys, log), nil
 }
 
 func envOr(key, fallback string) string {
