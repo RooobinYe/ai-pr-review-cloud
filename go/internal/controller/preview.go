@@ -295,9 +295,7 @@ func (c *Controller) CleanPreviews(ctx context.Context) {
 	var list struct {
 		Items []struct {
 			Metadata struct {
-				Name        string            `json:"name"`
-				Labels      map[string]string `json:"labels"`
-				Annotations map[string]string `json:"annotations"`
+				Name string `json:"name"`
 			} `json:"metadata"`
 		} `json:"items"`
 	}
@@ -306,17 +304,28 @@ func (c *Controller) CleanPreviews(ctx context.Context) {
 		return
 	}
 	for _, item := range list.Items {
-		c.cleanPreview(ctx, k, item.Metadata.Name, item.Metadata.Annotations)
+		c.cleanPreview(ctx, k, item.Metadata.Name)
 	}
 }
 
-func (c *Controller) cleanPreview(ctx context.Context, k *kube.Client, name string, annotations map[string]string) {
+func (c *Controller) cleanPreview(ctx context.Context, k *kube.Client, name string) {
 	unlock, err := c.cfg.Preview.lock(ctx, name)
 	if err != nil {
 		return
 	}
 	defer unlock()
-	a := annotations
+	// The list may predate a deployment that held this lock. Re-read ownership
+	// and age after acquiring it so cleanup cannot delete a replacement preview.
+	var current struct {
+		Metadata struct {
+			Labels      map[string]string `json:"labels"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := k.Request(ctx, "GET", "/api/v1/namespaces/"+name, nil, &current); err != nil || current.Metadata.Labels[previewLabel] != k.Namespace {
+		return
+	}
+	a := current.Metadata.Annotations
 	number, e1 := strconv.Atoi(a["pr"])
 	installation, e2 := strconv.ParseInt(a["installation"], 10, 64)
 	if e1 != nil || e2 != nil || name != preview.Namespace(a["repo"], number) {

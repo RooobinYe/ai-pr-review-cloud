@@ -182,19 +182,12 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 验收记录（2026-10-24，Kind，`deepseek/deepseek-flash`，thinking high）：
 
-| 检查 | 结果 |
-| --- | --- |
-| [故障 PR #10](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10)，head `e56c7c0` | readiness 路径为不存在的 `/readyz`；Pod 为 `0/1 Running`，事件为 `HTTP probe failed with statuscode: 404` |
-| agent 运行时验证 | 成功调用 `kubectl get pods`、`get deployments`、`get events` 和 `logs`；日志显示 `GET /readyz` 与 `GET /healthz`；Deployment JSON 确认两个探针的实际路径 |
-| [最终 Review](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10#pullrequestreview-5632292229) | `request_changes`，GitHub COMMENT，1 条逐行评论；端到端 217 秒，花费 $0.018352 |
-| 合入 M4 后复验：PR #10，head `f296c6f` | [Review 5632561250](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10#pullrequestreview-5632561250)：agent 通过 5 次 kubectl 检查确认探针 HTTP 404，`request_changes`；端到端 209 秒，花费 $0.015488；run `8563a6ae-06da-40f1-845b-5e0b91102cb9` |
-| 正常对照：PR #9，head `dd2ef5a` | Pod `1/1 Ready`，agent 读取 Pod、日志、事件后 APPROVE；端到端 362 秒，花费 $0.151225（包含整个 M5 实现的代码评审） |
-| 关闭清理 | 故障 PR 关闭后，controller 自动删除 namespace；没有手工删除或清理 finalizer |
-| 镜像 | CI 发布完整 head SHA 的 amd64/arm64 镜像；使用空 Docker 配置验证匿名获取，无需给预览应用提供镜像仓库凭据 |
-| 只读权限 | 本 namespace 的 Pod 可读；Secret、其他 namespace 的 Pod、创建 Deployment 均被拒绝 |
-| 回归检查 | `make lint`、Go 测试、runner 52 项测试、真实 PostgreSQL 集成测试、controller/preview 竞态检测通过；GitHub CI 通过 |
+| PR / 场景 | 结果 | 耗时 / 花费 |
+| --- | --- | --- |
+| [#10](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10)，head `f296c6f`，错误探针 | agent 通过 kubectl 读取 Pod、Deployment、事件和日志，确认 `/readyz` 返回 HTTP 404；request_changes，GitHub COMMENT | 209s / $0.0155 |
+| [#9](https://github.com/RooobinYe/ai-pr-review-cloud/pull/9)，head `dd2ef5a`，正常对照 | Pod `1/1 Ready`，agent 检查运行时证据后 APPROVE | 362s / $0.1512（含整个实现的代码评审） |
 
-本次通过签名 webhook 重放触发，未验收 GitHub → smee 实时转发。早期两轮分别因部署仍指向旧镜像、Linux stdin 兼容问题而没有拿到运行时证据，不计入通过记录。修复后的上述 run 完成了完整验证。故障 PR 已关闭且未合并；controller 已自动删除对应 namespace，查询返回 NotFound。
+故障 PR 已关闭且未合并，controller 自动删除了测试 namespace。只读账号不能读取 Secret、访问其他 namespace 或创建 Deployment；预览应用不挂载凭据。本次使用签名 webhook 重放，未覆盖 GitHub → smee 实时转发。
 
 ## M6 成本看板与测算报告
 

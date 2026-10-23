@@ -45,12 +45,45 @@ func TestValidateIsolation(t *testing.T) {
 		{"other namespace", Object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": Object{"name": "example", "namespace": "system"}}, false},
 		{"external service", Object{"apiVersion": "v1", "kind": "Service", "metadata": Object{"name": "example"}, "spec": Object{"type": "ExternalName"}}, false},
 		{"safe config", Object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": Object{"name": "example"}}, true},
-		{"sa override", Object{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": Object{"name": "example"}, "spec": Object{"template": Object{"spec": Object{"serviceAccountName": "controller"}}}}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := Validate(tt.obj, "pr-demo-1")
 			if (err == nil) != tt.valid {
 				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeploymentCredentialIsolation(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(Object, Object)
+		valid  bool
+	}{
+		{"plain container", func(_, _ Object) {}, true},
+		{"token mount requested", func(p, _ Object) { p["automountServiceAccountToken"] = true }, true},
+		{"service account", func(p, _ Object) { p["serviceAccountName"] = "controller" }, false},
+		{"secret volume", func(p, _ Object) {
+			p["volumes"] = []any{Object{"name": "secret", "secret": Object{"secretName": "credentials"}}}
+		}, false},
+		{"environment source", func(_, c Object) { c["envFrom"] = []any{Object{"secretRef": Object{"name": "credentials"}}} }, false},
+		{"environment value", func(_, c Object) {
+			c["env"] = []any{Object{"name": "TOKEN", "valueFrom": Object{"secretKeyRef": Object{"name": "credentials", "key": "token"}}}}
+		}, false},
+		{"probe destination", func(_, c Object) { c["readinessProbe"] = Object{"httpGet": Object{"host": "127.0.0.1", "port": 10250}} }, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			container := Object{"name": "app", "image": "example:head"}
+			pod := Object{"containers": []any{container}}
+			deployment := Object{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": Object{"name": "example"}, "spec": Object{"template": Object{"spec": pod}}}
+			tt.change(pod, container)
+			err := Validate(deployment, "pr-demo-1")
+			if (err == nil) != tt.valid {
+				t.Fatalf("Validate() = %v, valid=%v", err, tt.valid)
+			}
+			if err == nil && (pod["automountServiceAccountToken"] != false || mapping(deployment, "metadata")["namespace"] != "pr-demo-1") {
+				t.Fatal("accepted deployment lacks namespace or token isolation")
 			}
 		})
 	}

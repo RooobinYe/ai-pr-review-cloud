@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +39,11 @@ func previewBundle(t *testing.T) preview.Bundle {
 
 func TestPreviewReadyAndTimeoutKeepReadOnlyEvidenceAccess(t *testing.T) {
 	for _, ready := range []bool{true, false} {
-		t.Run(fmt.Sprint(ready), func(t *testing.T) {
+		name := "timeout"
+		if ready {
+			name = "ready"
+		}
+		t.Run(name, func(t *testing.T) {
 			h := newHarness()
 			h.reconcile()
 			var resources []string
@@ -52,9 +58,19 @@ func TestPreviewReadyAndTimeoutKeepReadOnlyEvidenceAccess(t *testing.T) {
 						t.Error(err)
 					}
 					if strings.HasSuffix(r.URL.Path, "/roles/preview-reader") {
+						var rules []struct{ APIGroups, Resources, Verbs []string }
 						data, _ := json.Marshal(object["rules"])
-						if strings.Contains(string(data), "secrets") || strings.Contains(string(data), "create") {
-							t.Error("reader can access credentials or write")
+						if err := json.Unmarshal(data, &rules); err != nil {
+							t.Error(err)
+							http.Error(w, "invalid role", 500)
+							return
+						}
+						want := []struct{ APIGroups, Resources, Verbs []string }{
+							{[]string{""}, []string{"pods", "pods/log", "events"}, []string{"get", "list", "watch"}},
+							{[]string{"apps"}, []string{"deployments", "replicasets"}, []string{"get", "list", "watch"}},
+						}
+						if !reflect.DeepEqual(rules, want) {
+							t.Errorf("reader rules = %+v, want %+v", rules, want)
 						}
 					}
 					fmt.Fprint(w, `{}`)
@@ -89,7 +105,17 @@ func TestPreviewReadyAndTimeoutKeepReadOnlyEvidenceAccess(t *testing.T) {
 			if (reply.Status == "ready") != ready || reply.Namespace != "pr-o-r-7" || !strings.Contains(reply.Kubeconfig, "test-only-reader") {
 				t.Fatal("incorrect preview outcome")
 			}
-			if len(resources) != 6 || h.state().State != run.StateRunning {
+			wantResources := []string{
+				"/api/v1/namespaces/pr-o-r-7/resourcequotas/preview",
+				"/api/v1/namespaces/pr-o-r-7/serviceaccounts/preview-reader",
+				"/apis/networking.k8s.io/v1/namespaces/pr-o-r-7/networkpolicies/preview-isolation",
+				"/apis/rbac.authorization.k8s.io/v1/namespaces/pr-o-r-7/roles/preview-reader",
+				"/apis/rbac.authorization.k8s.io/v1/namespaces/pr-o-r-7/rolebindings/preview-reader",
+				"/apis/apps/v1/namespaces/pr-o-r-7/deployments/preview-demo",
+			}
+			sort.Strings(resources)
+			sort.Strings(wantResources)
+			if !reflect.DeepEqual(resources, wantResources) || h.state().State != run.StateRunning {
 				t.Fatalf("resources %v; state %s", resources, h.state().State)
 			}
 		})
@@ -99,7 +125,7 @@ func TestPreviewReadyAndTimeoutKeepReadOnlyEvidenceAccess(t *testing.T) {
 func TestPreviewRejectsUnauthenticatedDisabledAndStaleRequests(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
-	body, _ := json.Marshal(previewBundle(t))
+	body := []byte(`{"files":{".ai-pr-review.yaml":"preview:\n  enabled: true\n  helm:\n    chart: chart\n"}}`)
 	if got := h.call("POST", "/runs/"+runID+"/preview", "wrong", body).Code; got != 401 {
 		t.Fatal(got)
 	}
@@ -136,7 +162,15 @@ func TestCleanupClosedAndOrphanPreviews(t *testing.T) {
 		name, state    string
 		age            time.Duration
 		active, remove bool
-	}{{"open", "open", time.Hour, false, false}, {"closed", "closed", time.Hour, false, true}, {"orphan", "open", 25 * time.Hour, false, true}, {"active", "open", 25 * time.Hour, true, false}} {
+		fresh, foreign bool
+	}{
+		{name: "open", state: "open", age: time.Hour},
+		{name: "closed", state: "closed", age: time.Hour, remove: true},
+		{name: "orphan", state: "open", age: 25 * time.Hour, remove: true},
+		{name: "active", state: "open", age: 25 * time.Hour, active: true},
+		{name: "replaced after list", state: "open", age: 25 * time.Hour, fresh: true},
+		{name: "ownership changed", state: "closed", age: time.Hour, foreign: true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness()
 			h.gh.closed = tt.state == "closed"
@@ -149,7 +183,21 @@ func TestCleanupClosedAndOrphanPreviews(t *testing.T) {
 					deleted = true
 					return
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{"metadata": map[string]any{"name": "pr-o-r-7", "annotations": map[string]string{"repo": "o/r", "pr": "7", "installation": "42", "created": h.now().Add(-tt.age).Format(time.RFC3339)}}}}})
+				age, owner := tt.age, "reviews"
+				if r.URL.Path == "/api/v1/namespaces/pr-o-r-7" {
+					if tt.fresh {
+						age = time.Minute
+					}
+					if tt.foreign {
+						owner = "other-controller"
+					}
+				}
+				object := map[string]any{"metadata": map[string]any{"name": "pr-o-r-7", "labels": map[string]string{previewLabel: owner}, "annotations": map[string]string{"repo": "o/r", "pr": "7", "installation": "42", "created": h.now().Add(-age).Format(time.RFC3339)}}}
+				if r.URL.Path == "/api/v1/namespaces" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{object}})
+				} else {
+					_ = json.NewEncoder(w).Encode(object)
+				}
 			}))
 			defer server.Close()
 			h.c.cfg.Preview = &PreviewConfig{Kube: &kube.Client{Host: server.URL, Namespace: "reviews", HTTP: server.Client()}}
