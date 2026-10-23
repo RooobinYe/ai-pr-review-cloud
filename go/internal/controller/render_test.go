@@ -5,10 +5,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
 
@@ -43,12 +45,61 @@ func TestBuildFoldedReviewOrdersBySeverity(t *testing.T) {
 		review.Comment{Path: "b.go", Line: 2, Severity: review.SeverityLow, Confidence: review.ConfidenceLow, Body: "low"},
 		review.Comment{Path: "a.go", Line: 9, Severity: review.SeverityCritical, Confidence: review.ConfidenceHigh, Body: "crit"},
 	)
-	body := BuildFoldedReview(res, "COMMENT").Body
+	body := BuildFoldedReview(runID, res, "COMMENT").Body
 	if strings.Index(body, "`a.go:9`") > strings.Index(body, "`b.go:2`") {
 		t.Errorf("critical comment not first:\n%s", body)
 	}
-	if !strings.HasSuffix(body, "`deepseek/deepseek-flash` · 2222222</sub>") {
-		t.Errorf("missing footer:\n%s", body)
+	if !strings.HasSuffix(body, "`deepseek/deepseek-flash` · 2222222</sub>\n<!-- ai-pr-review run="+runID+" -->") {
+		t.Errorf("missing footer or vote marker:\n%s", body)
+	}
+}
+
+func TestFindVote(t *testing.T) {
+	mine := BuildReview(runID, result(review.VerdictApprove), "APPROVE").Body
+	other := BuildReview("0b4c1f6e-0000-4000-8000-000000000002", result(review.VerdictApprove), "APPROVE").Body
+	review := func(id int64, login, state, body string) githubapp.Review {
+		r := githubapp.Review{ID: id, State: state, Body: body}
+		r.User.Login = login
+		return r
+	}
+	tests := []struct {
+		name    string
+		reviews []githubapp.Review
+		want    Vote
+		found   bool
+	}{
+		{"none", nil, Vote{}, false},
+		{"another run's vote", []githubapp.Review{review(1, bot, "APPROVED", other)}, Vote{}, false},
+		{"someone quoting the marker", []githubapp.Review{review(1, "mallory", "APPROVED", mine)}, Vote{}, false},
+		{"approval", []githubapp.Review{review(1, bot, "APPROVED", other), review(2, bot, "APPROVED", mine)}, Vote{ID: 2, Event: "APPROVE"}, true},
+		{"comment", []githubapp.Review{review(3, bot, "COMMENTED", mine)}, Vote{ID: 3, Event: "COMMENT"}, true},
+		{"dismissed approval no longer counts", []githubapp.Review{review(4, bot, "DISMISSED", mine)}, Vote{ID: 4, Event: "COMMENT"}, true},
+	}
+	for _, tt := range tests {
+		if got, found := FindVote(tt.reviews, bot, runID); got != tt.want || found != tt.found {
+			t.Errorf("%s: FindVote = %+v, %v; want %+v, %v", tt.name, got, found, tt.want, tt.found)
+		}
+	}
+}
+
+func TestRedeliveries(t *testing.T) {
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	at := func(id int64, guid string, status int, ago time.Duration) githubapp.Delivery {
+		return githubapp.Delivery{ID: id, GUID: guid, StatusCode: status, DeliveredAt: now.Add(-ago)}
+	}
+	ds := []githubapp.Delivery{
+		at(1, "ok", 202, time.Minute),
+		at(2, "failed", 503, time.Minute),
+		at(3, "retried-ok", 202, time.Minute), at(4, "retried-ok", 0, time.Hour),
+		at(5, "retrying", 502, 2*time.Minute), at(6, "retrying", 0, time.Hour), // newest attempt is 5
+		at(7, "ignored", 204, time.Minute), // an event the gateway does not act on still succeeded
+		at(8, "ancient", 500, 25*time.Hour),
+	}
+	for i := range maxDeliveryAttempts {
+		ds = append(ds, at(int64(100+i), "exhausted", 500, time.Duration(i)*time.Minute))
+	}
+	if got := Redeliveries(ds, now); !slices.Equal(got, []int64{2, 5}) {
+		t.Errorf("Redeliveries = %v, want [2 5]", got)
 	}
 }
 
@@ -56,11 +107,14 @@ func TestTruncateKeepsUTF8(t *testing.T) {
 	if got := truncate("评审结论", 4); got != "评…" {
 		t.Errorf("truncate = %q", got)
 	}
+	if got := truncateFront("评审结论", 4); got != "…论" {
+		t.Errorf("truncateFront = %q", got)
+	}
 }
 
 func TestBuildJob(t *testing.T) {
 	cfg := JobConfig{
-		FetchImage: "f:1", RunnerImage: "r:1", ControllerURL: "http://ctl.ns.svc/",
+		FetchImage: "f:1", RunnerImage: "r:1", ControllerURL: "http://ctl.ns.svc/", BotLogin: bot,
 		LLMEnv: map[string]string{"LLM_MODEL": "m", "LLM_BASE_URL": ""}, ActiveDeadlineSeconds: 900,
 	}
 	r := store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, JobName: JobName(runID, 1)}
@@ -74,7 +128,7 @@ func TestBuildJob(t *testing.T) {
 	if ref := fetchEnv["GITHUB_TOKEN"].ValueFrom.SecretKeyRef; ref.Name != runSecretName(r.JobName) {
 		t.Errorf("fetch token ref %+v", ref)
 	}
-	if fetchEnv["PR_NUMBER"].Value != "7" || fetchEnv["HEAD_SHA"].Value != headSHA {
+	if fetchEnv["PR_NUMBER"].Value != "7" || fetchEnv["HEAD_SHA"].Value != headSHA || fetchEnv["BOT_LOGIN"].Value != bot {
 		t.Errorf("fetch env %+v", fetchEnv)
 	}
 	if got := fetchEnv["HTTPS_PROXY"].Value; got != "http://"+runID+":$(PROXY_TOKEN)@ctl.ns.svc:80" {
@@ -118,6 +172,13 @@ func TestBuildJob(t *testing.T) {
 	if _, ok := runnerEnv["LLM_BASE_URL"]; ok {
 		t.Error("empty LLM_BASE_URL passed through")
 	}
+	if _, ok := runnerEnv["REVIEW_BUDGET_USD"]; ok {
+		t.Error("a run without a budget passed REVIEW_BUDGET_USD")
+	}
+	r.BudgetUSD = 0.5
+	if got := envMap(BuildJob(cfg, r).Spec.Template.Spec.Containers[0].Env)["REVIEW_BUDGET_USD"].Value; got != "0.5" {
+		t.Errorf("REVIEW_BUDGET_USD = %q, want 0.5", got)
+	}
 	if len(JobName(strings.Repeat("f", 36), 99)) > 52 {
 		t.Error("job name leaves no room for the pod suffix within 63 characters")
 	}
@@ -152,30 +213,46 @@ func TestPodFailure(t *testing.T) {
 		return kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: code, Reason: reason, Message: msg}}
 	}
 	tests := []struct {
-		name string
-		pod  kube.Pod
-		want string
+		name  string
+		pod   kube.Pod
+		want  string
+		final bool
 	}{
 		{"fetch failed", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{{Name: "fetch", State: terminated(1, "Error", "boom")}}}},
-			"fetch exited with code 1: boom"},
+			"fetch exited with code 1: boom", false},
+		{"head moved", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{{Name: "fetch", State: terminated(run.ExitFinal, "Error", "PR head moved")}}}},
+			"fetch exited with code 3: PR head moved", true},
 		{"runner OOM", kube.Pod{Status: kube.PodStatus{
 			InitContainerStatuses: []kube.ContainerStatus{{Name: "fetch", State: terminated(0, "Completed", "")}},
 			ContainerStatuses:     []kube.ContainerStatus{{Name: "runner", State: terminated(137, "OOMKilled", "")}},
-		}}, "runner exited with code 137: OOMKilled"},
+		}}, "runner exited with code 137: OOMKilled", false},
 		{"image missing", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
 			{Name: "fetch", State: kube.ContainerState{Waiting: &kube.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "not found"}}},
-		}}}, "fetch is stuck: ImagePullBackOff not found"},
+		}}}, "fetch is stuck: ImagePullBackOff not found", false},
 		{"budget spent", kube.Pod{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
 			{Name: "runner", State: terminated(1, "Error", "budget_exceeded: spent $0.51 of $0.50")},
-		}}}, "budget_exceeded: spent $0.51 of $0.50"},
+		}}}, "budget_exceeded: spent $0.51 of $0.50", true},
 		{"healthy", kube.Pod{Status: kube.PodStatus{InitContainerStatuses: []kube.ContainerStatus{
 			{Name: "fetch", State: kube.ContainerState{Waiting: &kube.ContainerStateWaiting{Reason: "PodInitializing"}}},
-		}}}, ""},
+		}}}, "", false},
 	}
 	for _, tt := range tests {
-		if got := PodFailure(tt.pod); got != tt.want {
-			t.Errorf("%s: PodFailure = %q, want %q", tt.name, got, tt.want)
+		if got, final := PodFailure(tt.pod); got != tt.want || final != tt.final {
+			t.Errorf("%s: PodFailure = %q, %v; want %q, %v", tt.name, got, final, tt.want, tt.final)
 		}
+	}
+}
+
+// A runner's message is the tail of its log; the fatal error is the last line
+// and must survive truncation.
+func TestPodFailureKeepsLastLine(t *testing.T) {
+	log := strings.Repeat("runner:   read a.go\n", 200) + "runner: model API error: 402 Insufficient Balance\n"
+	pod := kube.Pod{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
+		{Name: "runner", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: log}}},
+	}}}
+	got, _ := PodFailure(pod)
+	if !strings.HasPrefix(got, "runner exited with code 1: …") || !strings.HasSuffix(got, "runner: model API error: 402 Insufficient Balance") || len(got) > 1600 {
+		t.Errorf("PodFailure = %q", got)
 	}
 }
 

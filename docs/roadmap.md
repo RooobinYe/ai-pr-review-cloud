@@ -10,10 +10,10 @@
 | [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v3 JSON，质量不低于 v1 | ✅ 完成 |
 | [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论；结论为 approve 时 AI 投出的 APPROVE 计入必需审批数 | ✅ 完成 |
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
-| [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | 未开始 |
+| [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
-| [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | 未开始 |
+| [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | ✅ 完成 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
 
 ## 依赖关系
@@ -128,18 +128,42 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 ## M3 可靠性
 
+M2 与 M3/M6 整合验收（2026-10-24）：重试 key 的预算扣除已上报的跨轮花费，预算耗尽不签发新 key；重试、超时及 superseded 在删除旧 Job/Secret 前吊销 key。对应控制器回归测试、真实 PostgreSQL 用量汇总测试以及 runner 的预算错误/恢复测试通过。未上报的崩溃窗口花费不在扣减数内，限制见架构 §7.3。
+
 目标：任何组件在任何时刻崩溃，评审都能继续且不产生重复的 GitHub 副作用。
 
-- [ ] runner 每轮结束上传 session 快照（`PUT /runs/{id}/session`）和用量。
-- [ ] Pod 失败时 controller 放回 `queued`、`attempt + 1`；新 Pod 用 `SessionManager.open` 恢复。
-- [ ] 不丢 webhook：gateway 的就绪检查确认数据库表已就位；controller 定时列出 App 的近期 delivery，重投失败的那些（gateway 按 delivery ID 去重）。
-- [ ] 同一 PR 的新提交评审时，把 bot 之前的逐行评论（及是否已解决）写进 `pr.json`，提示模型不要重复已提过的问题，只说新问题和仍未修复的问题。
-- [ ] 同一 PR 推送新提交时，旧 run 标记为 `superseded` 并删除 Job。
-- [ ] Job 超时（`activeDeadlineSeconds`）与总重试上限，失败原因写到 Check Run。
-- [ ] controller 重启后从数据库恢复所有进行中的 run。
-- [ ] 针对上述每种故障的 E2E 测试。
+- [x] runner 每轮结束上传 session 快照（`PUT /runs/{id}/session`）和用量（`PUT /runs/{id}/usage`，含缓存读写 token）。
+- [x] Pod 失败时 controller 放回 `queued`、`attempt + 1`；新 Pod 取回快照，用 `SessionManager.inMemory(cwd, undefined, entries)` 恢复（不落盘，效果同 `open`）。快照里已有被接受的 `submit_review` 时直接上报，不再调用模型。
+- [x] 不丢 webhook：gateway 的就绪检查确认最新迁移已执行；controller 每 5 分钟列出 App 的近期 delivery，重投失败的那些（gateway 按 delivery ID 去重）。
+- [x] 同一 PR 的新提交评审时，把 bot 之前的逐行评论（及是否已解决、是否过时）写进 `pr.json`，提示模型不要重复已提过的问题，只说新问题和仍未修复的问题。
+- [x] 同一 PR 推送新提交时，旧 run 标记为 `superseded`，删除 Job，Check Run 完成为 `cancelled`。
+- [x] Job 超时（`activeDeadlineSeconds`）与总重试上限（`runs.maxAttempts`，默认 3），失败原因写到 Check Run；确定性失败用退出码 3 标记，不重试；从领取起超过时限的尝试也会失败，覆盖 Job 建不出来的情况（M1 遗留）。
+- [x] controller 重启后从数据库恢复所有进行中的 run；写 GitHub 之前先查是否已写过（Check Run 按 `external_id`，投票按正文里的 run 标记），补上"写成功、回填前崩溃"的窗口（M1 遗留）。
+- [x] 针对上述每种故障的测试：controller 用内存假实现逐个模拟（`go/internal/controller/recovery_test.go`），runner 用 pi 的 faux 模型验证续跑（`runner/src/review.test.ts`），store 在 PostgreSQL 上验证；丢 Pod 的场景另在 Kind 上实测（见下）。
 
 验收：评审进行中 `kubectl delete pod`，run 自动恢复完成，PR 上没有重复评论。
+
+第一次验收（2026-10-23，本仓库 [PR #3](https://github.com/RooobinYe/ai-pr-review-cloud/pull/3)，`deepseek/deepseek-flash`，thinking high）：
+
+| 时间（UTC） | 事件 |
+| --- | --- |
+| 14:19:36 | 第 1 次尝试的 Job 创建，Check Run 进入 in_progress |
+| 14:20:16 | 快照已到第 9 轮（249 KB，9 行用量），`kubectl delete pod` |
+| 14:20:49 | Job 变为 Failed（`BackoffLimitExceeded`）；宽限期内 runner 又上传到第 13 轮 |
+| 14:20:53 | controller 判定可重试，放回 `queued`，Check Run 显示"第 2 次尝试" |
+| 14:20:54 | 第 2 次尝试领取，新 Job、新 Secret、新 token |
+| 14:21:02 | 新 Pod 取回第 13 轮的快照（38 个 entry），带着前 13 轮的上下文继续探索 |
+| 14:22:33 | 模型账户先后返回 429（并发超限）和 402（余额不足），run 以 `failed` 结束 |
+
+恢复链路按设计工作：两次尝试共用同一个 Check Run，用量按轮次累计到 28 行、$0.0526，PR 上没有出现第二个 Check Run。评审没能走完是因为模型账户余额耗尽，所以"恢复后完成并且没有重复评论"这一条还要在充值后重新验收。
+
+这次失败暴露了一个问题：请求失败后的那一轮被当成"模型没调用 `submit_review`"，用掉两次提醒后以退出码 3 结束，不会再重试。已改为：最后一次模型回复是错误时抛出 `ModelRequestError`，以退出码 1 退出，由 controller 重试。
+
+实测发现：Node 作为 PID 1 不处理 SIGTERM，被删的 Pod 会跑满 30 秒宽限期（期间快照从第 9 轮推进到第 13 轮）才被杀掉。对恢复无害，但被 `superseded` 的 run 会白花 30 秒的 token，所以 runner 改为收到 SIGTERM 立即以 143 退出（可重试）。
+
+补充验收（2026-10-23 UTC，2026-10-24 核对数据库与 GitHub）：充值后的 run `9bfd1d86-4b08-4ed7-bf75-23723874a7c6` 评审 [PR #3](https://github.com/RooobinYe/ai-pr-review-cloud/pull/3)，head `86c2c09`。Claude session 记录 15:12:28 在第 5 轮删除 `review-9bfd1d86-4b08-4ed7-bf75-23723874a7c6-1-dgx7t`；数据库记录因 `BackoffLimitExceeded` 重试，最终 `attempt=2`、`state=done`，于 15:15:50 完成。最终快照为第 25 轮，用量 25 行、$0.062059704。GitHub 上该 run 只有一个 Check Run（`120491023505`，neutral），一条带 run 标记的 Review（`5630382577`，COMMENT）；数据库的创建/完成 Check 操作指向同一 ID。恢复后完整评审且不重复写入的验收通过。
+
+验收评审指出的两项有效问题已补齐：发布结果时也找回尚未回填 ID 的 Check Run，避免结果抢先到达后留下永久 `in_progress`；每轮先上报用量，再独立上传快照，避免快照拒绝时漏记已花费用量。与 M6 合并保留成本指标、预算提醒和统计输出；迁移覆盖新库、M3-only、M6-only 升级路径，并检查全部迁移后才就绪。相应恢复、路径规范化、用量上传和数据库升级测试均已加入。
 
 ## M4 仓库配置与可选合并模式
 
@@ -169,12 +193,32 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：回答赛题考核点 5（成本与性能）。
 
-- [ ] controller 暴露 `/metrics`（run 数、各阶段耗时、队列深度、token、金额）。
-- [ ] 部署 Prometheus 与 Grafana，提交看板 JSON。
-- [ ] runner 在花费达到预算 80% 时追加提示，要求尽快提交结论。
-- [ ] 按架构设计 §7.2 的方法测算 20 个 PR，输出成本与延迟报告和优化对比。
+- [x] controller 暴露 `/metrics`（run 数、各阶段耗时、队列深度、token、金额）：抓取时由数据库计算；runner 每轮上报用量（`PUT /runs/{id}/usage`），各阶段时间戳记在 `review_run`（架构 §7.1）。
+- [x] 部署 Prometheus 与 Grafana，提交看板 JSON：chart 的 `monitoring.dev`，看板在 `deploy/helm/ai-pr-review-cloud/dashboards/`。
+- [x] runner 在花费达到预算 80% 时追加提示，要求尽快提交结论（架构 §7.3）。
+- [x] 按架构设计 §7.2 的方法测算 20 个 PR，输出成本与延迟报告和优化对比：见 [cost-report.md](cost-report.md)（基线 20 × 3 次，软预算、低思考强度两组对照各 20 次，只用 flash）。
+- [x] 在 Kind 上跑真实评审，确认看板各面板有数据并截图：本 PR 的两个提交各跑一次完整闭环。
 
 验收：Grafana 看板能展示吞吐、各阶段耗时分布、每 PR 成本分布；测算报告入库到 `docs/`。
+
+验收记录（2026-10-23，`deepseek/deepseek-flash`，thinking high）：
+
+解决了什么：
+
+- 成本可见：每次评审的 token、金额、各阶段耗时进入数据库，`/metrics` 由数据库计算（controller 重启不丢计数），Grafana 看板随 `make deploy` 一起装好。
+- 成本可量化：一次评审 P50 $0.029、P95 $0.068，端到端 P50 106 秒；每 100 个 PR 每月约 $9（每 PR 评审 3 次）。模型评审占端到端时间的 95% 以上，成本主要来自输出 token，前缀缓存已把输入成本压到原来的约 1/4 到 1/7。
+- 成本可控：花费达到预算 80% 时提示模型提交。预算 $0.02 时均值降 26%、P95 降 46%，结论与基线 20/20 一致。
+- 失败可诊断：测算途中 DeepSeek 余额耗尽（402），暴露出两个问题，都已修复。一是 runner 把模型服务拒绝调用误报成"模型没有提交"，现在直接以 `model API error` 失败。二是 controller 截断容器日志时丢掉了最后一行（致命错误），现在保留日志末尾，失败原因按最后一行归类，并新增 `model_api`。
+- 根据 AI 评审意见修复：测算续跑时被模型服务拒绝的运行会重跑；stats 写入失败不再掩盖真实错误。
+
+没解决的：
+
+- 软预算按轮检查，管不住单轮的花费：go-chi/chi#1218 在一轮里花到了 $0.067，最终 $0.071。硬上限依赖 M2 的 LiteLLM `max_budget`。
+- chart 默认的 `runs.budgetUSD` 是 $0.5，提示永远不会触发。测算支持降到 $0.05 左右，但 M2 会用同一个值作为硬上限，留到 M2 一起定。
+- 指标在每次抓取时扫描所有 done run，run 多了以后要改为只看一个时间窗口，或在状态转换时累加。
+- 集群内只跑了 2 次完整评审，看板上的分位数只能看量级；更大样本留到 M7 演示时积累。
+- 没有对比更大的模型（按要求只用 flash），也没有做"小模型探索、大模型下结论"（需要改评审流程）。
+- 金额按 pi 模型目录的单价计算，还没与账单或 LiteLLM 的花费交叉核对（M2）。
 
 ## M7 参赛交付
 

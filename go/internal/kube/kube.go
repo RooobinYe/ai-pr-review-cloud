@@ -143,6 +143,12 @@ func (c *Client) GetJob(ctx context.Context, name string) (Job, error) {
 	return out, err
 }
 
+// DeleteJob deletes a Job together with its Pods; the Job's Secret goes with
+// it through its owner reference.
+func (c *Client) DeleteJob(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, c.path("apis/batch/v1", "jobs", name)+"?propagationPolicy=Background", nil, nil)
+}
+
 func (c *Client) CreateSecret(ctx context.Context, s Secret) error {
 	s.APIVersion, s.Kind = "v1", "Secret"
 	return c.do(ctx, http.MethodPost, c.path("api/v1", "secrets", ""), s, nil)

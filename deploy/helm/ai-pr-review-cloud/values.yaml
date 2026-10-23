@@ -59,11 +59,13 @@ runs:
   maxRunning: 4
   # Language of review comments.
   language: English
-  # Hard limit on one runner Job (activeDeadlineSeconds).
+  # Hard limit on one runner Job (activeDeadlineSeconds). A run that hits it fails.
   deadlineSeconds: 1800
   # host:port pairs fetch may reach through the controller's egress proxy.
   # The runner network policy blocks every other destination outside the cluster.
   fetchEgressHosts: [github.com:443, api.github.com:443]
+
+  maxAttempts: 3
 
 networkPolicy:
   # Confine runner Pods to DNS, LiteLLM and the controller. Needs a CNI that
@@ -73,6 +75,12 @@ networkPolicy:
   dns:
     namespace: kube-system
     podLabels: { k8s-app: kube-dns }
+
+webhooks:
+  # How often the controller redelivers webhooks the gateway failed to
+  # accept; 0 disables it. Deliveries through smee.io look successful to
+  # GitHub, so this only helps when GitHub reaches the gateway directly.
+  redeliverInterval: 5m
 
 database:
   # Existing Secret with key `DATABASE_URL`. Ignored when postgres.dev.enabled is true.
@@ -84,6 +92,27 @@ postgres:
     enabled: true
     image: postgres:17
     password: dev-only-password
+
+monitoring:
+  dev:
+    # Single-replica, non-persistent Prometheus and Grafana with the cost
+    # dashboard (dashboards/review-cost.json), for local Kind clusters only.
+    # Elsewhere, scrape the controller Service's /metrics and import the JSON.
+    enabled: true
+    scrapeInterval: 15s
+    prometheus:
+      image: prom/prometheus:v3.5.0
+      retention: 7d
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 512Mi }
+    grafana:
+      image: grafana/grafana:12.1.0
+      # Anonymous viewers can read the dashboard; editing needs admin.
+      adminPassword: dev-only-password
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 256Mi }
 
 gateway:
   replicas: 2

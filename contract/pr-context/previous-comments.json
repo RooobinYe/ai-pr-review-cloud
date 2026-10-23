@@ -1,0 +1,16 @@
+[
+  {
+    "path": "src/server.go",
+    "line": 12,
+    "body": "**high** · confidence high\n\n`mux.Handle(\"/healthz\", ok)` is registered without auth.",
+    "resolved": false,
+    "outdated": false
+  },
+  {
+    "path": "pkg/old_name.go",
+    "line": 3,
+    "body": "**medium** · confidence medium\n\nThe package rename breaks importers.",
+    "resolved": true,
+    "outdated": true
+  }
+]

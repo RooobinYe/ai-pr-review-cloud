@@ -30,20 +30,50 @@ func footer(res review.Result) string {
 	return fmt.Sprintf("\n\n---\n<sub>AI Review · `%s` · %s</sub>", res.Model, res.PR.HeadSHA[:7])
 }
 
+// voteMarker tags a review with the run that cast it, invisibly, so a
+// controller that voted and stopped before recording the vote finds it
+// instead of voting twice.
+func voteMarker(runID string) string {
+	return fmt.Sprintf("\n<!-- ai-pr-review run=%s -->", runID)
+}
+
+// Vote is a review the bot already submitted for a run.
+type Vote struct {
+	ID int64
+	// Event is the vote it counts as: APPROVE while the approval stands,
+	// COMMENT otherwise (including a dismissed approval).
+	Event string
+}
+
+// FindVote returns the bot's review carrying runID's marker, if any.
+func FindVote(reviews []githubapp.Review, botLogin, runID string) (Vote, bool) {
+	marker := strings.TrimSpace(voteMarker(runID))
+	for _, r := range reviews {
+		if r.User.Login == botLogin && strings.Contains(r.Body, marker) {
+			event := "COMMENT"
+			if r.State == "APPROVED" {
+				event = "APPROVE"
+			}
+			return Vote{ID: r.ID, Event: event}, true
+		}
+	}
+	return Vote{}, false
+}
+
 func commentBody(c review.Comment) string {
 	return fmt.Sprintf("**%s** · confidence %s\n\n%s", c.Severity, c.Confidence, strings.TrimSpace(c.Body))
 }
 
 // BuildReview turns a result into one PR review: the body plus inline comments,
 // pinned to the reviewed commit so later pushes cannot shift the anchors.
-func BuildReview(res review.Result, event string) githubapp.NewReview {
+func BuildReview(runID string, res review.Result, event string) githubapp.NewReview {
 	comments := make([]githubapp.ReviewComment, len(res.Comments))
 	for i, c := range res.Comments {
 		comments[i] = githubapp.ReviewComment{Path: c.Path, Line: c.Line, Side: "RIGHT", Body: commentBody(c)}
 	}
 	return githubapp.NewReview{
 		CommitID: res.PR.HeadSHA,
-		Body:     truncate(strings.TrimSpace(res.Body), maxBodyBytes) + footer(res),
+		Body:     truncate(strings.TrimSpace(res.Body), maxBodyBytes) + footer(res) + voteMarker(runID),
 		Event:    event,
 		Comments: comments,
 	}
@@ -51,7 +81,7 @@ func BuildReview(res review.Result, event string) githubapp.NewReview {
 
 // BuildFoldedReview moves inline comments into the body. It is the fallback
 // when GitHub rejects an inline anchor.
-func BuildFoldedReview(res review.Result, event string) githubapp.NewReview {
+func BuildFoldedReview(runID string, res review.Result, event string) githubapp.NewReview {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(res.Body))
 	if len(res.Comments) > 0 {
@@ -60,7 +90,7 @@ func BuildFoldedReview(res review.Result, event string) githubapp.NewReview {
 			fmt.Fprintf(&b, "\n#### `%s:%d`\n\n%s\n", c.Path, c.Line, commentBody(c))
 		}
 	}
-	return githubapp.NewReview{CommitID: res.PR.HeadSHA, Body: truncate(b.String(), maxBodyBytes) + footer(res), Event: event}
+	return githubapp.NewReview{CommitID: res.PR.HeadSHA, Body: truncate(b.String(), maxBodyBytes) + footer(res) + voteMarker(runID), Event: event}
 }
 
 func sortedComments(cs []review.Comment) []review.Comment {
@@ -120,6 +150,28 @@ func FailedCheckRun(reason string) githubapp.CheckRun {
 		Status:     "completed",
 		Conclusion: "failure",
 		Output:     &githubapp.CheckRunOutput{Title: "Review failed", Summary: truncate(reason, maxBodyBytes)},
+	}
+}
+
+// RetryingCheckRun keeps the Check Run in progress while a failed attempt is
+// retried.
+func RetryingCheckRun(reason string, next, maxAttempts int) githubapp.CheckRun {
+	return githubapp.CheckRun{
+		Status: "in_progress",
+		Output: &githubapp.CheckRunOutput{
+			Title:   fmt.Sprintf("Reviewing (attempt %d of %d)", next, maxAttempts),
+			Summary: truncate(fmt.Sprintf("The previous attempt failed and is resuming from where it stopped:\n\n%s", reason), maxBodyBytes),
+		},
+	}
+}
+
+// SupersededCheckRun completes the Check Run of a run whose commit is no
+// longer the PR head; the newer commit has its own run.
+func SupersededCheckRun() githubapp.CheckRun {
+	return githubapp.CheckRun{
+		Status:     "completed",
+		Conclusion: "cancelled",
+		Output:     &githubapp.CheckRunOutput{Title: "Superseded", Summary: "A newer commit was pushed; AI Review reviews that one instead."},
 	}
 }
 

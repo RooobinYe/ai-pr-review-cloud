@@ -31,8 +31,10 @@ spec:
                 secretKeyRef: { name: {{ include "aprc.databaseSecret" . }}, key: DATABASE_URL }
             - name: DEFAULT_BUDGET_USD
               value: {{ .Values.runs.budgetUSD | quote }}
+          # Unready until the controller has migrated the schema, so GitHub's
+          # one delivery attempt never lands on a gateway that cannot record it.
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
           livenessProbe:
             httpGet: { path: /healthz, port: http }
           resources: {{- toYaml .Values.gateway.resources | nindent 12 }}

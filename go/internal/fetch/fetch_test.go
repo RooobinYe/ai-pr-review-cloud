@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 )
@@ -108,6 +109,11 @@ func TestRun(t *testing.T) {
 			fmt.Fprintf(w, `{"number":3,"title":"t","user":{"login":"me"},"base":{"ref":"main","sha":%q},"head":{"ref":"f","sha":%q}}`, base, head)
 		case "/repos/o/r/pulls/3/files":
 			_ = json.NewEncoder(w).Encode([]githubapp.PullFile{{Filename: "a.txt", Status: "modified", Additions: 1, Deletions: 1, Patch: &patch}})
+		case "/graphql":
+			fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+				{"isResolved":false,"isOutdated":true,"path":"a.txt","line":null,"originalLine":1,"comments":{"nodes":[{"author":{"login":"ai-bot"},"body":"**high** · still wrong"}]}},
+				{"isResolved":false,"isOutdated":false,"path":"a.txt","line":1,"originalLine":1,"comments":{"nodes":[{"author":{"login":"alice"},"body":"human"}]}}
+			]}}}}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -115,7 +121,7 @@ func TestRun(t *testing.T) {
 	defer srv.Close()
 	gh := &githubapp.Client{BaseURL: srv.URL, Token: githubapp.StaticToken("ro-token")}
 	ws := t.TempDir()
-	opts := Options{Repo: "o/r", PRNumber: 3, HeadSHA: head, Workspace: ws, GitURL: "file://" + root, Token: "ro-token"}
+	opts := Options{Repo: "o/r", PRNumber: 3, HeadSHA: head, Workspace: ws, GitURL: "file://" + root, Token: "ro-token", BotLogin: "ai-bot[bot]"}
 	if err := Run(context.Background(), gh, opts); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +136,9 @@ func TestRun(t *testing.T) {
 	}
 	if pr.HeadSHA != head || pr.Author != "me" || !strings.Contains(pr.Diff, "+++ b/a.txt\n@@ -1 +1 @@") {
 		t.Errorf("pr.json = %+v", pr)
+	}
+	if want := []PreviousComment{{Path: "a.txt", Line: 1, Body: "**high** · still wrong", Outdated: true}}; !reflect.DeepEqual(pr.PreviousComments, want) {
+		t.Errorf("previous comments %+v, want only the bot's %+v", pr.PreviousComments, want)
 	}
 	repo := filepath.Join(ws, "repo")
 	if got := git(t, repo, "rev-parse", "HEAD"); got != head {
@@ -146,5 +155,46 @@ func TestRun(t *testing.T) {
 	var moved *HeadMovedError
 	if err := Run(context.Background(), gh, opts); !errors.As(err, &moved) || moved.Got != head {
 		t.Errorf("stale head: err %v, want HeadMovedError", err)
+	}
+}
+
+func TestPreviousCommentsMatchContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(contractDir, "previous-comments.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []PreviousComment
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&want); err != nil {
+		t.Fatal(err)
+	}
+	threads := make([]githubapp.ReviewThread, len(want))
+	for i, c := range want {
+		threads[i] = githubapp.ReviewThread{Path: c.Path, Line: c.Line, Body: c.Body, Resolved: c.Resolved, Outdated: c.Outdated, AuthorLogin: "ai-bot"}
+	}
+	if got := PreviousComments(threads, "ai-bot[bot]"); !reflect.DeepEqual(got, want) {
+		t.Errorf("PreviousComments = %+v, want contract %+v", got, want)
+	}
+}
+
+func TestPreviousComments(t *testing.T) {
+	thread := func(login, body string) githubapp.ReviewThread {
+		return githubapp.ReviewThread{Path: "a.go", Line: 1, AuthorLogin: login, Body: body}
+	}
+	var threads []githubapp.ReviewThread
+	for i := range maxPreviousComments + 2 {
+		threads = append(threads, thread("ai-bot", fmt.Sprint(i)))
+	}
+	threads = append(threads, thread("alice", "human"), thread("ai-bot", strings.Repeat("评", maxPreviousCommentBody)))
+	got := PreviousComments(threads, "ai-bot[bot]")
+	if len(got) != maxPreviousComments || got[0].Body != "3" {
+		t.Fatalf("kept %d comments starting with %q; want the newest %d", len(got), got[0].Body, maxPreviousComments)
+	}
+	if last := got[len(got)-1].Body; len(last) > maxPreviousCommentBody+len("…") || !utf8.ValidString(last) {
+		t.Errorf("long body not truncated to valid UTF-8: %d bytes", len(last))
+	}
+	if PreviousComments(threads, "") != nil {
+		t.Error("comments collected without a bot login")
 	}
 }

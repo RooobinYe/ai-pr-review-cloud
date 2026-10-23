@@ -21,6 +21,7 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/litellm"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/metrics"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
 
@@ -83,6 +84,8 @@ func run(log *slog.Logger) error {
 	if err := migrate(ctx, log, db); err != nil {
 		return err
 	}
+	// Metrics come from the database, so they work without a GitHub App too.
+	mux.Handle("GET /metrics", metrics.Handler(db.Stats, log))
 	ctl, err := newController(ctx, log, db)
 	if err != nil {
 		return err
@@ -91,6 +94,13 @@ func run(log *slog.Logger) error {
 		ctl.Routes(mux)
 		egress.Store(ctl)
 		go ctl.Run(ctx, 5*time.Second)
+		redeliver, err := time.ParseDuration(envOr("REDELIVER_INTERVAL", "5m"))
+		if err != nil {
+			return fmt.Errorf("REDELIVER_INTERVAL: %w", err)
+		}
+		if redeliver > 0 {
+			go ctl.RedeliverEvery(ctx, redeliver)
+		}
 	} else {
 		log.Warn("GITHUB_APP_ID is not set; runs stay queued until a GitHub App is configured")
 	}
@@ -145,6 +155,10 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 	if err != nil {
 		return nil, fmt.Errorf("MAX_RUNNING: %w", err)
 	}
+	maxAttempts, err := strconv.Atoi(envOr("MAX_ATTEMPTS", "3"))
+	if err != nil {
+		return nil, fmt.Errorf("MAX_ATTEMPTS: %w", err)
+	}
 	deadline, err := strconv.ParseInt(envOr("RUNNER_DEADLINE_SECONDS", "1800"), 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("RUNNER_DEADLINE_SECONDS: %w", err)
@@ -159,15 +173,17 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 	}
 
 	keys := &litellm.Client{BaseURL: os.Getenv("LITELLM_URL"), MasterKey: os.Getenv("LITELLM_MASTER_KEY")}
-
+	bot := slug + "[bot]"
 	cfg := controller.Config{
 		MaxRunning:  maxRunning,
-		BotLogin:    slug + "[bot]",
+		MaxAttempts: maxAttempts,
+		BotLogin:    bot,
 		EgressHosts: strings.Split(envOr("FETCH_EGRESS_HOSTS", "github.com:443,api.github.com:443"), ","),
 		Job: controller.JobConfig{
 			FetchImage:            os.Getenv("FETCH_IMAGE"),
 			RunnerImage:           os.Getenv("RUNNER_IMAGE"),
 			ImagePullPolicy:       envOr("IMAGE_PULL_POLICY", "IfNotPresent"),
+			BotLogin:              bot,
 			ControllerURL:         os.Getenv("CONTROLLER_URL"),
 			LLMEnv:                llmEnv,
 			Language:              envOr("REVIEW_LANGUAGE", "English"),
@@ -182,7 +198,7 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 			return nil, fmt.Errorf("%s is required", name)
 		}
 	}
-	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning)
+	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning, "max_attempts", maxAttempts)
 	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, keys, log), nil
 }
 

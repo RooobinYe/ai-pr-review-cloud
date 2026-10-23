@@ -1,0 +1,196 @@
+{
+  "uid": "ai-pr-review-cost",
+  "title": "AI PR Review：吞吐、耗时与成本",
+  "description": "docs/architecture.md §7.1 的指标。统计面板按所选时间范围计算。",
+  "tags": ["ai-pr-review-cloud"],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    { "type": "row", "title": "概览（所选时间范围）", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1, "panels": [] },
+    {
+      "type": "stat", "title": "完成的评审", "id": 2,
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "round(sum(increase(review_runs_total{state=\"done\"}[$__range])))", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "type": "stat", "title": "失败的评审", "id": 3,
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "round(sum(increase(review_runs_total{state=\"failed\"}[$__range])))", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "type": "stat", "title": "模型总花费", "id": 4,
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(increase(review_cost_usd_total[$__range]))", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 3, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "type": "stat", "title": "每次评审成本 P50 / P95", "id": 5,
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "legendFormat": "P50", "expr": "histogram_quantile(0.5, sum by (le) (increase(review_run_cost_usd_bucket[$__range])))", "instant": true },
+        { "refId": "B", "legendFormat": "P95", "expr": "histogram_quantile(0.95, sum by (le) (increase(review_run_cost_usd_bucket[$__range])))", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 3, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "type": "stat", "title": "端到端耗时 P50 / P95", "id": 6,
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "legendFormat": "P50", "expr": "histogram_quantile(0.5, sum by (le) (increase(review_run_duration_seconds_bucket{phase=\"total\"}[$__range])))", "instant": true },
+        { "refId": "B", "legendFormat": "P95", "expr": "histogram_quantile(0.95, sum by (le) (increase(review_run_duration_seconds_bucket{phase=\"total\"}[$__range])))", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "purple" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "type": "stat", "title": "缓存命中率（输入 token）", "id": 7,
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(increase(review_tokens_total{direction=\"cache_read\"}[$__range])) / sum(increase(review_tokens_total{direction=~\"input|cache_read\"}[$__range]))", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 1, "min": 0, "max": 1, "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value" }
+    },
+
+    { "type": "row", "title": "吞吐与排队", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "id": 10, "panels": [] },
+    {
+      "type": "timeseries", "title": "吞吐（每 5 分钟结束的评审，按结果）", "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "interval": "5m",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "legendFormat": "{{state}}", "expr": "round(sum by (state) (increase(review_runs_total[$__interval])))" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" }, "lineWidth": 1 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "done" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "superseded" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "gray" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries", "title": "排队与运行中的评审", "id": 12,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "legendFormat": "排队", "expr": "review_queue_depth" },
+        { "refId": "B", "legendFormat": "运行中", "expr": "review_running" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 15, "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+
+    { "type": "row", "title": "各阶段耗时", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }, "id": 20, "panels": [] },
+    {
+      "type": "barchart", "title": "各阶段耗时 P50 / P95（所选时间范围）", "id": 21,
+      "description": "queue：排队；startup：建 Job、调度、拉镜像；fetch：克隆代码；review：模型探索并提交；publish：投票与完成 Check Run。",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "format": "table", "instant": true, "expr": "histogram_quantile(0.5, sum by (le, phase) (increase(review_run_duration_seconds_bucket{phase!=\"total\"}[$__range])))" },
+        { "refId": "B", "format": "table", "instant": true, "expr": "histogram_quantile(0.95, sum by (le, phase) (increase(review_run_duration_seconds_bucket{phase!=\"total\"}[$__range])))" }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "Value #A": "P50", "Value #B": "P95", "phase": "阶段" }, "indexByName": { "phase": 0, "Value #A": 1, "Value #B": 2 } } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "min": 0, "custom": { "fillOpacity": 80, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "xField": "阶段", "showValue": "auto", "groupWidth": 0.7, "barWidth": 0.9, "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "type": "timeseries", "title": "各阶段耗时 P95 随时间", "id": 22,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "legendFormat": "{{phase}}", "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(review_run_duration_seconds_bucket[30m])))" }],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "spanNulls": true } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+
+    { "type": "row", "title": "成本", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }, "id": 30, "panels": [] },
+    {
+      "type": "bargauge", "title": "每次评审的成本分布（USD，次数）", "id": 31,
+      "description": "review_run_cost_usd 的直方图桶：每个柱是成本不超过该值、且高于上一档的评审次数。",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "format": "heatmap", "instant": true, "legendFormat": "≤ ${{le}}", "expr": "sum by (le) (increase(review_run_cost_usd_bucket[$__range]))" }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "min": 0, "color": { "mode": "continuous-BlYlRd" } }, "overrides": [] },
+      "options": { "orientation": "vertical", "displayMode": "gradient", "showUnfilled": true, "valueMode": "color", "namePlacement": "auto", "sizing": "auto", "minVizHeight": 16, "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "bargauge", "title": "端到端耗时分布（秒，次数）", "id": 32,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "format": "heatmap", "instant": true, "legendFormat": "≤ {{le}}s", "expr": "sum by (le) (increase(review_run_duration_seconds_bucket{phase=\"total\"}[$__range]))" }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "min": 0, "color": { "mode": "continuous-GrYlRd" } }, "overrides": [] },
+      "options": { "orientation": "vertical", "displayMode": "gradient", "showUnfilled": true, "valueMode": "color", "namePlacement": "auto", "sizing": "auto", "minVizHeight": 16, "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "timeseries", "title": "模型花费（每 5 分钟，按仓库）", "id": 33,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "interval": "5m",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "legendFormat": "{{repo}}", "expr": "sum by (repo) (increase(review_cost_usd_total[$__interval]))" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "bargauge", "title": "花费按模型（所选时间范围）", "id": 34,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "instant": true, "legendFormat": "{{model}}", "expr": "sort_desc(sum by (model) (increase(review_model_cost_usd_total[$__range])))" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 3, "min": 0, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": true, "valueMode": "color", "namePlacement": "auto", "sizing": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+
+    { "type": "row", "title": "Token 与失败", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }, "id": 40, "panels": [] },
+    {
+      "type": "timeseries", "title": "Token 速率（每分钟，按方向）", "id": 41,
+      "description": "input 为未命中缓存的输入；cache_read 为命中缓存的输入，单价约为 input 的 1/50。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "legendFormat": "{{direction}}", "expr": "sum by (direction) (rate(review_tokens_total[$__rate_interval])) * 60" }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "bargauge", "title": "失败原因（所选时间范围）", "id": 42,
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "instant": true, "legendFormat": "{{reason}}", "expr": "round(sum by (reason) (increase(review_failures_total[$__range])))" }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "min": 0, "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": true, "valueMode": "color", "namePlacement": "auto", "sizing": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "piechart", "title": "结论分布", "id": 43,
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "instant": true, "legendFormat": "{{verdict}}", "expr": "round(sum by (verdict) (increase(review_verdicts_total[$__range])))" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0 },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "approve" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "request_changes" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+        ]
+      },
+      "options": { "pieType": "donut", "displayLabels": ["value"], "legend": { "displayMode": "list", "placement": "right", "showLegend": true, "values": ["value"] }, "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "tooltip": { "mode": "single", "sort": "none" } }
+    }
+  ]
+}

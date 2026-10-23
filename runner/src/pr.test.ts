@@ -26,6 +26,13 @@ test("buildDiff produces the contract diff from GitHub's files response", () => 
   assert.equal(buildDiff(files), parsePRContext(read("pr.json")).diff);
 });
 
+test("contract previousComments parse", () => {
+  const pr = parsePRContext({ ...(read("pr.json") as object), previousComments: read("previous-comments.json") });
+  assert.equal(pr.previousComments?.length, 2);
+  assert.equal(pr.previousComments?.[1]?.resolved, true);
+  assert.throws(() => parsePRContext({ ...(read("pr.json") as object), previousComments: [{ path: "a" }] }), /invalid PR context/);
+});
+
 test("parsePRContext rejects malformed input", () => {
   const pr = read("pr.json") as Record<string, unknown>;
   assert.throws(() => parsePRContext({ ...pr, number: 0 }), /number/);

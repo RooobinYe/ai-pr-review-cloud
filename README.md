@@ -71,6 +71,16 @@ make webhook-forward SMEE_URL=<smee 通道地址>
 kubectl -n ai-pr-review-cloud logs deploy/ai-pr-review-cloud-controller -f
 ```
 
+### 成本看板
+
+`make deploy` 同时装上仅供开发用的 Prometheus 和 Grafana，Grafana 首页就是吞吐、各阶段耗时和每次评审成本的看板（[看板 JSON](deploy/helm/ai-pr-review-cloud/dashboards/review-cost.json)，指标见 [架构 §7.1](docs/architecture.md#71-指标)）。转发端口后打开 http://localhost:3000 ，匿名即可查看：
+
+```bash
+kubectl -n ai-pr-review-cloud port-forward svc/ai-pr-review-cloud-grafana 3000:3000
+```
+
+20 个 PR 的成本与延迟测算见 [docs/cost-report.md](docs/cost-report.md)。
+
 runner 也可以脱离集群单独运行（本地模式）：评审一个 PR，把结论打印到 stdout。默认使用 DeepSeek 的 `deepseek-flash`，其他模型和参数见 [架构 §4.5](docs/architecture.md#45-模型接入)。
 
 ```bash
@@ -81,7 +91,7 @@ export LLM_API_KEY=<DeepSeek API key>
 docker run --rm -e LLM_API_KEY -e GITHUB_TOKEN local/ai-pr-review-cloud-runner:dev --pr https://github.com/owner/repo/pull/1
 ```
 
-不用 Docker 时在 `runner/` 下执行 `node src/main.ts --pr <url>`。常用参数：`--format json` 输出 [schema v3](contract/review-result.schema.json) JSON，`--language Chinese` 指定评审语言。`GITHUB_TOKEN` 可选，私有仓库需要。
+不用 Docker 时在 `runner/` 下执行 `node src/main.ts --pr <url>`。常用参数：`--format json` 输出 [schema v3](contract/review-result.schema.json) JSON，`--language Chinese` 指定评审语言，`--budget 0.05` 在花费达到 80% 时要求模型尽快提交，`--stats <文件>` 写出 token、金额和各阶段耗时。`GITHUB_TOKEN` 可选，私有仓库需要。
 
 ## 目录结构
 
@@ -89,7 +99,8 @@ docker run --rm -e LLM_API_KEY -e GITHUB_TOKEN local/ai-pr-review-cloud-runner:d
 go/                         gateway、controller、fetch（Go）
 runner/                     评审 agent（TypeScript，pi SDK）
 contract/                   评审结论的 JSON schema 与 Go / TS 共用样例
-deploy/helm/                Helm chart
+deploy/helm/                Helm chart（含 Grafana 看板 JSON）
+bench/                      成本测算：PR 列表、驱动脚本、原始结果与汇总脚本
 hack/                       本地环境脚本
 docs/                       架构设计、roadmap 与赛题
 ```

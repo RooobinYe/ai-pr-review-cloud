@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -23,9 +24,19 @@ type Keys interface {
 // up revocation: a key the controller failed to delete still stops working.
 const keyGrace = 5 * time.Minute
 
+var errBudgetExceeded = errors.New(BudgetExceeded)
+
 // mintKey issues the virtual key for one attempt of a run, capped at the
 // run's budget and limited to the configured model.
 func (c *Controller) mintKey(ctx context.Context, r store.Run) (string, error) {
+	spent, err := c.store.RunCostUSD(ctx, r.ID)
+	if err != nil {
+		return "", err
+	}
+	remaining := r.BudgetUSD - spent
+	if remaining <= 0 {
+		return "", fmt.Errorf("%w: reported cost $%.4f exhausted the run's $%.4f budget", errBudgetExceeded, spent, r.BudgetUSD)
+	}
 	var models []string
 	if m := c.cfg.Job.LLMEnv["LLM_MODEL"]; m != "" {
 		models = []string{m}
@@ -33,7 +44,7 @@ func (c *Controller) mintKey(ctx context.Context, r store.Run) (string, error) {
 	return c.keys.Generate(ctx, litellm.Key{
 		Alias:        r.JobName,
 		Models:       models,
-		MaxBudgetUSD: r.BudgetUSD,
+		MaxBudgetUSD: remaining,
 		Duration:     time.Duration(c.cfg.Job.ActiveDeadlineSeconds)*time.Second + keyGrace,
 		Metadata:     map[string]string{"run_id": r.ID, "repo": r.Repo, "pr": strconv.Itoa(r.PRNumber), "head_sha": r.HeadSHA},
 	})
