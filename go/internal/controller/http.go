@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -13,6 +14,9 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
+
+// uuidPattern matches run IDs; anything else would be rejected by PostgreSQL.
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // maxResultBytes bounds a posted result; 15 comments of Markdown fit easily.
 const maxResultBytes = 1 << 20
@@ -53,6 +57,10 @@ func (c *Controller) authorized(req *http.Request, r store.Run) (bool, error) {
 
 func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
+	if !uuidPattern.MatchString(id) {
+		http.Error(w, "unknown run", http.StatusNotFound)
+		return
+	}
 	ctx := req.Context()
 	r, err := c.store.Get(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {

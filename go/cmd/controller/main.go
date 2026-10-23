@@ -33,6 +33,25 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Serve /healthz right away so the liveness probe passes while the
+	// database is still starting; the runner API is registered once ready.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Info("controller listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+		close(serveErr)
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
 	db, err := store.Open(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
 		return err
@@ -41,10 +60,6 @@ func run(log *slog.Logger) error {
 	if err := migrate(ctx, log, db); err != nil {
 		return err
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-
 	ctl, err := newController(ctx, log, db)
 	if err != nil {
 		return err
@@ -56,18 +71,12 @@ func run(log *slog.Logger) error {
 		log.Warn("GITHUB_APP_ID is not set; runs stay queued until a GitHub App is configured")
 	}
 
-	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-	log.Info("controller listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-serveErr:
 		return err
 	}
-	return nil
 }
 
 // migrate applies the schema, waiting for the database to come up.

@@ -443,6 +443,7 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 - **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库）；落地前用选定版本验证 `max_budget` 是否按预期拒绝请求。
 - **工具链版本较新。** runner 用 TypeScript 7.0、Go 镜像用 `golang:1.27`，本地验证通过，GitHub Actions 上还没跑过。
 - **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，controller 发布时以结果里的 `head_sha` 为 `commit_id`，PR 之后的推送不会让锚点错位；GitHub 仍拒绝时把评论折叠进正文（§6.3）。
-- **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；社区经验是专用 GitHub App 的 approve 会计入。M1 在要求 2 个审批的 demo 仓库上实测：bot 加一个人能否合并。若不计入，退路是用一个机器用户账号投票，代价是要管理它的凭据。
-- **撤销旧票的权限。** dismiss review 需要 App 有 Pull requests: write；若 branch protection 限制了谁能 dismiss review，要把 App 加入允许名单。M1 一并验证。
+- **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；社区经验是专用 GitHub App 的 approve 会计入。M1 已验证 bot 能投出 APPROVE（`commit_id` 为评审的提交），是否计入还要在开启分支保护的仓库上实测：bot 加一个人能否合并。若不计入，退路是用一个机器用户账号投票，代价是要管理它的凭据。
+- **撤销旧票的权限。** dismiss review 需要 App 有 Pull requests: write。M1 已在没有分支保护的仓库上验证 App 能 dismiss 自己的 APPROVE；若 branch protection 限制了谁能 dismiss review，要把 App 加入允许名单。
+- **webhook 丢失。** GitHub 不会自动重投失败的 delivery；本地开发时 smee 转发在 gateway 重启期间失败的事件同样会丢。可在 App 设置的 Advanced → Recent Deliveries 里手动重投（gateway 按 delivery ID 去重，重投安全）。生产部署需要定时对账：列出近期 delivery，重投失败的那些。
 - **预览环境的镜像约定。** 需要 demo 仓库的 CI 配合推送 `:<head_sha>` 镜像。
