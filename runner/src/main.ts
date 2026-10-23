@@ -200,7 +200,12 @@ async function cluster(runId: string): Promise<number> {
   if (resumeFrom) log(`run ${runId}: resuming from a snapshot with ${resumeFrom.length} entries`);
   const bundle = await previewBundle(join(workspace, "repo"));
   const { result } = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, {
-    preparePreview: bundle ? () => preparePreview(controllerUrl, runId, bundle, join(agentDir, "preview-kubeconfig.json"), remote) : undefined,
+    preparePreview: bundle ? async () => {
+      log("deploying preview; waiting for Ready or timeout");
+      const access = await preparePreview(controllerUrl, runId, bundle, remote);
+      log(`preview ${access.namespace}: ${access.status}`);
+      return access;
+    } : undefined,
     language: process.env.REVIEW_LANGUAGE || values.language!,
     budgetUSD,
     resumeFrom,

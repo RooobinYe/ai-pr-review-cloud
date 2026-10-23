@@ -127,7 +127,7 @@ function isolatedResources(system: string): ResourceLoader {
 }
 
 function describeToolCall(name: string, args: Record<string, unknown>): string {
-  if (name === "git" && Array.isArray(args.args)) return `git ${args.args.join(" ")}`;
+  if ((name === "git" || name === "kubectl") && Array.isArray(args.args)) return `${name} ${args.args.join(" ")}`;
   const target = args.pattern ?? args.path ?? "";
   return `${name} ${String(target)}`.trim();
 }

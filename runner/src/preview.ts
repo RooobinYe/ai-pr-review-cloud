@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { defineTool } from "@earendil-works/pi-coding-agent";
@@ -45,7 +45,7 @@ export async function previewBundle(cwd: string): Promise<{ files: Record<string
   return { files };
 }
 
-export async function preparePreview(url: string, runId: string, bundle: { files: Record<string, string> }, destination: string, opts: CallOptions): Promise<PreviewAccess> {
+export async function preparePreview(url: string, runId: string, bundle: { files: Record<string, string> }, opts: CallOptions): Promise<PreviewAccess> {
   for (let attempt = 0; ; attempt++) {
     try {
       const res = await fetch(`${url.replace(/\/$/, "")}/runs/${encodeURIComponent(runId)}/preview`, {
@@ -59,8 +59,7 @@ export async function preparePreview(url: string, runId: string, bundle: { files
       }
       const reply = await res.json() as { enabled: boolean; namespace: string; status: string; kubeconfig: string };
       if (!reply.enabled || !reply.kubeconfig || !/^pr-[a-z0-9-]+$/.test(reply.namespace)) throw new RejectedError("controller returned invalid preview access");
-      await writeFile(destination, reply.kubeconfig, { mode: 0o600 });
-      return { namespace: reply.namespace, status: reply.status, kubeconfig: destination };
+      return { namespace: reply.namespace, status: reply.status, kubeconfig: reply.kubeconfig };
     } catch (err) {
       if (err instanceof RejectedError || attempt >= 2) throw err;
       opts.log?.(`preview interrupted; retrying: ${String(err)}`);
@@ -86,10 +85,16 @@ export function kubectlTool(access: () => PreviewAccess | undefined) {
     async execute(_id, { args }) {
       const target = access();
       if (!target || !checkKubectlArgs(args)) throw new Error("only bounded read-only preview kubectl commands are allowed");
-      const command = ["--kubeconfig", target.kubeconfig, "--namespace", target.namespace, "--request-timeout=20s", ...args];
+      const command = ["--kubeconfig=/dev/stdin", "--namespace", target.namespace, "--request-timeout=20s", ...args];
       if (args[0] === "logs") command.push("--tail=200", "--limit-bytes=30000");
       try {
-        const { stdout } = await exec("kubectl", command, { timeout: 30_000, maxBuffer: 1 << 20 });
+        // Node stdio is a Unix socket on Linux; kubectl cannot reopen it as /dev/stdin.
+        // A fixed pipeline supplies a real pipe. Model input is passed only as validated argv.
+        const pending = exec("sh", ["-c", 'cat | exec kubectl "$@"', "preview-kubectl", ...command], { timeout: 30_000, maxBuffer: 1 << 20 });
+        // Keep the short-lived reader credential out of files, argv and tool output.
+        pending.child.stdin?.on("error", () => {});
+        pending.child.stdin?.end(target.kubeconfig);
+        const { stdout } = await pending;
         return { content: [{ type: "text", text: stdout.slice(0, 40_000) || "(no output)" }], details: undefined };
       } catch (err) { throw new Error(String((err as { stderr?: string }).stderr || err).slice(0, 2000)); }
     },

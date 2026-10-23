@@ -307,9 +307,9 @@ M5 预览实现约定（验收记录见 roadmap）：
 
 - 本仓库新增独立 HTTP 示例应用作为预览目标；故障验收 PR 只修改示例 chart 的 readiness 路径，避免破坏评审服务本身。
 - runner 在代码探索后把配置和 chart 的普通文件作为有大小上限的数据包交给 controller。controller 离线执行 `helm template`，强制 `image.tag=<head_sha>`，先校验全部资源，再部署；不执行 PR 程序、Helm 插件或下载依赖。初版只支持 Deployment、ClusterIP Service 和 ConfigMap。
-- 预览 namespace 使用 ResourceQuota、Restricted Pod Security admission 和默认拒绝网络策略。只读 ServiceAccount 的短期 token 在等待 Ready 或超时后才交给 runner；超时保留现场，由模型读取实际证据，不能仅凭超时推断探针错误。
+- 预览 namespace 使用 ResourceQuota、Restricted Pod Security admission 和默认拒绝网络策略。只读 ServiceAccount 的短期 token 在等待 Ready 或超时后才交给 runner，只在内存中保存，经 stdin 传入 kubectl，不写入文件或工具输出；超时保留现场，由模型读取实际证据，不能仅凭超时推断探针错误。
 - `previewing` 表示部署等待，结束后返回 `running` 做运行时评审。此阶段失败可回到 `queued` 重试；状态取值未新增，数据库 CHECK 中已有 `previewing`。
-- 原先“ClusterRole 只含 namespaces”的权限不足以在动态 namespace 中创建工作负载、配额和只读授权。拟采用显式开关的预览 ClusterRole，列出所需资源及操作；Kubernetes RBAC 不能按 namespace 名称前缀约束它，controller 必须校验归属。该权限范围已获批准；chart 通过 `preview.enabled` 显式开启，默认关闭。开启时 controller 必须为单副本，升级使用 Recreate，避免多个进程同时部署同一 PR。
+- “ClusterRole 只含 namespaces”的权限不足以在动态 namespace 中创建工作负载、配额和只读授权。采用显式开关的预览 ClusterRole，列出所需资源及操作；Kubernetes RBAC 不能按 namespace 名称前缀约束它，controller 必须校验归属。该权限范围已获批准；chart 通过 `preview.enabled` 显式开启，默认关闭。开启时 controller 必须为单副本，升级使用 Recreate，避免多个进程同时部署同一 PR。
 - PR 关闭清理由 controller 定时查询 GitHub 状态执行，使漏收 closed webhook 时也能清理；超过 24 小时、PR 已不可访问或没有进行中评审的 namespace 作为孤儿清理；GitHub 暂时出错时不删除。gateway 保持只记录触发的边界。
 
 ### 6.3 投票与合并
@@ -405,7 +405,7 @@ controller 的 `GET /metrics`（与 runner 回调同一个端口）输出以下�
 | `publish` | 收到结果 → done：投票、完成 Check Run | `reviewed_at` → `finished_at`（进入终态时写入） |
 | `total` | 创建 → done | `created_at` → `finished_at` |
 
-fetch 的起止时间由 controller 在发布投票前读 runner Pod 的状态得到（只用于指标，读取失败只记日志）。预览阶段在 M5 加入。
+fetch 的起止时间由 controller 在发布投票前读 runner Pod 的状态得到（只用于指标，读取失败只记日志）。M5 的预览部署等待和运行时检查目前计入 `review`，尚未拆分独立阶段指标。
 
 **指标在抓取时由数据库计算**，controller 不在内存里累计。这样 controller 重启后计数不归零，多副本时每个副本报出的值一致，Prometheus 只需抓任意一个副本。代价是每次抓取扫描所有 done run，演示规模下可以忽略；run 数量大时改为只扫描最近一段时间，或在状态转换时累加计数。Prometheus 文本格式手写输出，不引入 client 库，与不用 client-go 的理由相同（§6.1）。
 
@@ -515,7 +515,7 @@ chart 目前包含：
 - 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库。
 - 仅供开发用的 Prometheus 和 Grafana（`monitoring.dev.enabled`，不持久化）：Prometheus 抓取 controller 的 `/metrics`，Grafana 预置数据源和成本看板，匿名只读。生产环境关闭它，用已有的监控抓取 controller Service 并导入看板 JSON。
 
-预览环境所需的 ClusterRole 在 M5 加入。
+预览环境所需的 ClusterRole 由 `preview.enabled` 显式开启，默认关闭。配置、升级和验收步骤见 [预览验证](preview.md)。
 
 `make deploy` 的密钥只从环境变量读取：`GITHUB_WEBHOOK_SECRET`（缺省时用一个固定的开发值）、`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY_FILE`、`LLM_API_KEY`（真实模型 key，交给 LiteLLM）。没有 App ID 时 controller 照常启动，但 run 停在 `queued`，所以不配置 GitHub App 也能把整套服务拉起来。
 
