@@ -365,3 +365,37 @@ func TestReady(t *testing.T) {
 		t.Error("store ready without the newest migration")
 	}
 }
+
+func TestPreviewAttemptCannotAdvanceReplacement(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id, _, err := s.RecordTrigger(ctx, "preview-attempt", newRun("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, 1, jobName); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionAttempt(ctx, id, 1, run.StateRunning, run.StatePreviewing); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.Active(ctx)
+	if err != nil || len(active) != 1 || active[0].State != run.StatePreviewing {
+		t.Fatalf("active previews: %v %v", active, err)
+	}
+	if err := s.Transition(ctx, id, run.StatePreviewing, run.StateQueued, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, 1, jobName); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionAttempt(ctx, id, 2, run.StateRunning, run.StatePreviewing); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionAttempt(ctx, id, 1, run.StatePreviewing, run.StateRunning); !errors.Is(err, ErrConflict) {
+		t.Fatalf("old attempt: %v", err)
+	}
+	if err := s.TransitionAttempt(ctx, id, 2, run.StatePreviewing, run.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+}
