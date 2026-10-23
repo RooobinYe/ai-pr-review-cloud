@@ -67,11 +67,11 @@ func TestBuildJob(t *testing.T) {
 	job := BuildJob(cfg, r)
 	spec := job.Spec.Template.Spec
 
-	if *job.Spec.BackoffLimit != 0 || *job.Spec.ActiveDeadlineSeconds != 900 || *spec.AutomountServiceAccountToken {
+	if *job.Spec.BackoffLimit != 0 || *job.Spec.ActiveDeadlineSeconds != 900 || *spec.AutomountServiceAccountToken || *spec.EnableServiceLinks {
 		t.Errorf("job spec %+v", job.Spec)
 	}
 	fetchEnv := envMap(spec.InitContainers[0].Env)
-	if ref := fetchEnv["GITHUB_TOKEN"].ValueFrom.SecretKeyRef; ref.Name != tokenSecretName(r.JobName) {
+	if ref := fetchEnv["GITHUB_TOKEN"].ValueFrom.SecretKeyRef; ref.Name != runSecretName(r.JobName) {
 		t.Errorf("fetch token ref %+v", ref)
 	}
 	if fetchEnv["PR_NUMBER"].Value != "7" || fetchEnv["HEAD_SHA"].Value != headSHA {
@@ -80,6 +80,12 @@ func TestBuildJob(t *testing.T) {
 	runnerEnv := envMap(spec.Containers[0].Env)
 	if _, leaked := runnerEnv["GITHUB_TOKEN"]; leaked {
 		t.Error("runner container gets a GitHub token")
+	}
+	if _, leaked := fetchEnv["RUN_TOKEN"]; leaked {
+		t.Error("fetch container gets the callback token")
+	}
+	if ref := runnerEnv["RUN_TOKEN"].ValueFrom.SecretKeyRef; ref.Key != "RUN_TOKEN" {
+		t.Errorf("runner token ref %+v", ref)
 	}
 	if runnerEnv["RUN_ID"].Value != runID || runnerEnv["LLM_MODEL"].Value != "m" || runnerEnv["LLM_API_KEY"].ValueFrom.SecretKeyRef.Name != "llm" {
 		t.Errorf("runner env %+v", runnerEnv)
@@ -92,7 +98,7 @@ func TestBuildJob(t *testing.T) {
 	}
 
 	job.Metadata.UID = "u"
-	secret := BuildTokenSecret(job, "tok")
+	secret := BuildRunSecret(job, "tok", "run-tok")
 	data, _ := json.Marshal(secret)
 	if !strings.Contains(string(data), `"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job","name":"`+r.JobName+`","uid":"u"}]`) {
 		t.Errorf("secret %s", data)
@@ -133,5 +139,21 @@ func TestPodFailure(t *testing.T) {
 		if got := PodFailure(tt.pod); got != tt.want {
 			t.Errorf("%s: PodFailure = %q, want %q", tt.name, got, tt.want)
 		}
+	}
+}
+
+func TestParseResources(t *testing.T) {
+	res, err := ParseResources(`{"requests":{"cpu":"250m","memory":1073741824},"limits":{"cpu":1}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests["cpu"] != "250m" || res.Requests["memory"] != "1073741824" || res.Limits["cpu"] != "1" {
+		t.Errorf("ParseResources = %+v", res)
+	}
+	if res, err := ParseResources(""); err != nil || res.Requests != nil {
+		t.Errorf("empty: %+v, %v", res, err)
+	}
+	if _, err := ParseResources(`{"requests":"x"}`); err == nil {
+		t.Error("malformed resources accepted")
 	}
 }

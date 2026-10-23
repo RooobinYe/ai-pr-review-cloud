@@ -3,6 +3,8 @@
 import type { ReviewResult } from "./schema.ts";
 
 export interface PostOptions {
+  /** The run's callback token (RUN_TOKEN), sent as a bearer token. */
+  token: string;
   attempts?: number;
   /** Delay before the first retry; doubles after each attempt. */
   retryDelayMs?: number;
@@ -19,7 +21,7 @@ const retryable = (status: number) => status >= 500 || status === 408 || status 
  * errors and 5xx responses. The controller accepts a repeated POST of the same
  * result, so retrying after a lost response is safe.
  */
-export async function postResult(controllerUrl: string, runId: string, result: ReviewResult, opts: PostOptions = {}): Promise<void> {
+export async function postResult(controllerUrl: string, runId: string, result: ReviewResult, opts: PostOptions): Promise<void> {
   const url = `${controllerUrl.replace(/\/$/, "")}/runs/${encodeURIComponent(runId)}/result`;
   const attempts = opts.attempts ?? 5;
   let delay = opts.retryDelayMs ?? 1000;
@@ -28,7 +30,7 @@ export async function postResult(controllerUrl: string, runId: string, result: R
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${opts.token}` },
         body: JSON.stringify(result),
         signal: AbortSignal.timeout(30_000),
       });

@@ -90,7 +90,7 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 
 - [ ] chart 加入 LiteLLM proxy，真实模型 key 只放在 proxy 里。
 - [ ] controller 为每个 run 签发带 `max_budget` 的虚拟 key，存进本 run 的 Secret，run 结束吊销。
-- [ ] 每个 run 生成独立的回调 token（`RUN_TOKEN`），controller 校验。
+- [x] 每个 run 生成独立的回调 token（`RUN_TOKEN`），controller 校验。（M1 提前实现：伪造的结论能让 bot 投出计入审批数的 APPROVE）
 - [ ] runner 的 NetworkPolicy：出站只允许 DNS、LiteLLM、controller。
 - [ ] 验证 `max_budget` 超出后 proxy 拒绝请求，run 以 `failed(budget_exceeded)` 结束。
 

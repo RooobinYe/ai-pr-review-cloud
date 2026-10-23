@@ -27,13 +27,13 @@ test("postResult retries server errors, then succeeds", async () => {
   const seen: string[] = [];
   await withServer(
     (req, body, res) => {
-      seen.push(`${req.method} ${req.url}`);
+      seen.push(`${req.method} ${req.url} ${req.headers.authorization}`);
       assert.deepEqual(JSON.parse(body), RESULT);
       res.writeHead(seen.length < 3 ? 503 : 204).end();
     },
-    (url) => postResult(url, "run-1", RESULT, { retryDelayMs: 1 }),
+    (url) => postResult(url, "run-1", RESULT, { token: "t0k", retryDelayMs: 1 }),
   );
-  assert.deepEqual(seen, Array(3).fill("POST /runs/run-1/result"));
+  assert.deepEqual(seen, Array(3).fill("POST /runs/run-1/result Bearer t0k"));
 });
 
 test("postResult does not retry a rejection", async () => {
@@ -43,7 +43,7 @@ test("postResult does not retry a rejection", async () => {
       calls++;
       res.writeHead(422).end("result is for another commit");
     },
-    (url) => assert.rejects(postResult(url, "run-1", RESULT, { retryDelayMs: 1 }), (err: Error) => err instanceof ResultRejectedError && /another commit/.test(err.message)),
+    (url) => assert.rejects(postResult(url, "run-1", RESULT, { token: "t", retryDelayMs: 1 }), (err: Error) => err instanceof ResultRejectedError && /another commit/.test(err.message)),
   );
   assert.equal(calls, 1);
 });
@@ -51,6 +51,6 @@ test("postResult does not retry a rejection", async () => {
 test("postResult gives up after the last attempt", async () => {
   await withServer(
     (_req, _body, res) => res.writeHead(500).end("down"),
-    (url) => assert.rejects(postResult(url, "run-1", RESULT, { attempts: 2, retryDelayMs: 1 }), /after 2 attempts: 500 down/),
+    (url) => assert.rejects(postResult(url, "run-1", RESULT, { token: "t", attempts: 2, retryDelayMs: 1 }), /after 2 attempts: 500 down/),
   );
 });

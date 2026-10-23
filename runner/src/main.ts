@@ -28,7 +28,7 @@ environment:
   GITHUB_TOKEN   optional; needed for private repositories and higher rate limits
 
 cluster mode (set by the controller's Job):
-  RUN_ID, CONTROLLER_URL, WORKSPACE (default /workspace), REVIEW_LANGUAGE`;
+  RUN_ID, RUN_TOKEN, CONTROLLER_URL, WORKSPACE (default /workspace), REVIEW_LANGUAGE`;
 
 const { values } = parseArgs({
   options: {
@@ -104,15 +104,15 @@ async function local(url: string, format: string): Promise<number> {
 }
 
 async function cluster(runId: string): Promise<number> {
-  const controllerUrl = process.env.CONTROLLER_URL;
-  if (!controllerUrl) throw new Error("CONTROLLER_URL is not set");
+  const { CONTROLLER_URL: controllerUrl, RUN_TOKEN: token } = process.env;
+  if (!controllerUrl || !token) throw new Error("CONTROLLER_URL and RUN_TOKEN must be set");
   const cfg = modelConfigFromEnv(process.env);
   const workspace = process.env.WORKSPACE || "/workspace";
   const pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
   const agentDir = await mkdtemp(join(tmpdir(), "pi-"));
   log(`run ${runId}: ${pr.files.length} files changed`);
   const result = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, process.env.REVIEW_LANGUAGE || values.language!);
-  await postResult(controllerUrl, runId, result, { log });
+  await postResult(controllerUrl, runId, result, { token, log });
   log(`run ${runId}: posted ${result.verdict} with ${result.comments.length} comments`);
   return 0;
 }

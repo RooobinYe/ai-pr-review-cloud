@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -116,11 +115,9 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 	if err != nil {
 		return nil, fmt.Errorf("RUNNER_DEADLINE_SECONDS: %w", err)
 	}
-	var resources kube.Resources
-	if v := os.Getenv("RUNNER_RESOURCES"); v != "" {
-		if err := json.Unmarshal([]byte(v), &resources); err != nil {
-			return nil, fmt.Errorf("RUNNER_RESOURCES: %w", err)
-		}
+	resources, err := controller.ParseResources(os.Getenv("RUNNER_RESOURCES"))
+	if err != nil {
+		return nil, err
 	}
 	llmEnv := map[string]string{}
 	for _, name := range []string{"LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "LLM_THINKING"} {

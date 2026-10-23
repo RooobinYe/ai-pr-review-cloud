@@ -137,6 +137,7 @@ type fakeGitHub struct {
 	rejectLines bool
 	checkRuns   map[int64][]githubapp.CheckRun
 	tokens      []string
+	writeErr    error
 }
 
 func (g *fakeGitHub) Client(int64) GitHubClient { return g }
@@ -159,12 +160,18 @@ func (g *fakeGitHub) ListReviews(context.Context, string, int) ([]githubapp.Revi
 	return g.reviews, nil
 }
 
+// refuse makes every later GitHub write fail with err.
+func (g *fakeGitHub) refuse(err error) { g.writeErr = err }
+
 func (g *fakeGitHub) DismissReview(_ context.Context, _ string, _ int, id int64, _ string) error {
 	g.dismissed = append(g.dismissed, id)
 	return nil
 }
 
 func (g *fakeGitHub) CreateReview(_ context.Context, _ string, _ int, r githubapp.NewReview) (int64, error) {
+	if g.writeErr != nil {
+		return 0, g.writeErr
+	}
 	if g.rejectLines && len(r.Comments) > 0 {
 		return 0, &githubapp.APIError{Status: http.StatusUnprocessableEntity, Message: "Line could not be resolved"}
 	}
@@ -218,13 +225,21 @@ func (k *fakeKube) CreateSecret(_ context.Context, s kube.Secret) error {
 	if _, ok := k.secrets[s.Metadata.Name]; ok {
 		return kube.ErrAlreadyExists
 	}
+	// The API server returns stringData as data.
+	s.Data = map[string][]byte{}
+	for key, v := range s.StringData {
+		s.Data[key] = []byte(v)
+	}
 	k.secrets[s.Metadata.Name] = s
 	return nil
 }
 
-func (k *fakeKube) SecretExists(_ context.Context, name string) (bool, error) {
-	_, ok := k.secrets[name]
-	return ok, nil
+func (k *fakeKube) GetSecret(_ context.Context, name string) (kube.Secret, error) {
+	s, ok := k.secrets[name]
+	if !ok {
+		return kube.Secret{}, kube.ErrNotFound
+	}
+	return s, nil
 }
 
 func (k *fakeKube) ListPods(context.Context, string) ([]kube.Pod, error) { return k.pods, nil }

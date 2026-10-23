@@ -1,11 +1,14 @@
 package controller
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
@@ -14,8 +17,9 @@ import (
 // maxResultBytes bounds a posted result; 15 comments of Markdown fit easily.
 const maxResultBytes = 1 << 20
 
-// Routes registers the runner callback API on mux.
-// M2 adds a per-run RUN_TOKEN that these handlers verify.
+// Routes registers the runner callback API on mux. Each call must carry the
+// run's RUN_TOKEN as a bearer token; it lives in the run's Secret, which only
+// the controller and that run's runner container can read.
 func (c *Controller) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /runs/{id}/result", c.handleResult)
 }
@@ -30,18 +34,25 @@ func matchResult(r store.Run, res review.Result) error {
 	return nil
 }
 
+// authorized reports whether the request carries the run's callback token.
+func (c *Controller) authorized(req *http.Request, r store.Run) (bool, error) {
+	got, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
+	if !ok || got == "" || r.JobName == "" {
+		return false, nil
+	}
+	secret, err := c.kube.GetSecret(req.Context(), runSecretName(r.JobName))
+	if errors.Is(err, kube.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	want := secret.Data["RUN_TOKEN"]
+	return len(want) > 0 && subtle.ConstantTimeCompare([]byte(got), want) == 1, nil
+}
+
 func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
-	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxResultBytes))
-	if err != nil {
-		http.Error(w, "result too large or unreadable", http.StatusRequestEntityTooLarge)
-		return
-	}
-	res, err := review.Parse(body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	ctx := req.Context()
 	r, err := c.store.Get(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -51,6 +62,24 @@ func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		c.log.Error("load run for result", "run_id", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if ok, err := c.authorized(req, r); err != nil {
+		c.log.Error("check run token", "run_id", id, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if !ok {
+		http.Error(w, "missing or wrong run token", http.StatusUnauthorized)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxResultBytes))
+	if err != nil {
+		http.Error(w, "result too large or unreadable", http.StatusRequestEntityTooLarge)
+		return
+	}
+	res, err := review.Parse(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := matchResult(r, res); err != nil {

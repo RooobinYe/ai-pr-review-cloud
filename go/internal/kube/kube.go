@@ -148,13 +148,10 @@ func (c *Client) CreateSecret(ctx context.Context, s Secret) error {
 	return c.do(ctx, http.MethodPost, c.path("api/v1", "secrets", ""), s, nil)
 }
 
-// SecretExists reports whether the named Secret exists.
-func (c *Client) SecretExists(ctx context.Context, name string) (bool, error) {
-	err := c.do(ctx, http.MethodGet, c.path("api/v1", "secrets", name), nil, nil)
-	if errors.Is(err, ErrNotFound) {
-		return false, nil
-	}
-	return err == nil, err
+func (c *Client) GetSecret(ctx context.Context, name string) (Secret, error) {
+	var out Secret
+	err := c.do(ctx, http.MethodGet, c.path("api/v1", "secrets", name), nil, &out)
+	return out, err
 }
 
 // ListPods lists Pods matching a label selector such as "job-name=x".

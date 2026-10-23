@@ -204,7 +204,7 @@ func TestActiveIncludesUnreportedFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(active) != 1 || active[0].ID != unreported || active[0].Error != "boom" {
-		t.Errorf("active = %+v, want only the unreported failure (queued run %s excluded)", active, queued)
+	if len(active) != 2 || active[0].ID != unreported || active[1].ID != silent || active[0].Error != "boom" {
+		t.Errorf("active = %+v, want the two unreported failures (queued run %s excluded)", active, queued)
 	}
 }

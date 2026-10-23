@@ -80,6 +80,7 @@ stateDiagram-v2
     running --> reviewed: runner 提交结论
     reviewed --> done: 已投票；approvalMode = vote（默认），或结论不是 approve
     reviewed --> awaiting_approval: approvalMode = manual 且结论为 approve
+    reviewed --> failed: GitHub 拒绝投票（确定性错误）
     reviewed --> merging: approvalMode = auto 且结论为 approve
     awaiting_approval --> merging: 收到 /merge 评论或人工 approve
     merging --> done
@@ -122,12 +123,13 @@ controller 启动时执行嵌入的迁移（`schema_migration` 表记录已执�
 Pod (Job: review-<run-id>-<attempt>)
 ├── initContainer: fetch（alpine + git）
 │     env: GITHUB_TOKEN = 只读、1 小时有效、只能访问本仓库的 installation token
-│                         （来自 Secret review-<run-id>-<attempt>-github，归 Job 所有，随 Job 删除）
+│                         （来自 Secret review-<run-id>-<attempt>-credentials，归 Job 所有，随 Job 删除）
 │          REPO, PR_NUMBER, HEAD_SHA, WORKSPACE=/workspace
 │     作用: 克隆 head（往前 20 个提交）到 /workspace/repo、拉取 base、写出 /workspace/pr.json（元信息 + diff）
 │     token 经 git 的环境变量配置传入，不进 argv 和 .git/config；结束后随容器退出，主容器读不到
 ├── container: runner
-│     env: RUN_ID, CONTROLLER_URL, LLM_API_KEY（M1 为共享 Secret，M2 换成 LiteLLM 虚拟 key），RUN_TOKEN（M2）
+│     env: RUN_ID, CONTROLLER_URL, RUN_TOKEN（回调 controller 用，同一个 Secret 的另一个 key，fetch 读不到）,
+│          LLM_API_KEY（M1 为共享 Secret，M2 换成 LiteLLM 虚拟 key）
 │     volume: /workspace、/tmp (emptyDir)；根文件系统只读
 │     serviceAccount: 不挂载 token；预览阶段使用绑定到 PR namespace 的只读 SA
 └── NetworkPolicy: 出站只允许 LiteLLM proxy、controller、kube-apiserver（预览阶段）
@@ -145,7 +147,7 @@ Pod (Job: review-<run-id>-<attempt>)
 2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
 3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才加入 `bash`，其中的 `kubectl` 只能访问这个 namespace。
 4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。
-5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
+5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`，带 `Authorization: Bearer <RUN_TOKEN>`，controller 读本 run 的 Secret 比对，不符返回 401：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
 
 本地模式（`--pr <url>`）走同样的流程，只是第 1 步自己用 GitHub API 拉取 PR、部分克隆（`--filter=blob:none`，head 往前 20 个提交加 base 提交）到临时目录，最后把结果按 `--format markdown|json` 打印到 stdout，token 与金额打印到 stderr。
 
@@ -237,6 +239,7 @@ demo 不做合并加固，但"模型拿不到真实密钥"是本项目的目标�
 | 模型厂商真实 API key | LiteLLM proxy | 否。只有本次 run 的虚拟 key，带预算上限，run 结束即吊销 |
 | GitHub App 私钥 | controller | 否 |
 | GitHub 只读 installation token | fetch initContainer | 否。initContainer 退出后不可见 |
+| 回调 token（`RUN_TOKEN`） | controller、本 run 的 runner 主容器 | 是，只能为本 run 提交结果；没有它无法伪造结论让 bot 投 APPROVE |
 | GitHub 写操作（评论、approve、merge） | controller | 否。runner 只能提交结论 |
 | 集群访问 | 预览阶段的只读 SA | 只限 PR 自己的 namespace：pods、pods/log、events、deployments 的 get/list/watch |
 | 外网访问 | — | 否。NetworkPolicy 只放行 proxy、controller 和 apiserver |
@@ -433,7 +436,7 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 
 ## 10. 风险与待确认
 
-- **run 进行中的失败处理。** M1 没有重试：Job 失败、超时或 GitHub 返回确定性错误（401、403、404、422）时，run 直接置为 `failed` 并写到 Check Run。重试与 session 恢复在 M3。
+- **run 进行中的失败处理。** M1 没有重试：Job 失败、超时，或 GitHub 返回确定性错误（401、403（限流除外）、404、410、422）时，run 直接置为 `failed`；投票被拒也一样（`reviewed` → `failed`）。失败一律写到 Check Run，Check Run 还没创建时补建一个已失败的；连 Check Run 都写不进去时只记日志，不再重试。重试与 session 恢复在 M3。
 - **pi SDK 版本变动快。** 包名已从 `@mariozechner` 迁到 `@earendil-works`，初始化方式也从 `AuthStorage` 换成了 `ModelRuntime`，两周内从 1.1 发到 1.4。目前精确锁定 `1.3.0`，升级单独提交并跑一遍 M0 的验收。
 - **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，M2 时与 LiteLLM 的花费交叉校验。
 - **自定义模型接入。** DeepSeek 是 pi 内置 provider，指向 LiteLLM 只需覆盖 `baseUrl`；`deepseek-flash` 在 M0 的三个 PR 上都一次调用成功 `submit_review`。换用其他模型时要重新验证工具调用的稳定性。

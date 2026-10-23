@@ -26,6 +26,8 @@ func TestClient(t *testing.T) {
 		case "POST /api/v1/namespaces/ns/secrets":
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"message":"secrets \"s\" already exists"}`))
+		case "GET /api/v1/namespaces/ns/secrets/s":
+			_, _ = w.Write([]byte(`{"metadata":{"name":"s"},"data":{"RUN_TOKEN":"dG9r"}}`))
 		case "GET /apis/batch/v1/namespaces/ns/jobs/j":
 			_, _ = w.Write([]byte(`{"metadata":{"name":"j"},"spec":{"template":{"spec":{"containers":[]}}},
 				"status":{"failed":1,"conditions":[{"type":"Failed","status":"True","reason":"DeadlineExceeded"}]}}`))
@@ -66,8 +68,11 @@ func TestClient(t *testing.T) {
 	if _, err := c.GetJob(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetJob missing: %v", err)
 	}
-	if ok, err := c.SecretExists(ctx, "missing"); ok || err != nil {
-		t.Errorf("SecretExists missing = %v, %v", ok, err)
+	if _, err := c.GetSecret(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetSecret missing: %v", err)
+	}
+	if s, err := c.GetSecret(ctx, "s"); err != nil || string(s.Data["RUN_TOKEN"]) != "tok" {
+		t.Errorf("GetSecret = %+v, %v", s, err)
 	}
 	pods, err := c.ListPods(ctx, "job-name=j")
 	if err != nil || len(pods) != 1 || pods[0].Status.InitContainerStatuses[0].State.Terminated.Message != "boom" {

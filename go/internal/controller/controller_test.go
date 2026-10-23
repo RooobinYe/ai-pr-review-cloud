@@ -51,10 +51,19 @@ func (h *harness) state() store.Run {
 	return r
 }
 
-func (h *harness) post(res review.Result) int {
+// runToken is the callback token the controller gave the run's runner.
+func (h *harness) runToken() string {
+	return string(h.kube.secrets[runSecretName(h.state().JobName)].Data["RUN_TOKEN"])
+}
+
+func (h *harness) post(res review.Result) int { return h.postWithToken(res, h.runToken()) }
+
+func (h *harness) postWithToken(res review.Result, token string) int {
 	body, _ := json.Marshal(res)
+	req := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/result", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
-	h.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/result", bytes.NewReader(body)))
+	h.mux.ServeHTTP(rec, req)
 	return rec.Code
 }
 
@@ -98,9 +107,9 @@ func TestApproveFlow(t *testing.T) {
 	if !ok {
 		t.Fatal("job not created")
 	}
-	secret := h.kube.secrets[tokenSecretName(r.JobName)]
-	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
-		t.Errorf("token secret %+v", secret)
+	secret := h.kube.secrets[runSecretName(r.JobName)]
+	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || len(secret.StringData["RUN_TOKEN"]) != 64 || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
+		t.Errorf("run secret %+v", secret)
 	}
 
 	h.reconcile() // nothing new while the job runs
@@ -300,4 +309,48 @@ func (f failingGitHub) Client(int64) GitHubClient { return f }
 
 func (f failingGitHub) ListReviews(context.Context, string, int) ([]githubapp.Review, error) {
 	return nil, f.err
+}
+
+func TestResultNeedsRunToken(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	for _, token := range []string{"", "wrong"} {
+		if code := h.postWithToken(result(review.VerdictApprove), token); code != http.StatusUnauthorized {
+			t.Errorf("token %q: %d, want 401", token, code)
+		}
+	}
+	if h.state().State != run.StateRunning {
+		t.Error("unauthenticated result accepted")
+	}
+}
+
+func TestRefusedVoteFailsRun(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.post(result(review.VerdictApprove))
+	h.gh.refuse(&githubapp.APIError{Status: http.StatusForbidden, Message: "Resource not accessible by integration"})
+	h.reconcile()
+	if r := h.state(); r.State != run.StateFailed || !strings.Contains(r.Error, "403") {
+		t.Fatalf("run %+v, want failed", r)
+	}
+	if cr := h.gh.checkRuns[100]; cr[len(cr)-1].Conclusion != "failure" {
+		t.Errorf("check run %+v, want failure", cr[len(cr)-1])
+	}
+}
+
+func TestFailureBeforeCheckRunIsStillReported(t *testing.T) {
+	h := newHarness()
+	h.c.gh = failingGitHub{h.gh, &githubapp.APIError{Status: http.StatusForbidden, Message: "dismissal not allowed"}}
+	h.reconcile()
+	r := h.state()
+	if r.State != run.StateFailed {
+		t.Fatalf("run %+v, want failed", r)
+	}
+	cr := h.gh.checkRuns[100]
+	if len(cr) != 1 || cr[0].Name != CheckName || cr[0].HeadSHA != headSHA || cr[0].Conclusion != "failure" || !strings.Contains(cr[0].Output.Summary, "dismissal not allowed") {
+		t.Errorf("check run %+v", cr)
+	}
+	if !r.Done(store.ActionCheckRunComplete) {
+		t.Error("failure report not recorded")
+	}
 }

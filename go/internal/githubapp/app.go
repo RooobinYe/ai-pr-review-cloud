@@ -133,15 +133,20 @@ const tokenRefreshMargin = 5 * time.Minute
 func (a *App) Installation(installationID int64) *Client {
 	return &Client{BaseURL: a.BaseURL, HTTP: a.HTTP, Token: func(ctx context.Context) (string, error) {
 		a.mu.Lock()
-		defer a.mu.Unlock()
-		if t, ok := a.tokens[installationID]; ok && a.now().Add(tokenRefreshMargin).Before(t.ExpiresAt) {
+		t, ok := a.tokens[installationID]
+		a.mu.Unlock()
+		if ok && a.now().Add(tokenRefreshMargin).Before(t.ExpiresAt) {
 			return t.Token, nil
 		}
+		// Minted outside the lock: concurrent callers may mint twice, which is
+		// harmless, rather than stall every installation on one request.
 		t, err := a.InstallationToken(ctx, installationID, nil)
 		if err != nil {
 			return "", err
 		}
+		a.mu.Lock()
 		a.tokens[installationID] = t
+		a.mu.Unlock()
 		return t.Token, nil
 	}}
 }

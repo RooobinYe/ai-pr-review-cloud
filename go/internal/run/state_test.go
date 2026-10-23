@@ -11,6 +11,7 @@ func TestCanTransition(t *testing.T) {
 		{StateRunning, StateQueued, true}, // pod failure retried
 		{StateRunning, StateReviewed, true},
 		{StateReviewed, StateMerging, true},
+		{StateReviewed, StateFailed, true}, // GitHub refused the vote
 		{StateAwaitingApproval, StateMerging, true},
 		{StateQueued, StateMerging, false},
 		{StateReviewed, StateSuperseded, false}, // result already posted for this SHA

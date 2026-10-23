@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -36,13 +38,41 @@ type JobConfig struct {
 	Resources             kube.Resources
 }
 
+// ParseResources decodes the runner's resources from JSON such as Helm's
+// toJson output. Quantities may be strings ("250m") or numbers (1).
+func ParseResources(s string) (kube.Resources, error) {
+	var res kube.Resources
+	if s == "" {
+		return res, nil
+	}
+	var raw map[string]map[string]any
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber() // keeps 1000000000 from turning into 1e+09
+	if err := dec.Decode(&raw); err != nil {
+		return res, fmt.Errorf("runner resources: %w", err)
+	}
+	quantities := func(m map[string]any) map[string]string {
+		if m == nil {
+			return nil
+		}
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			out[k] = fmt.Sprint(v)
+		}
+		return out
+	}
+	res.Requests, res.Limits = quantities(raw["requests"]), quantities(raw["limits"])
+	return res, nil
+}
+
 // JobName names the Job for one attempt of a run.
 func JobName(runID string, attempt int) string {
 	return fmt.Sprintf("review-%s-%d", runID, attempt)
 }
 
-// tokenSecretName names the per-run Secret holding fetch's GitHub token.
-func tokenSecretName(jobName string) string { return jobName + "-github" }
+// runSecretName names the per-run Secret holding fetch's GitHub token and the
+// runner's callback token.
+func runSecretName(jobName string) string { return jobName + "-credentials" }
 
 // BuildJob renders the runner Job for a run (docs/architecture.md §4.1): the
 // fetch init container clones the PR with a read-only token, then the runner
@@ -62,6 +92,7 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 		{Name: "WORKSPACE", Value: "/workspace"},
 		{Name: "REVIEW_LANGUAGE", Value: cfg.Language},
 		{Name: "HOME", Value: "/tmp"},
+		{Name: "RUN_TOKEN", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: runSecretName(r.JobName), Key: "RUN_TOKEN"}}},
 		{Name: "LLM_API_KEY", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: cfg.LLMSecret, Key: "LLM_API_KEY"}}},
 	}
 	for _, name := range []string{"LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "LLM_THINKING"} {
@@ -82,6 +113,8 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 				Spec: kube.PodSpec{
 					RestartPolicy:                "Never",
 					AutomountServiceAccountToken: kube.Ptr(false),
+					// The runner only needs CONTROLLER_URL, not every Service in the namespace.
+					EnableServiceLinks: kube.Ptr(false),
 					SecurityContext: &kube.PodSecurityContext{
 						RunAsNonRoot:   kube.Ptr(true),
 						RunAsUser:      kube.Ptr(int64(runnerUID)),
@@ -94,7 +127,7 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 						Image:           cfg.FetchImage,
 						ImagePullPolicy: cfg.ImagePullPolicy,
 						Env: []kube.EnvVar{
-							{Name: "GITHUB_TOKEN", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: tokenSecretName(r.JobName), Key: "GITHUB_TOKEN"}}},
+							{Name: "GITHUB_TOKEN", ValueFrom: &kube.EnvVarSource{SecretKeyRef: &kube.SecretKeySelector{Name: runSecretName(r.JobName), Key: "GITHUB_TOKEN"}}},
 							{Name: "REPO", Value: r.Repo},
 							{Name: "PR_NUMBER", Value: strconv.Itoa(r.PRNumber)},
 							{Name: "HEAD_SHA", Value: r.HeadSHA},
@@ -125,17 +158,18 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 	}
 }
 
-// BuildTokenSecret holds fetch's GitHub token. It is owned by the Job, so
-// Kubernetes deletes it together with the Job.
-func BuildTokenSecret(job kube.Job, token string) kube.Secret {
+// BuildRunSecret holds fetch's GitHub token and the runner's callback token,
+// each exposed to one container only. It is owned by the Job, so Kubernetes
+// deletes it together with the Job.
+func BuildRunSecret(job kube.Job, githubToken, runToken string) kube.Secret {
 	return kube.Secret{
 		Metadata: kube.ObjectMeta{
-			Name:            tokenSecretName(job.Metadata.Name),
+			Name:            runSecretName(job.Metadata.Name),
 			Labels:          job.Metadata.Labels,
 			OwnerReferences: []kube.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: job.Metadata.Name, UID: job.Metadata.UID}},
 		},
 		Type:       "Opaque",
-		StringData: map[string]string{"GITHUB_TOKEN": token},
+		StringData: map[string]string{"GITHUB_TOKEN": githubToken, "RUN_TOKEN": runToken},
 	}
 }
 

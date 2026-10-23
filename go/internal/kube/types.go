@@ -73,6 +73,7 @@ type PodTemplateSpec struct {
 type PodSpec struct {
 	RestartPolicy                string              `json:"restartPolicy,omitempty"`
 	AutomountServiceAccountToken *bool               `json:"automountServiceAccountToken,omitempty"`
+	EnableServiceLinks           *bool               `json:"enableServiceLinks,omitempty"`
 	SecurityContext              *PodSecurityContext `json:"securityContext,omitempty"`
 	InitContainers               []Container         `json:"initContainers,omitempty"`
 	Containers                   []Container         `json:"containers"`
@@ -153,6 +154,8 @@ type Secret struct {
 	Metadata   ObjectMeta        `json:"metadata"`
 	Type       string            `json:"type,omitempty"`
 	StringData map[string]string `json:"stringData,omitempty"`
+	// Data is what the API server returns; encoding/json decodes its base64.
+	Data map[string][]byte `json:"data,omitempty"`
 }
 
 type Pod struct {

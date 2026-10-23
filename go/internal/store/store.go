@@ -97,9 +97,12 @@ func (s *Store) Close() { s.pool.Close() }
 // Ping checks that the database is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// migrationLock is an arbitrary advisory lock key that serializes Migrate
-// across controller replicas.
-const migrationLock = 0x61707263
+// Arbitrary advisory lock keys that serialize Migrate and Claim across
+// controller replicas.
+const (
+	migrationLock = 0x61707263
+	claimLock     = 0x61707264
+)
 
 // Migrate applies every migration not applied yet, each in its own transaction.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -218,10 +221,13 @@ func (s *Store) Get(ctx context.Context, id string) (Run, error) {
 
 // Claim moves the oldest queued runs to running, keeping at most maxRunning
 // runs in flight. jobName names the Job for a run's attempt. Concurrent callers
-// never claim the same run.
+// are serialized, so they neither claim the same run nor exceed maxRunning.
 func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id string, attempt int) string) ([]Run, error) {
 	var claimed []Run
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", claimLock); err != nil {
+			return err
+		}
 		var inFlight int
 		if err := tx.QueryRow(ctx, "SELECT count(*) FROM review_run WHERE state IN ('running', 'previewing')").Scan(&inFlight); err != nil {
 			return err
@@ -256,12 +262,11 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 }
 
 // Active returns the runs the controller still has to act on: running and
-// reviewed runs, and failed runs whose Check Run was opened but not completed.
+// reviewed runs, and failed runs whose failure is not on a Check Run yet.
 func (s *Store) Active(ctx context.Context) ([]Run, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+runColumns+` FROM review_run r
 		WHERE r.state IN ('running', 'reviewed')
 		   OR (r.state = 'failed'
-		       AND EXISTS (SELECT 1 FROM github_action a WHERE a.run_id = r.id AND a.kind = 'check_run_create' AND a.external_id IS NOT NULL)
 		       AND NOT EXISTS (SELECT 1 FROM github_action a WHERE a.run_id = r.id AND a.kind = 'check_run_complete' AND a.external_id IS NOT NULL))
 		ORDER BY r.created_at`)
 	if err != nil {

@@ -6,6 +6,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -52,7 +54,7 @@ type Kube interface {
 	CreateJob(ctx context.Context, job kube.Job) (kube.Job, error)
 	GetJob(ctx context.Context, name string) (kube.Job, error)
 	CreateSecret(ctx context.Context, s kube.Secret) error
-	SecretExists(ctx context.Context, name string) (bool, error)
+	GetSecret(ctx context.Context, name string) (kube.Secret, error)
 	ListPods(ctx context.Context, selector string) ([]kube.Pod, error)
 }
 
@@ -132,17 +134,26 @@ func (c *Controller) runLog(r store.Run) *slog.Logger {
 
 func (c *Controller) advance(ctx context.Context, r store.Run) error {
 	switch r.State {
-	case run.StateRunning:
-		err := c.advanceRunning(ctx, r)
+	case run.StateRunning, run.StateReviewed:
+		step := c.advanceRunning
+		if r.State == run.StateReviewed {
+			step = c.publish
+		}
+		err := step(ctx, r)
 		if permanent(err) {
-			// Retrying cannot help, and the run would hold a running slot forever.
-			return c.fail(ctx, c.gh.Client(r.InstallationID), r, err.Error())
+			// Retrying cannot help; the run would be retried forever and a
+			// running one would hold its slot.
+			return c.fail(ctx, r, r.State, err.Error())
 		}
 		return err
-	case run.StateReviewed:
-		return c.publish(ctx, r)
 	case run.StateFailed:
-		return c.reportFailure(ctx, c.gh.Client(r.InstallationID), r)
+		err := c.reportFailure(ctx, r)
+		if permanent(err) {
+			// There is nowhere left to report the failure; stop trying.
+			c.runLog(r).Warn("cannot report failure on GitHub", "err", err)
+			return c.store.RecordAction(ctx, r.ID, store.ActionCheckRunComplete, "unreported")
+		}
+		return err
 	}
 	return nil
 }
@@ -202,7 +213,7 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		return err
 	}
 	if _, failed := job.Status.Condition(kube.JobFailed); failed {
-		return c.fail(ctx, gh, r, c.jobFailure(ctx, job))
+		return c.fail(ctx, r, run.StateRunning, c.jobFailure(ctx, job))
 	}
 	if _, complete := job.Status.Condition(kube.JobComplete); complete {
 		// A result moves the run to reviewed before the runner exits. Re-read
@@ -210,13 +221,13 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		if cur, err := c.store.Get(ctx, r.ID); err != nil || cur.State != run.StateRunning {
 			return err
 		}
-		return c.fail(ctx, gh, r, "runner exited without submitting a review")
+		return c.fail(ctx, r, run.StateRunning, "runner exited without submitting a review")
 	}
 	// The controller may have stopped between creating the Job and its Secret.
-	if ok, err := c.kube.SecretExists(ctx, tokenSecretName(r.JobName)); err != nil || ok {
+	if _, err := c.kube.GetSecret(ctx, runSecretName(r.JobName)); !errors.Is(err, kube.ErrNotFound) {
 		return err
 	}
-	return c.createTokenSecret(ctx, r, job)
+	return c.createRunSecret(ctx, r, job)
 }
 
 func (c *Controller) startJob(ctx context.Context, r store.Run) error {
@@ -228,19 +239,24 @@ func (c *Controller) startJob(ctx context.Context, r store.Run) error {
 		return fmt.Errorf("create job: %w", err)
 	}
 	c.runLog(r).Info("created job", "job", r.JobName)
-	return c.createTokenSecret(ctx, r, job)
+	return c.createRunSecret(ctx, r, job)
 }
 
-// createTokenSecret mints fetch's read-only token. The Secret is created after
-// the Job so it can be owned by it; the init container waits until it exists.
-func (c *Controller) createTokenSecret(ctx context.Context, r store.Run, job kube.Job) error {
-	token, err := c.gh.FetchToken(ctx, r.InstallationID, r.Repo)
+// createRunSecret mints fetch's read-only GitHub token and the runner's
+// callback token. The Secret is created after the Job so it can be owned by
+// it; the Pod's containers wait until it exists.
+func (c *Controller) createRunSecret(ctx context.Context, r store.Run, job kube.Job) error {
+	githubToken, err := c.gh.FetchToken(ctx, r.InstallationID, r.Repo)
 	if err != nil {
 		return fmt.Errorf("mint fetch token: %w", err)
 	}
-	err = c.kube.CreateSecret(ctx, BuildTokenSecret(job, token))
+	runToken := make([]byte, 32)
+	if _, err := rand.Read(runToken); err != nil {
+		return err
+	}
+	err = c.kube.CreateSecret(ctx, BuildRunSecret(job, githubToken, hex.EncodeToString(runToken)))
 	if err != nil && !errors.Is(err, kube.ErrAlreadyExists) {
-		return fmt.Errorf("create token secret: %w", err)
+		return fmt.Errorf("create run secret: %w", err)
 	}
 	return nil
 }
@@ -259,30 +275,35 @@ func (c *Controller) jobFailure(ctx context.Context, job kube.Job) string {
 	return fmt.Sprintf("runner job failed: %s %s", cond.Reason, cond.Message)
 }
 
-func (c *Controller) fail(ctx context.Context, gh GitHubClient, r store.Run, reason string) error {
-	err := c.store.Transition(ctx, r.ID, run.StateRunning, run.StateFailed, reason)
+func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reason string) error {
+	err := c.store.Transition(ctx, r.ID, from, run.StateFailed, reason)
 	if errors.Is(err, store.ErrConflict) {
-		return nil // a result arrived meanwhile
+		return nil // the run moved on meanwhile, e.g. a result arrived
 	}
 	if err != nil {
 		return err
 	}
 	r.State, r.Error = run.StateFailed, reason
 	c.runLog(r).Warn("run failed", "reason", reason)
-	return c.reportFailure(ctx, gh, r)
+	return c.reportFailure(ctx, r)
 }
 
-func (c *Controller) reportFailure(ctx context.Context, gh GitHubClient, r store.Run) error {
-	checkRunID, opened := r.Actions[store.ActionCheckRunCreate]
-	if !opened {
-		return nil
-	}
+// reportFailure completes the run's Check Run as failed, creating one if the
+// run failed before opening it, so every failure is visible on the PR.
+func (c *Controller) reportFailure(ctx context.Context, r store.Run) error {
+	gh := c.gh.Client(r.InstallationID)
 	return c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
-		id, err := strconv.ParseInt(checkRunID, 10, 64)
-		if err != nil {
-			return "", err
+		if checkRunID, opened := r.Actions[store.ActionCheckRunCreate]; opened {
+			id, err := strconv.ParseInt(checkRunID, 10, 64)
+			if err != nil {
+				return "", err
+			}
+			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, FailedCheckRun(r.Error))
 		}
-		return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, FailedCheckRun(r.Error))
+		cr := FailedCheckRun(r.Error)
+		cr.Name, cr.HeadSHA, cr.ExternalID = CheckName, r.HeadSHA, r.ID
+		id, err := gh.CreateCheckRun(ctx, r.Repo, cr)
+		return strconv.FormatInt(id, 10), err
 	})
 }
 
