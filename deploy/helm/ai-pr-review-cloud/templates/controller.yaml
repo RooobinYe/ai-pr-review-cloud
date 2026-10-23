@@ -47,7 +47,7 @@ metadata:
 spec:
   replicas: {{ .Values.controller.replicas }}
   {{- if .Values.preview.enabled }}
-  strategy: { type: Recreate }
+  strategy: { type: Recreate, rollingUpdate: null }
   {{- end }}
   selector:
     matchLabels: {{- include "aprc.selector" $sel | nindent 6 }}
