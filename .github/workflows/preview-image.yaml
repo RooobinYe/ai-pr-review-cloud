@@ -15,17 +15,21 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Build without registry credentials
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          docker build -t ghcr.io/rooobinye/ai-pr-review-cloud-preview:"$HEAD_SHA" demo/preview
-      - name: Publish exact head image
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Authenticate registry client
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker push ghcr.io/rooobinye/ai-pr-review-cloud-preview:"$HEAD_SHA"
-          docker logout ghcr.io
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # Registry auth is used by the client for pushing, never passed as a
+      # build argument, build secret, or file in the PR's build context.
+      - uses: docker/build-push-action@v6
+        with:
+          context: demo/preview
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/rooobinye/ai-pr-review-cloud-preview:${{ github.event.pull_request.head.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+      - name: Remove registry login
+        if: always()
+        run: docker logout ghcr.io
