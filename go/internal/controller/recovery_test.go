@@ -169,7 +169,7 @@ func TestStuckAttemptTimesOut(t *testing.T) {
 func TestRestartAfterVoteBeforeRecordDoesNotVoteTwice(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
-	h.post(result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"}))
+	h.post(result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityLow, Confidence: review.ConfidenceHigh, Body: "minor"}))
 	h.store.crashOn = store.ActionReview
 	h.reconcile()
 	if len(h.gh.posted) != 1 || h.state().Done(store.ActionReview) {

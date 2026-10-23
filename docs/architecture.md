@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：M1、M2、M3、M5、M6 完成，最小闭环与删除 Pod 后恢复完成均在本仓库的 PR 上实测通过，成本测算见 [cost-report](cost-report.md)；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M1、M2、M3、M4、M5、M6 完成，最小闭环与删除 Pod 后恢复完成均在本仓库的 PR 上实测通过，成本测算见 [cost-report](cost-report.md)；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -54,7 +54,7 @@ flowchart LR
 
 | 组件 | 语言 | 职责 | 不做什么 |
 | --- | --- | --- | --- |
-| `gateway` | Go | 校验 webhook 签名，按 delivery ID 去重，写入一条 run 记录，立即返回 202 | 不调 GitHub，不建 Job |
+| `gateway` | Go | 校验 webhook 签名，按 delivery ID 去重，记录评审触发或人工合并确认，立即返回 202 | 不调 GitHub，不建 Job |
 | `controller` | Go | 驱动 run 状态机：排队、建 Job、建预览环境、接收结果、执行所有 GitHub 写操作、超时与重试 | 不调用模型 |
 | `fetch` | Go | runner Pod 的 init 容器：用只读 installation token 拉取代码和 PR 元信息，写入共享卷后退出 | 不在主容器里留下任何凭据 |
 | `runner` | TypeScript（pi SDK） | 每个 run 一个 Job：探索代码、可选的 kubectl 验证、通过 `submit_review` 工具提交结构化结论 | 不持有 GitHub 凭据，不直接写 GitHub |
@@ -82,7 +82,8 @@ stateDiagram-v2
     reviewed --> awaiting_approval: approvalMode = manual 且结论为 approve
     reviewed --> failed: GitHub 拒绝投票（确定性错误）
     reviewed --> merging: approvalMode = auto 且结论为 approve
-    awaiting_approval --> merging: 收到 /merge 评论或人工 approve
+    awaiting_approval --> merging: 收到有写权限的人的 /merge 评论或当前提交的 approve
+    awaiting_approval --> failed: GitHub 返回确定性错误
     merging --> done
     merging --> failed: 合并被 GitHub 拒绝
     running --> queued: Pod 失败且未超过重试次数
@@ -92,7 +93,7 @@ stateDiagram-v2
     queued --> superseded: 新的 head_sha 到达
     running --> superseded
     previewing --> superseded
-    awaiting_approval --> superseded
+    awaiting_approval --> superseded: 新提交或 PR 已关闭
     done --> [*]
     failed --> [*]
     superseded --> [*]
@@ -108,9 +109,12 @@ stateDiagram-v2
 | --- | --- | --- |
 | `review_run` | 一次评审，状态机的载体；记录 `installation_id`（controller 换 token 用）、当前尝试的序号 `attempt` 与领取时间 `claimed_at`（单次尝试的时限从这里算），以及失败原因 `error`（写到 Check Run；重试时记录上一次尝试的失败原因） | `UNIQUE (repo, pr_number, head_sha)`；`state`、`verdict` 用 CHECK 限定取值；处于 `reviewed`、`awaiting_approval`、`merging`、`done` 时 `verdict` 必须非空；活跃 run 有部分索引供 controller 扫描 |
 | `webhook_delivery` | 已记录的 webhook delivery ID，GitHub 重投时去重 | 主键 `delivery_id` |
-| `github_action` | 每个 GitHub 写操作一行：`dismiss_stale_approvals`（撤销旧票）、`check_run_create`、`check_run_complete`、`review`（投票，§6.3）、`merge`（M4） | 主键 `(run_id, kind)`；`external_id` 非空表示已完成；取值在 `go/internal/store/store.go` 里也有一份 |
+| `github_action` | 每个 GitHub 写操作一行：`dismiss_stale_approvals`（撤销旧票）、`check_run_create`、`check_run_complete`、`review`（投票，§6.3）、`merge` | 主键 `(run_id, kind)`；`external_id` 非空表示已完成；取值在 `go/internal/store/store.go` 里也有一份 |
+| `merge_signal` | gateway 记录的人工确认，绑定当前已产出结论的 manual run；controller 核对权限后消费 | 主键 `delivery_id`，引用 `webhook_delivery`；不跨 run 复用，拒绝的确认标记 `handled` |
 | `run_session` | runner 每轮结束上传的 pi session 快照（JSONL），用于崩溃恢复 | 每个 run 只保留一份；轮次更早的上传被忽略，迟到的请求不会把快照回退；只在 `running` 时接受 |
 | `run_usage` | 每轮的模型、输入、输出、缓存读写 token 和金额 | 主键 `(run_id, turn)`，重复上报覆盖而不是累加；任何状态都接受，花掉的钱照记 |
+
+`review_run.repo_config` 和 `config_sha` 保存 controller 第一次领取后读取的仓库配置及目标分支提交；配置保存和 `budget_usd` 更新在同一条 SQL 中完成，首次写入后不再覆盖。升级前已经进入 `reviewed` 且无配置快照的 run 仍按 `vote` 完成。
 
 `review_run` 还记录各阶段的时间戳（`started_at`、`fetch_started_at`、`fetch_finished_at`、`reviewed_at`、`finished_at`，见 `0002_metrics.sql`），供 §7.1 的阶段耗时使用。
 
@@ -294,7 +298,7 @@ LiteLLM 自己的入站也用 NetworkPolicy 限定为 runner 和 controller。
 - 冷启动优化：runner 镜像预装 pi 依赖和 git（M5 再加 kubectl）；fetch 阶段浅克隆（depth 1 + 按需拉 base）。实测后再决定要不要加 git mirror 缓存。
 - 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 GitHub token 和代理凭据、runner 的回调 token 和虚拟 key）。开启 M5 预览时，另外启用 §6.2 的 ClusterRole，授予动态 namespace 及明确列出的预览资源权限。
 - Kubernetes 访问：controller 只用到 Job、Secret、Pod 的少数几个调用，`go/internal/kube` 直接调 REST API（in-cluster token 每次请求重读），不引入 client-go，controller 镜像保持在十几 MB。M5 需要部署 Helm chart 时再评估。
-- 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run、推进到 `done`；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。
+- 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run，并按仓库策略推进到 `done`、`awaiting_approval` 或 `merging`；等待人工确认时回收 runner Job 和虚拟 key，确认权限及当前 head 后才合并；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。
 - 同一 PR 的新提交到达后，旧 run 只要还没到 `reviewed`（`queued`、`running`、`previewing`、`awaiting_approval`）就被取代，它的 Job 连同 Pod 和 Secret 一起删除（`propagationPolicy: Background`），之后再到的结果、快照都被拒绝。已经 `reviewed` 的 run 让它投完：投票前会检查 head（§6.3）。
 
 ### 6.2 预览环境
@@ -333,15 +337,24 @@ AI 的身份是 GitHub App bot（如 `ai-pr-review[bot]`）。每个 run 结束�
 是否合并只在一个函数里决定：
 
 ```go
-// decideMerge 是唯一决定是否合并的地方。默认的 vote 模式从不合并，
-// 合并交给仓库的 branch protection 和人。auto 模式只看 AI 结论；
-// 生产环境在这里加确定性规则（作者白名单、路径、改动行数、CI 状态）。
-func decideMerge(run ReviewRun, cfg RepoConfig) bool {
-	return cfg.ApprovalMode == ApprovalAuto && run.Verdict == VerdictApprove
+// decideMerge 是 auto 和 manual 共用的唯一合并决策。
+// confirmed 表示 controller 已核实当前 run 的人工确认。
+func decideMerge(r store.Run, confirmed bool) bool {
+    if r.Config == nil || r.Verdict != review.VerdictApprove {
+        return false
+    }
+    return r.Config.ApprovalMode == repoconfig.Auto ||
+        (r.Config.ApprovalMode == repoconfig.Manual && confirmed)
 }
 ```
 
-合并调用 GitHub 的 merge API，仍受仓库 branch protection 约束。
+合并调用 GitHub 的 [merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)，使用 squash，并携带已评审的 `head_sha`。仓库需要允许 squash；branch protection 仍由 GitHub 执行。合并前再次读取 PR：提交变了或 PR 关闭则不调用合并；GitHub 返回 405、409、422 等确定性拒绝时 run 进入 `failed`，Check Run 改为 failure；限流、网络或 5xx 错误保留 `merging`，下一轮重试。若合并成功但记录前崩溃，重启后根据相同 head 的 `merged` 与 `merge_commit_sha` 补记 `github_action.merge`，不重复合并。
+
+**manual 的人工确认。** gateway 仅接受 PR 上新建、去掉首尾空白后恰好等于 `/merge` 的评论，或新提交的 APPROVED review；忽略编辑事件、普通 issue、bot 和非审批 review。确认人的身份与时间来自签名 webhook。事件绑定到接收时已经 `reviewed` 或 `awaiting_approval` 的 manual run，且结论为 approve；review 必须匹配 head，事件创建时间不得早于本次评审完成（按 GitHub 时间戳的秒精度比较）。允许 `reviewed` 是为了覆盖“投票刚发布，人已确认，controller 尚未更新状态”的窗口。提前确认、旧事件或重复投递不会授权后续 run。
+
+controller 查询确认人当前的仓库权限，只允许 write、maintain、admin；若是 review，还重新检查它尚未被撤销且对应当前 head。通过后进入 `merging`。没有确认时只保留数据库状态；等待前撤销虚拟 key、删除 runner Job 及所属 Secret/Pod，Kubernetes 的后台 GC 可能短暂保留 Terminating Pod。controller 重启不会重建等待中的 runner。新提交或 PR 关闭会使等待失效。
+
+投票后 Check Run 先显示评审结果，让 GitHub 合并规则可以检查它；之后若合并失败或等待被取消，store 在状态变更事务中清除 `check_run_complete` 的完成标记，让 controller 可恢复地发布最终失败或取消结果。
 
 ### 6.4 GitHub App
 
@@ -351,7 +364,7 @@ func decideMerge(run ReviewRun, cfg RepoConfig) bool {
 | 权限 | Pull requests: write（投票、撤销旧票）、Contents: write（见下）、Checks: write、Metadata: read |
 | 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review，正文为结论的 `body`，逐行评论来自 `comments` 的 `path`、`line`；review 事件按 `verdict` 取 APPROVE 或 COMMENT（§6.3） |
 
-gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；`closed`、`issue_comment`、`pull_request_review` 在 M4、M5 接入。
+gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；M4 已接入 `issue_comment.created` 的 `/merge` 和 `pull_request_review.submitted` 的人工 approve，gateway 只记录确认；`closed` webhook 与 `/review` 命令尚未接入。等待合并期间由 controller 查询 PR 状态处理关闭。
 
 GitHub 只投递一次 webhook，失败不会自动重试，所以有两道保护。一是 gateway 的就绪检查（`/readyz`）确认最新的迁移已执行，数据库还没就绪时不接流量。二是 controller 每 5 分钟（`REDELIVER_INTERVAL`）用 App JWT 列出最近 100 次投递（`GET /app/hook/deliveries`），按 GUID 分组：24 小时内、每次尝试都没拿到 2xx、尝试不满 5 次的，重投最新那次（`POST /app/hook/deliveries/{id}/attempts`）。gateway 按 delivery ID 去重，重投与迟到的成功撞在一起也安全。这一步不依赖 controller 自己的状态，重启后照常工作。
 
@@ -376,7 +389,9 @@ preview:
   readyTimeout: 5m
 ```
 
-没有配置文件或省略某项时取默认值，`approvalMode` 默认为 `vote`。
+controller 在创建 runner Job 前，从 PR **目标分支的 base SHA** 读取根目录 `.ai-pr-review.yaml`，将解析结果与 SHA 一起保存到 run；重试与恢复复用快照。PR 中修改配置不会改变自身的合并模式，新配置合入目标分支后才对新 run 生效。
+
+没有配置文件或省略字段时，`approvalMode` 默认 `vote`，`failOn` 默认 `high`，预算和语言沿用部署默认值（语言为空时用 `zh`）。模式只接受 `vote`、`auto`、`manual`，阈值接受 `critical`、`high`、`medium`、`low`，预算必须是有限非负数；零预算会在发放虚拟 key 时结束为预算耗尽。配置最多 64 KiB，未知字段、重复字段、多 YAML 文档和非法值使 run 失败并报告 Check Run，不启动 runner。`preview` 字段在策略快照中保留解析兼容。M5 的部署参数和 chart 来自被评审的 head，由 runner 打包后交给 controller 校验；可信镜像仓库映射和集群开关由操作者设置。它们不会改变 base SHA 决定的合并策略。
 
 `failOn` 在 controller 里对 `result.comments` 做确定性校验：模型给了 approve 但存在 `severity` 达到阈值的评论时，结论改写为 request_changes，即只发 COMMENT、不投 APPROVE。这是把原 CLI 的 `--fail-on` 门禁搬到服务端，作为模型判断之外的一道确定性兜底。
 

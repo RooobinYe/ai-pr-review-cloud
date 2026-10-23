@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,35 @@ func TestTriggerFromEvent(t *testing.T) {
 			}
 			if ok != tt.wantOK || got != tt.want {
 				t.Fatalf("got (%+v, %v), want (%+v, %v)", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestApprovalFromEvent(t *testing.T) {
+	const comment = `{"action":"created","repository":{"full_name":"o/r"},"installation":{"id":42},"issue":{"number":7,"pull_request":{}},"comment":{"body":"/merge","user":{"login":"human","type":"User"},"created_at":"2026-10-24T00:00:00Z"}}`
+	const approval = `{"action":"submitted","repository":{"full_name":"o/r"},"installation":{"id":42},"pull_request":{"number":7},"review":{"id":123,"state":"approved","commit_id":"2222222222222222222222222222222222222222","user":{"login":"human","type":"User"},"submitted_at":"2026-10-24T00:00:00Z"}}`
+	for _, tt := range []struct {
+		name, event, body string
+		ok, bad           bool
+	}{
+		{"comment", "issue_comment", comment, true, false}, {"review", "pull_request_review", approval, true, false},
+		{"edited", "issue_comment", strings.Replace(comment, "created", "edited", 1), false, false},
+		{"bot", "issue_comment", strings.Replace(comment, "User", "Bot", 1), false, false},
+		{"ordinary issue", "issue_comment", strings.Replace(comment, `,"pull_request":{}`, "", 1), false, false},
+		{"quoted command", "issue_comment", strings.Replace(comment, "/merge", "> /merge", 1), false, false},
+		{"arguments", "issue_comment", strings.Replace(comment, "/merge", "/merge now", 1), false, false},
+		{"non approval", "pull_request_review", strings.Replace(approval, "approved", "commented", 1), false, false},
+		{"missing timestamp", "issue_comment", strings.Replace(comment, "2026-10-24T00:00:00Z", "", 1), false, true},
+		{"invalid json", "issue_comment", "{", false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a, ok, err := ApprovalFromEvent(tt.event, []byte(tt.body))
+			if ok != tt.ok || (err != nil) != tt.bad {
+				t.Fatalf("%+v ok %v err %v", a, ok, err)
+			}
+			if ok && (a.Actor != "human" || a.PRNumber != 7 || a.InstallationID != 42) {
+				t.Fatal(a)
 			}
 		})
 	}

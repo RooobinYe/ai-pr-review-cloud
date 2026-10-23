@@ -16,6 +16,7 @@ import (
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/repoconfig"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
@@ -23,6 +24,9 @@ import (
 
 // Store is the subset of *store.Store the controller uses.
 type Store interface {
+	SaveConfig(context.Context, string, string, repoconfig.Config) error
+	MergeSignals(context.Context, string) ([]store.MergeSignal, error)
+	IgnoreMergeSignal(context.Context, string) error
 	Claim(ctx context.Context, maxRunning int, jobName func(id string, attempt int) string) ([]store.Run, error)
 	Supersede(ctx context.Context) ([]string, error)
 	Active(ctx context.Context) ([]store.Run, error)
@@ -40,6 +44,10 @@ type Store interface {
 
 // GitHubClient is the subset of *githubapp.Client the controller uses.
 type GitHubClient interface {
+	RepositoryConfig(context.Context, string, string) ([]byte, error)
+	CanWrite(context.Context, string, string) (bool, error)
+	GetReview(context.Context, string, int, int64) (githubapp.Review, error)
+	MergePull(context.Context, string, int, string) (string, error)
 	GetPull(ctx context.Context, repo string, number int) (githubapp.Pull, error)
 	ListReviews(ctx context.Context, repo string, number int) ([]githubapp.Review, error)
 	DismissReview(ctx context.Context, repo string, number int, reviewID int64, message string) error
@@ -173,10 +181,16 @@ func (c *Controller) runLog(r store.Run) *slog.Logger {
 
 func (c *Controller) advance(ctx context.Context, r store.Run) error {
 	switch r.State {
-	case run.StateRunning, run.StatePreviewing, run.StateReviewed:
+	case run.StateRunning, run.StatePreviewing, run.StateReviewed, run.StateAwaitingApproval, run.StateMerging:
 		step := c.advanceRunning
 		if r.State == run.StateReviewed {
 			step = c.publish
+		}
+		if r.State == run.StateAwaitingApproval {
+			step = c.awaitApproval
+		}
+		if r.State == run.StateMerging {
+			step = c.merge
 		}
 		err := step(ctx, r)
 		if permanent(err) || errors.Is(err, errBudgetExceeded) {
@@ -258,6 +272,13 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		return strconv.FormatInt(id, 10), err
 	})
 	if err != nil {
+		return err
+	}
+
+	// Revoke old approvals before validating configuration: even a malformed
+	// policy must not leave an earlier commit's approval counting for new code.
+	r, err = c.loadConfig(ctx, r)
+	if err != nil || (r.State != run.StateRunning && r.State != run.StatePreviewing) {
 		return err
 	}
 
@@ -406,6 +427,7 @@ func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reas
 		return err
 	}
 	r.State, r.Error = run.StateFailed, reason
+	delete(r.Actions, store.ActionCheckRunComplete)
 	c.runLog(r).Warn("run failed", "reason", reason)
 	return c.reportFailure(ctx, r)
 }
@@ -466,6 +488,9 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 		return errors.New("reviewed run has no result")
 	}
 	res := *r.Result
+	if r.Config != nil && r.Config.ApprovalMode == repoconfig.Manual && r.Verdict == review.VerdictApprove {
+		res.Body += "\n\nManual merge: after this review is published, a repository writer can comment `/merge` or submit an approving review to ask AI Review to merge this commit."
+	}
 	// The runner has nothing left to ask the model.
 	c.revokeKey(ctx, r)
 	if !r.FetchTimed {
@@ -512,13 +537,7 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 			return err
 		}
 	}
-	// vote is the only approval mode until M4 adds auto and manual (§6.3):
-	// the run ends once the vote is cast.
-	if err := c.store.Transition(ctx, r.ID, run.StateReviewed, run.StateDone, ""); err != nil && !errors.Is(err, store.ErrConflict) {
-		return err
-	}
-	c.runLog(r).Info("run done", "verdict", res.Verdict)
-	return nil
+	return c.afterReview(ctx, r)
 }
 
 // recordFetchTiming copies when fetch ran from the runner Pod into the run, for
