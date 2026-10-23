@@ -15,6 +15,9 @@ COPY --from=build /out/app /app
 USER 1000:1000
 ENTRYPOINT ["/app"]
 
+FROM alpine/helm:3.17.3 AS helm
+
 FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=helm /usr/bin/helm /usr/local/bin/helm
 COPY --from=build /out/app /app
 ENTRYPOINT ["/app"]

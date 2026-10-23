@@ -156,7 +156,7 @@ runner 在集群模式下把失败原因写进 `/dev/termination-log`。容器�
 
 1. 读 `/workspace/pr.json`，构造系统提示词和用户提示词。提示词按 v1 的防幻觉规则重写，放在 `runner/src/prompts.ts`。
 2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
-3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才加入 `bash`，其中的 `kubectl` 只能访问这个 namespace。
+3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才启用受限的 `kubectl` 工具，只允许读取这个 namespace 的 Pod、事件、Deployment、ReplicaSet 和日志，不开放 shell。
 4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。最后一轮是模型服务报错（pi 重试后仍失败，例如 402 余额不足）时不再提醒，直接以 `model API error: ...` 失败，免得被误读成模型不肯提交。
 5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`，带 `Authorization: Bearer <RUN_TOKEN>`，controller 读本 run 的 Secret 比对，不符返回 401：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
 
@@ -302,6 +302,15 @@ LiteLLM 自己的入站也用 NetworkPolicy 限定为 runner 和 controller。
 - controller 创建 `pr-<owner>-<repo>-<n>` namespace，配 ResourceQuota，用 PR 的镜像 tag 部署，等待 Ready 或超时。
 - PR 关闭或合并时删除 namespace；另有定时清理，删掉超过 24 小时的孤儿 namespace。
 - 构建镜像依赖仓库自己的 CI。demo 里约定 PR 的 CI 推送 `:<head_sha>` 镜像，controller 等这个 tag 出现。
+
+M5 预览实现约定（验收记录见 roadmap）：
+
+- 本仓库新增独立 HTTP 示例应用作为预览目标；故障验收 PR 只修改示例 chart 的 readiness 路径，避免破坏评审服务本身。
+- runner 在代码探索后把配置和 chart 的普通文件作为有大小上限的数据包交给 controller。controller 离线执行 `helm template`，强制 `image.tag=<head_sha>`，先校验全部资源，再部署；不执行 PR 程序、Helm 插件或下载依赖。初版只支持 Deployment、ClusterIP Service 和 ConfigMap。
+- 预览 namespace 使用 ResourceQuota、Restricted Pod Security admission 和默认拒绝网络策略。只读 ServiceAccount 的短期 token 在等待 Ready 或超时后才交给 runner；超时保留现场，由模型读取实际证据，不能仅凭超时推断探针错误。
+- `previewing` 表示部署等待，结束后返回 `running` 做运行时评审。此阶段失败可回到 `queued` 重试；状态取值未新增，数据库 CHECK 中已有 `previewing`。
+- 原先“ClusterRole 只含 namespaces”的权限不足以在动态 namespace 中创建工作负载、配额和只读授权。拟采用显式开关的预览 ClusterRole，列出所需资源及操作；Kubernetes RBAC 不能按 namespace 名称前缀约束它，controller 必须校验归属。该权限范围已获批准；chart 通过 `preview.enabled` 显式开启，默认关闭。开启时 controller 必须为单副本，升级使用 Recreate，避免多个进程同时部署同一 PR。
+- PR 关闭清理由 controller 定时查询 GitHub 状态执行，使漏收 closed webhook 时也能清理；超过 24 小时、PR 已不可访问或没有进行中评审的 namespace 作为孤儿清理；GitHub 暂时出错时不删除。gateway 保持只记录触发的边界。
 
 ### 6.3 投票与合并
 

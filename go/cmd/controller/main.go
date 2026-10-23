@@ -94,6 +94,18 @@ func run(log *slog.Logger) error {
 		ctl.Routes(mux)
 		egress.Store(ctl)
 		go ctl.Run(ctx, 5*time.Second)
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				ctl.CleanPreviews(ctx)
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 		redeliver, err := time.ParseDuration(envOr("REDELIVER_INTERVAL", "5m"))
 		if err != nil {
 			return fmt.Errorf("REDELIVER_INTERVAL: %w", err)
@@ -197,6 +209,9 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 		if v == "" {
 			return nil, fmt.Errorf("%s is required", name)
 		}
+	}
+	if os.Getenv("PREVIEW_ENABLED") == "true" {
+		cfg.Preview = &controller.PreviewConfig{Kube: k}
 	}
 	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning, "max_attempts", maxAttempts)
 	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, keys, log), nil

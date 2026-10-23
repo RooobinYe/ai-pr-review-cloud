@@ -1,0 +1,31 @@
+name: preview image
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    # Fork PRs do not receive package write credentials.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Build without registry credentials
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          docker build -t ghcr.io/rooobinye/ai-pr-review-cloud-preview:"$HEAD_SHA" demo/preview
+      - name: Publish exact head image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push ghcr.io/rooobinye/ai-pr-review-cloud-preview:"$HEAD_SHA"
+          docker logout ghcr.io

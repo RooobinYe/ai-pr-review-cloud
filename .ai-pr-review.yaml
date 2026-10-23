@@ -1,0 +1,5 @@
+preview:
+  enabled: true
+  helm:
+    chart: demo/preview/chart
+  readyTimeout: 5m

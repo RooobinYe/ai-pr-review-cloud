@@ -130,3 +130,9 @@ runner:
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 1536Mi }
+
+# Explicit opt-in: provisions isolated namespaces with restricted application resources.
+preview:
+  enabled: false
+  # Include Kubernetes Service IP and API endpoint IPs (CNI DNAT behavior varies).
+  apiServerCIDRs: []

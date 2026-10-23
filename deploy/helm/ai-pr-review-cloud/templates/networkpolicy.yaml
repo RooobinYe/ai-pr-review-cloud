@@ -32,6 +32,18 @@ spec:
             matchLabels: {{- include "aprc.selector" (dict "root" . "component" "controller") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 8080 }
+{{- if .Values.preview.enabled }}
+    {{- if not .Values.preview.apiServerCIDRs }}
+    {{- fail "preview.apiServerCIDRs must include Kubernetes Service and API endpoint IPs" }}
+    {{- end }}
+    - to:
+        {{- range .Values.preview.apiServerCIDRs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }
+{{- end }}
 ---
 # Only runners and the controller talk to the model proxy.
 apiVersion: networking.k8s.io/v1

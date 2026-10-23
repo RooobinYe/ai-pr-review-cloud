@@ -12,7 +12,7 @@
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
-| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
+| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 实现中，未验收 |
 | [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | ✅ 完成 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
 
@@ -156,6 +156,8 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 ## M5 预览环境验证
 
 目标：把运行时证据纳入评审结论。
+
+实现中（2026-10-24）：预览配置、受限 Helm 渲染、controller 回调和 runner 两阶段验证已开始实现；尚未部署或完成真实 PR 验收。动态 namespace 的授权方案需要同步修正架构 §6.2 中仅授予 namespaces 权限的假设。
 
 - [ ] demo 仓库的 CI 为每个 PR 推送 `:<head_sha>` 镜像。
 - [ ] controller 增加只含 `namespaces` 的 ClusterRole；为 PR 创建 `pr-<owner>-<repo>-<n>` namespace 并配 ResourceQuota。

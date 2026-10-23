@@ -166,3 +166,26 @@ test("a failed model request is retryable, not a missing submission", async () =
     return true;
   });
 });
+
+test("preview follow-up occurs before final submission and includes runtime status", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "preview-review-test-"));
+  const { faux, modelRuntime, model } = await fauxModel(dir);
+  let prepared = false;
+  faux.setResponses([
+    () => {
+      assert.equal(prepared, false);
+      return fauxAssistantMessage("Code exploration complete; waiting for runtime evidence.");
+    },
+    (context) => {
+      assert.equal(prepared, true);
+      assert.match(JSON.stringify(context.messages), /pr-demo-1/);
+      assert.match(JSON.stringify(context.messages), /timeout/);
+      return fauxAssistantMessage(fauxToolCall("submit_review", submission));
+    },
+  ]);
+  const outcome = await review({ pr, cwd: dir, agentDir: dir, model, modelRuntime, thinkingLevel: "off", language: "English",
+    preparePreview: async () => { prepared = true; return { namespace: "pr-demo-1", status: "timeout", kubeconfig: "/unused" }; },
+  });
+  assert.equal(outcome.submission.verdict, "request_changes");
+  assert.equal(faux.state.callCount, 2);
+});

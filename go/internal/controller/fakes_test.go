@@ -66,7 +66,7 @@ func (s *fakeStore) Claim(_ context.Context, maxRunning int, jobName func(string
 	defer s.mu.Unlock()
 	inFlight := 0
 	for _, r := range s.runs {
-		if r.State == run.StateRunning {
+		if r.State == run.StateRunning || r.State == run.StatePreviewing {
 			inFlight++
 		}
 	}
@@ -90,7 +90,7 @@ func (s *fakeStore) Active(context.Context) ([]store.Run, error) {
 	var out []store.Run
 	for _, r := range s.sorted() {
 		unreported := (r.State == run.StateFailed || r.State == run.StateSuperseded) && !r.Done(store.ActionCheckRunComplete)
-		if r.State == run.StateRunning || r.State == run.StateReviewed || unreported {
+		if r.State == run.StateRunning || r.State == run.StatePreviewing || r.State == run.StateReviewed || unreported {
 			out = append(out, s.copyOf(r))
 		}
 	}
@@ -222,6 +222,7 @@ func (s *fakeStore) RecordFetchTiming(_ context.Context, id string, started, fin
 
 // fakeGitHub records every write.
 type fakeGitHub struct {
+	state       string
 	mu          sync.Mutex
 	head        string
 	reviews     []githubapp.Review
@@ -248,6 +249,10 @@ func (g *fakeGitHub) FetchToken(_ context.Context, installationID int64, repo st
 func (g *fakeGitHub) GetPull(context.Context, string, int) (githubapp.Pull, error) {
 	var p githubapp.Pull
 	p.Head.SHA = g.head
+	p.State = g.state
+	if p.State == "" {
+		p.State = "open"
+	}
 	return p, nil
 }
 
@@ -411,5 +416,19 @@ func (f *fakeKeys) Delete(_ context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.live, key)
+	return nil
+}
+
+func (s *fakeStore) TransitionAttempt(_ context.Context, id string, attempt int, from, to run.State) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.runs[id]
+	if r == nil || r.Attempt != attempt || r.State != from {
+		return store.ErrConflict
+	}
+	if !run.CanTransition(from, to) {
+		return fmt.Errorf("invalid transition")
+	}
+	r.State = to
 	return nil
 }

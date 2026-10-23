@@ -274,7 +274,7 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 // completed yet.
 func (s *Store) Active(ctx context.Context) ([]Run, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+runColumns+` FROM review_run r
-		WHERE r.state IN ('running', 'reviewed')
+		WHERE r.state IN ('running', 'previewing', 'reviewed')
 		   OR (r.state IN ('failed', 'superseded')
 		       AND NOT EXISTS (SELECT 1 FROM github_action a WHERE a.run_id = r.id AND a.kind = 'check_run_complete' AND a.external_id IS NOT NULL))
 		ORDER BY r.created_at`)
@@ -416,6 +416,21 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 	if !applied {
 		return errors.New("schema migrations are not all applied yet")
+	}
+	return nil
+}
+
+// TransitionAttempt prevents a delayed preview callback from advancing a newer attempt.
+func (s *Store) TransitionAttempt(ctx context.Context, id string, attempt int, from, to run.State) error {
+	if !run.CanTransition(from, to) {
+		return fmt.Errorf("invalid preview transition")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state=$4, updated_at=now() WHERE id=$1 AND attempt=$2 AND state=$3`, id, attempt, from, to)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
 	}
 	return nil
 }
