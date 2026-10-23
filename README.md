@@ -2,7 +2,7 @@
 
 装在 GitHub 上、跑在 Kubernetes 上的 AI PR 评审服务。PR 打开或更新时自动触发，每个 PR 在独立的 Pod 里由 agent 探索代码并给出结构化结论，结果以 Check Run 和 PR Review 呈现。AI 像人类审批人一样投票：没问题时提交 approve，可以计入"需要 N 个 approval"；有问题时只留评论、不阻塞合并。可按仓库开启自动合并和预览环境验证。
 
-> 状态：M1 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
+> 状态：M1、M2、M3、M5、M6 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
 
 ## 架构
 
@@ -70,6 +70,12 @@ make webhook-forward SMEE_URL=<smee 通道地址>
 ```bash
 kubectl -n ai-pr-review-cloud logs deploy/ai-pr-review-cloud-controller -f
 ```
+
+### 预览验证
+
+本仓库的 `.ai-pr-review.yaml` 已启用独立示例应用的预览。评审本仓库前，需要按 [预览验证指南](docs/preview.md) 开启服务端 `preview.enabled`，配置 API 地址白名单及可信镜像仓库映射。仓库要求预览而服务端未开启时，评审会明确失败，不会静默跳过验证。
+
+M5 已用本仓库的错误探针 PR 验收：agent 读取 Kubernetes 事件和日志，确认探针返回 404，再给出 `request_changes`。验收记录见 [roadmap](docs/roadmap.md#m5-预览环境验证)。
 
 ### 成本看板
 

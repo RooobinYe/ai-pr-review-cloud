@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -211,7 +212,11 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 		}
 	}
 	if os.Getenv("PREVIEW_ENABLED") == "true" {
-		cfg.Preview = &controller.PreviewConfig{Kube: k}
+		repositories := map[string]string{}
+		if err := json.Unmarshal([]byte(os.Getenv("PREVIEW_IMAGE_REPOSITORIES")), &repositories); err != nil {
+			return nil, fmt.Errorf("PREVIEW_IMAGE_REPOSITORIES must be a JSON object: %w", err)
+		}
+		cfg.Preview = &controller.PreviewConfig{Kube: k, ImageRepositories: repositories}
 	}
 	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning, "max_attempts", maxAttempts)
 	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, keys, log), nil

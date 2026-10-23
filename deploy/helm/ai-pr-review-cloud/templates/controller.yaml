@@ -64,6 +64,8 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
           env:
+            - name: PREVIEW_IMAGE_REPOSITORIES
+              value: {{ toJson .Values.preview.imageRepositories | quote }}
             - name: PREVIEW_ENABLED
               value: {{ .Values.preview.enabled | quote }}
             - name: DATABASE_URL

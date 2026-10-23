@@ -1,4 +1,7 @@
 {{- if .Values.preview.enabled }}
+{{- if not .Values.preview.imageRepositories }}
+{{- fail "preview.imageRepositories must map approved repositories to their image repositories" }}
+{{- end }}
 {{- if ne (int .Values.controller.replicas) 1 }}
 {{- fail "preview requires one controller replica to serialize deployments per PR" }}
 {{- end }}

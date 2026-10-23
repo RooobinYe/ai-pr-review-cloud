@@ -12,7 +12,7 @@
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
-| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 实现中，未验收 |
+| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | ✅ 完成 |
 | [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | ✅ 完成 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
 
@@ -157,16 +157,31 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：把运行时证据纳入评审结论。
 
-实现中（2026-10-24）：预览配置、受限 Helm 渲染、controller 回调和 runner 两阶段验证已开始实现；尚未部署或完成真实 PR 验收。动态 namespace 的授权方案需要同步修正架构 §6.2 中仅授予 namespaces 权限的假设。
+配置与权限范围见 [预览验证](preview.md)。实现 PR 为 [#9](https://github.com/RooobinYe/ai-pr-review-cloud/pull/9)，故障验收使用本仓库的独立示例应用。
 
-- [ ] demo 仓库的 CI 为每个 PR 推送 `:<head_sha>` 镜像。
-- [ ] controller 增加只含 `namespaces` 的 ClusterRole；为 PR 创建 `pr-<owner>-<repo>-<n>` namespace 并配 ResourceQuota。
-- [ ] 按 `.ai-pr-review.yaml` 的 `preview` 配置用 Helm 部署，等待 Ready 或超时。
-- [ ] runner 镜像加入 kubectl；预览阶段使用只能读该 namespace 的 ServiceAccount。
-- [ ] runner 收到 follow-up 提示后用 kubectl 检查 Pod、事件、日志。
-- [ ] PR 关闭时删除 namespace；定时清理超过 24 小时的孤儿 namespace。
+- [x] demo 仓库的 CI 为每个 PR 推送 `:<head_sha>` 镜像。
+- [x] controller 通过显式开关启用预览 ClusterRole（namespace 及必要的预览资源权限，见架构 §6.2）；为 PR 创建 `pr-<owner>-<repo>-<n>` namespace 并配 ResourceQuota。
+- [x] 按 `.ai-pr-review.yaml` 的 `preview` 配置用 Helm 部署，等待 Ready 或超时。
+- [x] runner 镜像加入 kubectl；预览阶段使用只能读该 namespace 的 ServiceAccount。
+- [x] runner 收到 follow-up 提示后用 kubectl 检查 Pod、事件、日志。
+- [x] PR 关闭时删除 namespace；定时清理超过 24 小时的孤儿 namespace。
 
 验收：提交一个探针配置错误的 PR，agent 通过 kubectl 发现问题并给出 request_changes。
+
+验收记录（2026-10-24，Kind，`deepseek/deepseek-flash`，thinking high）：
+
+| 检查 | 结果 |
+| --- | --- |
+| [故障 PR #10](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10)，head `e56c7c0` | readiness 路径为不存在的 `/readyz`；Pod 为 `0/1 Running`，事件为 `HTTP probe failed with statuscode: 404` |
+| agent 运行时验证 | 成功调用 `kubectl get pods`、`get deployments`、`get events` 和 `logs`；日志显示 `GET /readyz` 与 `GET /healthz`；Deployment JSON 确认两个探针的实际路径 |
+| [最终 Review](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10#pullrequestreview-5632292229) | `request_changes`，GitHub COMMENT，1 条逐行评论；端到端 217 秒，花费 $0.018352 |
+| 正常对照：PR #9，head `dd2ef5a` | Pod `1/1 Ready`，agent 读取 Pod、日志、事件后 APPROVE；端到端 362 秒，花费 $0.151225（包含整个 M5 实现的代码评审） |
+| 关闭清理 | 故障 PR 关闭后，controller 自动删除 namespace；没有手工删除或清理 finalizer |
+| 镜像 | CI 发布完整 head SHA 的 amd64/arm64 镜像；使用空 Docker 配置验证匿名获取，无需给预览应用提供镜像仓库凭据 |
+| 只读权限 | 本 namespace 的 Pod 可读；Secret、其他 namespace 的 Pod、创建 Deployment 均被拒绝 |
+| 回归检查 | `make lint`、Go 测试、runner 52 项测试、真实 PostgreSQL 集成测试、controller/preview 竞态检测通过；GitHub CI 通过 |
+
+本次通过签名 webhook 重放触发，未验收 GitHub → smee 实时转发。早期两轮分别因部署仍指向旧镜像、Linux stdin 兼容问题而没有拿到运行时证据，不计入通过记录。修复后的上述 run 完成了完整验证。故障 PR 已关闭且未合并；controller 已自动删除对应 namespace，查询返回 NotFound。
 
 ## M6 成本看板与测算报告
 

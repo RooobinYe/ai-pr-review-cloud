@@ -23,9 +23,10 @@ const previewLabel = "ai-pr-review.cloud/preview"
 
 // PreviewConfig is installed only when cluster preview has explicitly been enabled.
 type PreviewConfig struct {
-	Kube   *kube.Client
-	locks  sync.Map
-	CAFile string
+	Kube              *kube.Client
+	locks             sync.Map
+	CAFile            string
+	ImageRepositories map[string]string
 }
 
 type previewReply struct {
@@ -60,6 +61,10 @@ func (c *Controller) handlePreview(w http.ResponseWriter, req *http.Request) {
 	}
 	if c.cfg.Preview == nil {
 		http.Error(w, "preview requested but disabled by operator", 422)
+		return
+	}
+	if c.cfg.Preview.ImageRepositories[r.Repo] == "" {
+		http.Error(w, "preview image repository is not configured by operator", 422)
 		return
 	}
 	// Serialization also prevents a delayed old attempt from replacing a newer preview.
@@ -127,10 +132,13 @@ func (c *Controller) preparePreview(ctx context.Context, r store.Run, bundle pre
 	k := c.cfg.Preview.Kube
 	ns := preview.Namespace(r.Repo, r.PRNumber)
 	renderCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	objects, cfg, err := preview.Render(renderCtx, bundle, r.HeadSHA, ns)
+	objects, cfg, err := preview.Render(renderCtx, bundle, r.HeadSHA, ns, c.cfg.Preview.ImageRepositories[r.Repo])
 	cancel()
 	if err != nil {
-		return previewReply{}, fmt.Errorf("%w: %v", errPreviewInput, err)
+		if errors.Is(err, preview.ErrInput) {
+			return previewReply{}, fmt.Errorf("%w: %v", errPreviewInput, err)
+		}
+		return previewReply{}, err
 	}
 	namespace := obj("v1", "Namespace", ns, nil)
 	namespace["metadata"] = map[string]any{"name": ns, "labels": map[string]string{previewLabel: k.Namespace, "pod-security.kubernetes.io/enforce": "restricted", "pod-security.kubernetes.io/enforce-version": "v1.34"}, "annotations": map[string]string{"repo": r.Repo, "pr": strconv.Itoa(r.PRNumber), "installation": strconv.FormatInt(r.InstallationID, 10), "run": r.ID, "head": r.HeadSHA, "created": time.Now().UTC().Format(time.RFC3339)}}

@@ -34,7 +34,7 @@ export async function previewBundle(cwd: string): Promise<{ files: Record<string
   if (!safePreviewPath(chart) || (valuesFile !== undefined && !safePreviewPath(valuesFile))) throw new Error("invalid preview chart or valuesFile");
   const { stdout } = await exec("git", ["ls-files", "-z", "--", chart, ...(valuesFile ? [valuesFile] : [])], { cwd, maxBuffer: 1 << 20 });
   const files: Record<string, string> = { ".ai-pr-review.yaml": source };
-  let size = source.length;
+  let size = Buffer.byteLength(source);
   for (const name of stdout.split("\0").filter(Boolean)) {
     if (Object.keys(files).length >= 100) throw new Error("preview bundle exceeds 100 files");
     const content = await read(name);
