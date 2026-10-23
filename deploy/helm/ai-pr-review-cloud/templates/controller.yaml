@@ -100,7 +100,7 @@ spec:
             - name: RUNNER_RESOURCES
               value: {{ toJson .Values.runner.resources | quote }}
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
           livenessProbe:
             httpGet: { path: /healthz, port: http }
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -312,6 +313,8 @@ func (s *Store) Transition(ctx context.Context, id string, from, to run.State, r
 	if !run.CanTransition(from, to) {
 		return fmt.Errorf("transition %s -> %s is not allowed", from, to)
 	}
+	// Reasons quote external messages; PostgreSQL rejects invalid UTF-8.
+	reason = strings.ToValidUTF8(reason, "\uFFFD")
 	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now()
 		WHERE id = $1 AND state = $2`, id, from, to, reason)
 	if err != nil {

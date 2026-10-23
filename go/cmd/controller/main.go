@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,10 +34,18 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Serve /healthz right away so the liveness probe passes while the
-	// database is still starting; the runner API is registered once ready.
+	// Serve the probes right away: /healthz (liveness) passes while the
+	// database is still starting, and /readyz (readiness) only once the runner
+	// API is registered, so the Service never routes a result to a controller
+	// that would answer 404.
+	var ready atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
 	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() {
@@ -70,6 +79,7 @@ func run(log *slog.Logger) error {
 	} else {
 		log.Warn("GITHUB_APP_ID is not set; runs stay queued until a GitHub App is configured")
 	}
+	ready.Store(true)
 
 	select {
 	case <-ctx.Done():

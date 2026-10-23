@@ -23,7 +23,9 @@ const retryable = (status: number) => status >= 500 || status === 408 || status 
  */
 export async function postResult(controllerUrl: string, runId: string, result: ReviewResult, opts: PostOptions): Promise<void> {
   const url = `${controllerUrl.replace(/\/$/, "")}/runs/${encodeURIComponent(runId)}/result`;
-  const attempts = opts.attempts ?? 5;
+  // 8 attempts back off for about two minutes in total, enough to outlast a
+  // controller restart (it is unready, so unreachable, until it can accept results).
+  const attempts = opts.attempts ?? 8;
   let delay = opts.retryDelayMs ?? 1000;
   for (let attempt = 1; ; attempt++) {
     let problem: string;

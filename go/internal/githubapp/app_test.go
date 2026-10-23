@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func testKey(t *testing.T) (*rsa.PrivateKey, []byte) {
@@ -171,5 +173,19 @@ func TestAPIErrorAndPagination(t *testing.T) {
 	}
 	if StatusOf(fmt.Errorf("wrapped: %w", err)) != http.StatusUnprocessableEntity {
 		t.Error("StatusOf does not unwrap")
+	}
+}
+
+func TestAPIErrorMessageStaysValidUTF8(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		fmt.Fprintf(w, `{"message":"%s"}`, strings.Repeat("评", 200)) // 600 bytes; 500 splits a rune
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Token: StaticToken("t")}
+	err := c.UpdateCheckRun(context.Background(), "o/r", 1, CheckRun{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !utf8.ValidString(apiErr.Message) || len(apiErr.Message) > 500 {
+		t.Errorf("message %q is not valid, truncated UTF-8", apiErr.Message)
 	}
 }

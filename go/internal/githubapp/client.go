@@ -101,7 +101,8 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 			}
 		}
 		if len(msg) > 500 {
-			msg = msg[:500]
+			// Cut on a rune boundary: the message ends up in a PostgreSQL text column.
+			msg = strings.ToValidUTF8(msg[:500], "")
 		}
 		return &APIError{Method: method, Path: path, Status: res.StatusCode, Message: msg}
 	}
