@@ -122,3 +122,39 @@ func TestApprovalWebhook(t *testing.T) {
 		t.Fatalf("unexpected records %+v", rec)
 	}
 }
+
+// A draft can receive commits and be reopened without creating a run. Marking
+// the same head ready for review must then create the usual review trigger.
+func TestDraftPullRequestLifecycle(t *testing.T) {
+	rec := &fakeRecorder{seen: map[string]bool{}}
+	h := &Handler{Secret: []byte("s"), Recorder: rec, BudgetUSD: 0.5, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for _, tt := range []struct {
+		action     string
+		draft      string
+		wantStatus int
+		wantCalls  int
+	}{
+		{"opened", "true", http.StatusNoContent, 0},
+		{"synchronize", "true", http.StatusNoContent, 0},
+		{"reopened", "true", http.StatusNoContent, 0},
+		{"ready_for_review", "false", http.StatusAccepted, 1},
+	} {
+		t.Run(tt.action, func(t *testing.T) {
+			body := strings.Replace(opened, `"action":"opened"`, `"action":"`+tt.action+`"`, 1)
+			body = strings.Replace(body, `"number":5`, `"number":5,"draft":`+tt.draft, 1)
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("X-Hub-Signature-256", sign("s", body))
+			req.Header.Set("X-GitHub-Delivery", tt.action)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != tt.wantStatus || len(rec.calls) != tt.wantCalls {
+				t.Fatalf("status=%d calls=%d, want status=%d calls=%d", w.Code, len(rec.calls), tt.wantStatus, tt.wantCalls)
+			}
+		})
+	}
+	want := store.NewRun{Repo: "o/r", PRNumber: 5, HeadSHA: "abababababababababababababababababababab", InstallationID: 9, BudgetUSD: 0.5}
+	if len(rec.calls) != 1 || rec.calls[0] != want || len(rec.approvals) != 0 {
+		t.Fatalf("unexpected records: %+v", rec)
+	}
+}
