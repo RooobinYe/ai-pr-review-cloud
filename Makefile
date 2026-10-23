@@ -35,7 +35,9 @@ kind-load: images
 # Secrets come from the environment only. GITHUB_WEBHOOK_SECRET defaults to a
 # throwaway value, and without GITHUB_APP_ID the controller leaves runs queued,
 # so the stack starts without a GitHub App. GITHUB_APP_PRIVATE_KEY_FILE is the
-# App's .pem; LLM_API_KEY is the model key the runner uses until M2.
+# App's .pem; LLM_API_KEY is the real model key, which only the LiteLLM proxy
+# sees (runners get per-run virtual keys). The first deploy pulls LiteLLM's
+# image (about 1.2 GB), hence the longer timeout.
 deploy: kind-load
 	helm upgrade --install ai-pr-review-cloud $(CHART) \
 		--namespace $(NAMESPACE) --create-namespace \
@@ -44,7 +46,7 @@ deploy: kind-load
 		--set-string github.appId=$${GITHUB_APP_ID:-} \
 		$(if $(GITHUB_APP_PRIVATE_KEY_FILE),--set-file github.privateKey=$(GITHUB_APP_PRIVATE_KEY_FILE)) \
 		--set llm.apiKey=$${LLM_API_KEY:-} \
-		--wait
+		--wait --timeout 10m
 	@# Images keep the same tag across builds; restart so freshly loaded ones run.
 	@# The dev PostgreSQL is left alone: restarting it would drop its data.
 	kubectl -n $(NAMESPACE) rollout restart $(DEPLOYMENTS)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/litellm"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
@@ -248,4 +249,30 @@ func (k *fakeKube) finish(name, condition string) {
 	job := k.jobs[name]
 	job.Status.Conditions = append(job.Status.Conditions, kube.JobCondition{Type: condition, Status: "True", Reason: "BackoffLimitExceeded"})
 	k.jobs[name] = job
+}
+
+// fakeKeys stands in for the LiteLLM proxy's key management.
+type fakeKeys struct {
+	mu     sync.Mutex
+	issued []litellm.Key
+	live   map[string]litellm.Key
+}
+
+func (f *fakeKeys) Generate(_ context.Context, k litellm.Key) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = map[string]litellm.Key{}
+	}
+	key := fmt.Sprintf("sk-virtual-%d", len(f.issued))
+	f.issued = append(f.issued, k)
+	f.live[key] = k
+	return key, nil
+}
+
+func (f *fakeKeys) Delete(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.live, key)
+	return nil
 }

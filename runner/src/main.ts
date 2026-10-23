@@ -3,6 +3,7 @@
 //     /workspace and results go back to the controller.
 //   - local mode: --pr <url>; fetches the PR itself and prints the result,
 //     for development and CI use without a cluster.
+import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,7 @@ import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } fro
 import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import { ReviewNotSubmittedError, review } from "./review.ts";
+import { ReviewFailedError, review } from "./review.ts";
 import { ReviewResultSchema, SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 
 const USAGE = `usage: runner --pr <github-pr-url> [--format markdown|json] [--language <name>] [--keep]
@@ -72,7 +73,7 @@ async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: Model
     }
     return result;
   } catch (err) {
-    if (err instanceof ReviewNotSubmittedError) {
+    if (err instanceof ReviewFailedError) {
       log(formatUsage({ ...err.stats.tokens, cost: err.stats.cost }, (Date.now() - started) / 1000));
     }
     throw err;
@@ -128,10 +129,25 @@ async function main(): Promise<number> {
   return 2;
 }
 
+/**
+ * In cluster mode the failure reason goes to the termination log, which the
+ * controller copies to the run's Check Run; Kubernetes keeps up to 4 KiB.
+ */
+function reportFailure(message: string): void {
+  if (!process.env.RUN_ID) return;
+  try {
+    writeFileSync(process.env.TERMINATION_LOG || "/dev/termination-log", message.slice(0, 4000));
+  } catch {
+    // Outside Kubernetes there is no termination log; the message is logged anyway.
+  }
+}
+
 main().then(
   (code) => process.exit(code),
   (err: unknown) => {
-    log(err instanceof Error ? err.message : String(err));
+    const message = err instanceof Error ? err.message : String(err);
+    log(message);
+    reportFailure(message);
     process.exit(1);
   },
 );

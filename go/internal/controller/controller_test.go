@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -30,18 +31,23 @@ type harness struct {
 	store *fakeStore
 	gh    *fakeGitHub
 	kube  *fakeKube
+	keys  *fakeKeys
 	mux   *http.ServeMux
 }
 
 func newHarness() *harness {
-	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued})
+	s := newFakeStore(store.Run{ID: runID, Repo: "o/r", PRNumber: 7, HeadSHA: headSHA, InstallationID: 42, State: run.StateQueued, BudgetUSD: 0.5})
 	gh := &fakeGitHub{head: headSHA}
 	k := newFakeKube()
-	cfg := Config{MaxRunning: 2, BotLogin: bot, Job: JobConfig{FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl", LLMSecret: "llm"}}
-	c := New(cfg, s, gh, k, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	keys := &fakeKeys{}
+	cfg := Config{MaxRunning: 2, BotLogin: bot, EgressHosts: []string{"github.com:443"}, Job: JobConfig{
+		FetchImage: "fetch:dev", RunnerImage: "runner:dev", ControllerURL: "http://ctl",
+		LLMEnv: map[string]string{"LLM_MODEL": "deepseek-flash"}, ActiveDeadlineSeconds: 1800,
+	}}
+	c := New(cfg, s, gh, k, keys, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
 	c.Routes(mux)
-	return &harness{c: c, store: s, gh: gh, kube: k, mux: mux}
+	return &harness{c: c, store: s, gh: gh, kube: k, keys: keys, mux: mux}
 }
 
 func (h *harness) reconcile() { h.c.Reconcile(context.Background()) }
@@ -108,8 +114,13 @@ func TestApproveFlow(t *testing.T) {
 		t.Fatal("job not created")
 	}
 	secret := h.kube.secrets[runSecretName(r.JobName)]
-	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || len(secret.StringData["RUN_TOKEN"]) != 64 || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
+	if secret.StringData["GITHUB_TOKEN"] != "ro-42-o/r-0" || len(secret.StringData["RUN_TOKEN"]) != 64 || len(secret.StringData["PROXY_TOKEN"]) != 64 ||
+		secret.StringData["RUN_TOKEN"] == secret.StringData["PROXY_TOKEN"] || secret.Metadata.OwnerReferences[0].UID != job.Metadata.UID {
 		t.Errorf("run secret %+v", secret)
+	}
+	key, ok := h.keys.live[secret.StringData["LLM_API_KEY"]]
+	if !ok || key.MaxBudgetUSD != 0.5 || key.Alias != r.JobName || key.Duration != 35*time.Minute || len(key.Models) != 1 || key.Models[0] != "deepseek-flash" {
+		t.Errorf("virtual key %+v (live %v)", key, ok)
 	}
 
 	h.reconcile() // nothing new while the job runs
@@ -125,6 +136,9 @@ func TestApproveFlow(t *testing.T) {
 
 	if got := h.state(); got.State != run.StateDone {
 		t.Fatalf("state %s, want done", got.State)
+	}
+	if len(h.keys.live) != 0 {
+		t.Errorf("virtual keys still live after the vote: %v", h.keys.live)
 	}
 	if len(h.gh.posted) != 1 {
 		t.Fatalf("posted %d reviews", len(h.gh.posted))
@@ -204,6 +218,9 @@ func TestJobFailureIsReported(t *testing.T) {
 	if r.State != run.StateFailed || !strings.Contains(r.Error, "fetch exited with code 1: fetch: 404 Not Found") {
 		t.Fatalf("run %+v", r)
 	}
+	if len(h.keys.live) != 0 {
+		t.Errorf("virtual keys still live after the failure: %v", h.keys.live)
+	}
 	cr := h.gh.checkRuns[100]
 	if last := cr[len(cr)-1]; last.Conclusion != "failure" || !strings.Contains(last.Output.Summary, "404") {
 		t.Errorf("check run %+v", last)
@@ -214,6 +231,19 @@ func TestJobFailureIsReported(t *testing.T) {
 	}
 	if code := h.post(result(review.VerdictApprove)); code != http.StatusConflict {
 		t.Errorf("late result: %d, want 409", code)
+	}
+}
+
+func TestBudgetExceeded(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	h.kube.pods = []kube.Pod{{Status: kube.PodStatus{ContainerStatuses: []kube.ContainerStatus{
+		{Name: "runner", State: kube.ContainerState{Terminated: &kube.ContainerStateTerminated{ExitCode: 1, Message: "budget_exceeded: the run spent its model budget"}}},
+	}}}}
+	h.kube.finish(h.state().JobName, kube.JobFailed)
+	h.reconcile()
+	if r := h.state(); r.State != run.StateFailed || r.Error != "budget_exceeded: the run spent its model budget" {
+		t.Errorf("run %+v", r)
 	}
 }
 

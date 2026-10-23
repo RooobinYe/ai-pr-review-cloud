@@ -68,6 +68,7 @@ type Run struct {
 	Verdict        review.Verdict
 	Result         *review.Result
 	Error          string
+	BudgetUSD      float64
 	CreatedAt      time.Time
 	// Actions maps each completed GitHub action to its external ID.
 	Actions map[ActionKind]string
@@ -173,7 +174,7 @@ func (s *Store) RecordTrigger(ctx context.Context, deliveryID string, nr NewRun)
 }
 
 const runColumns = `r.id, r.repo, r.pr_number, r.head_sha, r.installation_id, r.state, r.attempt,
-	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.created_at,
+	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.budget_usd::float8, r.created_at,
 	COALESCE((SELECT jsonb_object_agg(a.kind, a.external_id) FROM github_action a
 	          WHERE a.run_id = r.id AND a.external_id IS NOT NULL), '{}')`
 
@@ -181,7 +182,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var result, actions []byte
 	err := row.Scan(&r.ID, &r.Repo, &r.PRNumber, &r.HeadSHA, &r.InstallationID, &r.State, &r.Attempt,
-		&r.JobName, &r.Verdict, &result, &r.Error, &r.CreatedAt, &actions)
+		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &actions)
 	if err != nil {
 		return Run{}, err
 	}

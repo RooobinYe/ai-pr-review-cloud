@@ -6,8 +6,6 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -64,7 +62,9 @@ type Config struct {
 	MaxRunning int
 	// BotLogin is the App's bot user, "<slug>[bot]", whose approvals it dismisses.
 	BotLogin string
-	Job      JobConfig
+	// EgressHosts are the host:port pairs fetch may reach through EgressProxy.
+	EgressHosts []string
+	Job         JobConfig
 }
 
 type Controller struct {
@@ -72,12 +72,13 @@ type Controller struct {
 	store Store
 	gh    GitHub
 	kube  Kube
+	keys  Keys
 	log   *slog.Logger
 	wake  chan struct{}
 }
 
-func New(cfg Config, s Store, gh GitHub, k Kube, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, log: log, wake: make(chan struct{}, 1)}
+func New(cfg Config, s Store, gh GitHub, k Kube, keys Keys, log *slog.Logger) *Controller {
+	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, keys: keys, log: log, wake: make(chan struct{}, 1)}
 }
 
 // Wake makes the loop reconcile now instead of at the next tick.
@@ -242,21 +243,33 @@ func (c *Controller) startJob(ctx context.Context, r store.Run) error {
 	return c.createRunSecret(ctx, r, job)
 }
 
-// createRunSecret mints fetch's read-only GitHub token and the runner's
-// callback token. The Secret is created after the Job so it can be owned by
-// it; the Pod's containers wait until it exists.
+// createRunSecret mints the run's credentials: fetch's read-only GitHub token
+// and proxy token, the runner's callback token and LiteLLM virtual key. The
+// Secret is created after the Job so it can be owned by it; the Pod's
+// containers wait until it exists.
 func (c *Controller) createRunSecret(ctx context.Context, r store.Run, job kube.Job) error {
-	githubToken, err := c.gh.FetchToken(ctx, r.InstallationID, r.Repo)
-	if err != nil {
+	var creds RunCredentials
+	var err error
+	if creds.GitHubToken, err = c.gh.FetchToken(ctx, r.InstallationID, r.Repo); err != nil {
 		return fmt.Errorf("mint fetch token: %w", err)
 	}
-	runToken := make([]byte, 32)
-	if _, err := rand.Read(runToken); err != nil {
+	if creds.ProxyToken, err = randomToken(); err != nil {
 		return err
 	}
-	err = c.kube.CreateSecret(ctx, BuildRunSecret(job, githubToken, hex.EncodeToString(runToken)))
-	if err != nil && !errors.Is(err, kube.ErrAlreadyExists) {
-		return fmt.Errorf("create run secret: %w", err)
+	if creds.RunToken, err = randomToken(); err != nil {
+		return err
+	}
+	if creds.LLMKey, err = c.mintKey(ctx, r); err != nil {
+		return fmt.Errorf("mint virtual key: %w", err)
+	}
+	if err := c.kube.CreateSecret(ctx, BuildRunSecret(job, creds)); err != nil {
+		// No runner will ever see this key; an existing Secret holds its own.
+		if derr := c.keys.Delete(ctx, creds.LLMKey); derr != nil {
+			c.runLog(r).Warn("delete unused virtual key; it expires on its own", "err", derr)
+		}
+		if !errors.Is(err, kube.ErrAlreadyExists) {
+			return fmt.Errorf("create run secret: %w", err)
+		}
 	}
 	return nil
 }
@@ -285,6 +298,7 @@ func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reas
 	}
 	r.State, r.Error = run.StateFailed, reason
 	c.runLog(r).Warn("run failed", "reason", reason)
+	c.revokeKey(ctx, r)
 	return c.reportFailure(ctx, r)
 }
 
@@ -313,6 +327,8 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 		return errors.New("reviewed run has no result")
 	}
 	res := *r.Result
+	// The runner has nothing left to ask the model.
+	c.revokeKey(ctx, r)
 	gh := c.gh.Client(r.InstallationID)
 	// The vote actually cast. If the controller restarted after voting, the
 	// Check Run falls back to the verdict's vote.

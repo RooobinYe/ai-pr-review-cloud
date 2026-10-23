@@ -41,7 +41,7 @@ make kind-up
 make deploy
 ```
 
-`make deploy` 会构建 4 个镜像、加载进 Kind，并用 Helm 安装到 `ai-pr-review-cloud` 命名空间（附带一个仅供开发用的 PostgreSQL）。不设置下面的环境变量也能部署，只是 run 会停在排队状态。
+`make deploy` 会构建 4 个镜像、加载进 Kind，并用 Helm 安装到 `ai-pr-review-cloud` 命名空间（附带一个仅供开发用的 PostgreSQL，以及持有模型 key 的 LiteLLM proxy；首次部署要从 ghcr.io 拉取约 1.2 GB 的 LiteLLM 镜像）。模型 key 只交给 LiteLLM，每个 runner 拿到的是带预算上限的一次性虚拟 key，并且只能连到 DNS、LiteLLM 和 controller（[架构 §5](docs/architecture.md#5-安全边界)）。不设置下面的环境变量也能部署，只是 run 会停在排队状态。
 
 ### 接入 GitHub
 
