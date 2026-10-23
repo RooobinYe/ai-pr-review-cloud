@@ -74,7 +74,7 @@ func (s *fakeStore) Active(context.Context) ([]store.Run, error) {
 	defer s.mu.Unlock()
 	var out []store.Run
 	for _, r := range s.sorted() {
-		unreported := r.State == run.StateFailed && r.Done(store.ActionCheckRunCreate) && !r.Done(store.ActionCheckRunComplete)
+		unreported := r.State == run.StateFailed && !r.Done(store.ActionCheckRunComplete)
 		if r.State == run.StateRunning || r.State == run.StateReviewed || unreported {
 			out = append(out, s.copyOf(r))
 		}

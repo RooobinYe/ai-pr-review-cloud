@@ -88,13 +88,17 @@ func InProgressCheckRun(runID, headSHA string) githubapp.CheckRun {
 	}
 }
 
-// ReviewedCheckRun completes the Check Run with the verdict. request_changes
-// is neutral rather than failure: the vote, not the check, carries the
-// verdict, and a failed check would block merging if the check were required.
-func ReviewedCheckRun(res review.Result) githubapp.CheckRun {
+// ReviewedCheckRun completes the Check Run to match the vote cast. Anything
+// but an approval is neutral rather than failure: the vote, not the check,
+// carries the verdict, and a failed check would block merging if the check
+// were required.
+func ReviewedCheckRun(res review.Result, event string) githubapp.CheckRun {
 	conclusion, title := "success", "Approved"
-	if res.Verdict != review.VerdictApprove {
+	switch {
+	case res.Verdict != review.VerdictApprove:
 		conclusion, title = "neutral", "Changes suggested"
+	case event != "APPROVE":
+		conclusion, title = "neutral", "Approved an outdated commit; not counted"
 	}
 	switch n := len(res.Comments); n {
 	case 0:

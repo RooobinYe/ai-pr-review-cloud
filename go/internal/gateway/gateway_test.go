@@ -34,7 +34,7 @@ func (f *fakeRecorder) RecordTrigger(_ context.Context, delivery string, nr stor
 	return "run-1", true, nil
 }
 
-const opened = `{"action":"opened","pull_request":{"number":5,"head":{"sha":"abc"}},
+const opened = `{"action":"opened","pull_request":{"number":5,"head":{"sha":"abababababababababababababababababababab"}},
 	"repository":{"full_name":"o/r"},"installation":{"id":9}}`
 
 func sign(secret, body string) string {
@@ -71,7 +71,7 @@ func TestHandler(t *testing.T) {
 			t.Errorf("%s: status %d, want %d", tt.name, got, tt.want)
 		}
 	}
-	want := store.NewRun{Repo: "o/r", PRNumber: 5, HeadSHA: "abc", InstallationID: 9, BudgetUSD: 0.5}
+	want := store.NewRun{Repo: "o/r", PRNumber: 5, HeadSHA: "abababababababababababababababababababab", InstallationID: 9, BudgetUSD: 0.5}
 	if len(rec.calls) != 2 || rec.calls[0] != want {
 		t.Errorf("recorded %+v, want two calls of %+v", rec.calls, want)
 	}

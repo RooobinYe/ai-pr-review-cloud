@@ -168,6 +168,9 @@ func TestApproveAfterHeadMovedVotesComment(t *testing.T) {
 	if rv := h.gh.posted[0]; rv.Event != "COMMENT" {
 		t.Errorf("event %s, want COMMENT for a stale head", rv.Event)
 	}
+	if cr := h.gh.checkRuns[100]; cr[len(cr)-1].Conclusion != "neutral" {
+		t.Errorf("check run %+v, want neutral when the approval was not cast", cr[len(cr)-1])
+	}
 }
 
 func TestRejectedInlineCommentsAreFolded(t *testing.T) {
@@ -352,5 +355,20 @@ func TestFailureBeforeCheckRunIsStillReported(t *testing.T) {
 	}
 	if !r.Done(store.ActionCheckRunComplete) {
 		t.Error("failure report not recorded")
+	}
+}
+
+func TestFailedRunWithoutCheckRunIsReportedOnRecovery(t *testing.T) {
+	h := newHarness()
+	// The controller stopped between marking the run failed and reporting it.
+	h.store.runs[runID].State, h.store.runs[runID].Error = run.StateFailed, "boom"
+	h.reconcile()
+	cr := h.gh.checkRuns[100]
+	if len(cr) != 1 || cr[0].Conclusion != "failure" || cr[0].Output.Summary != "boom" {
+		t.Errorf("check runs %+v", h.gh.checkRuns)
+	}
+	h.reconcile()
+	if len(h.gh.checkRuns) != 1 {
+		t.Error("failure reported twice")
 	}
 }

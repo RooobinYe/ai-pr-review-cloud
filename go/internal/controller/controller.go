@@ -314,8 +314,12 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 	}
 	res := *r.Result
 	gh := c.gh.Client(r.InstallationID)
+	// The vote actually cast. If the controller restarted after voting, the
+	// Check Run falls back to the verdict's vote.
+	event := ReviewEvent(r.Verdict)
 	err := c.once(ctx, &r, store.ActionReview, func() (string, error) {
-		event, err := c.voteEvent(ctx, gh, r)
+		var err error
+		event, err = c.voteEvent(ctx, gh, r)
 		if err != nil {
 			return "", err
 		}
@@ -335,7 +339,7 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 			if err != nil {
 				return "", err
 			}
-			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res))
+			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res, event))
 		})
 		if err != nil {
 			return err

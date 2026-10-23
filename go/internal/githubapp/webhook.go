@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -37,6 +38,8 @@ type Trigger struct {
 	HeadSHA        string
 	InstallationID int64
 }
+
+var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // reviewActions are the pull_request actions that produce a new revision to review.
 var reviewActions = map[string]bool{"opened": true, "synchronize": true, "reopened": true}
@@ -78,6 +81,9 @@ func TriggerFromEvent(eventType string, body []byte) (t Trigger, ok bool, err er
 	}
 	if t.Repo == "" || t.PRNumber <= 0 || t.HeadSHA == "" || t.InstallationID == 0 {
 		return Trigger{}, false, fmt.Errorf("pull_request event missing repository, number, head sha, or installation")
+	}
+	if !shaPattern.MatchString(t.HeadSHA) {
+		return Trigger{}, false, fmt.Errorf("pull_request event head sha %q is not a full commit SHA", t.HeadSHA)
 	}
 	return t, true, nil
 }
