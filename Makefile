@@ -9,7 +9,7 @@ CHART        := deploy/helm/ai-pr-review-cloud
 .PHONY: test lint images $(addprefix image-,$(GO_CMDS)) image-runner kind-up kind-load deploy
 
 test:
-	cd go && go test ./...
+	cd go && go test -count=1 ./...
 	cd runner && npm test
 
 lint:

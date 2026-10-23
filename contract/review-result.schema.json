@@ -1,0 +1,110 @@
+{
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pr",
+    "model",
+    "generated_at",
+    "verdict",
+    "body",
+    "comments"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 3
+    },
+    "pr": {
+      "type": "object",
+      "required": [
+        "repo",
+        "number",
+        "head_sha"
+      ],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "pattern": "^[\\w.-]+/[\\w.-]+$"
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "verdict": {
+      "enum": [
+        "approve",
+        "request_changes"
+      ],
+      "description": "approve if the PR is safe to merge as is; request_changes if anything must be fixed first."
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Markdown review summary posted as the top-level PR review comment."
+    },
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "line",
+          "severity",
+          "confidence",
+          "body"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "File path relative to the repository root, as shown in the diff."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Line number in the new version of the file. Must be an added or context line of the diff."
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "confidence": {
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Markdown comment: the evidence (quote the code), why it matters, and a concrete fix."
+          }
+        },
+        "additionalProperties": false
+      },
+      "maxItems": 15,
+      "description": "Inline comments anchored to lines of the diff. Empty when there is nothing specific to point at."
+    }
+  },
+  "additionalProperties": false
+}

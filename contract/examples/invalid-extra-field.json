@@ -1,0 +1,29 @@
+{
+  "schema_version": 3,
+  "pr": {
+    "repo": "octo/demo.js",
+    "number": 12,
+    "head_sha": "89abcdef0123456789abcdef0123456789abcdef"
+  },
+  "model": "deepseek/deepseek-flash",
+  "generated_at": "2026-10-23T08:00:00Z",
+  "verdict": "request_changes",
+  "body": "The new handler builds a shell command from user input.",
+  "comments": [
+    {
+      "path": "src/run.ts",
+      "line": 14,
+      "severity": "critical",
+      "confidence": "high",
+      "body": "`exec(\"sh -c \" + input)` allows command injection; use execFile."
+    },
+    {
+      "path": "src/run.ts",
+      "line": 20,
+      "severity": "low",
+      "confidence": "low",
+      "body": "[Uncertain] The timeout may be too short."
+    }
+  ],
+  "must_fix": []
+}

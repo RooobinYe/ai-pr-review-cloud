@@ -1,0 +1,9 @@
+{
+  "schema_version": 3,
+  "pr": { "repo": "octo/demo", "number": 7, "head_sha": "0123456789abcdef0123456789abcdef01234567" },
+  "model": "deepseek/deepseek-flash",
+  "generated_at": "2026-10-23T08:00:00.000Z",
+  "verdict": "approve",
+  "body": "Adds a retry to the client. Safe to merge.",
+  "comments": []
+}

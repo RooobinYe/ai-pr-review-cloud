@@ -7,11 +7,11 @@
 | 阶段 | 内容 | 验收标准 | 状态 |
 | --- | --- | --- | --- |
 | [骨架](#骨架) | 仓库结构、4 个镜像、Helm chart、Makefile、CI；gateway 签名校验；状态机与表结构 | `make lint`、`make test` 通过；Kind 上 4 个 Pod 就绪；签名正确的 webhook 返回 202，错误返回 401 | ✅ 完成 |
-| [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v2 JSON，质量不低于 v1 | 未开始 |
-| [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论 | 未开始 |
+| [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v3 JSON，质量不低于 v1 | ✅ 完成 |
+| [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论；结论为 approve 时 AI 投出的 APPROVE 计入必需审批数 | 未开始 |
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | 未开始 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | 未开始 |
-| [M4](#m4-自动合并与-manual-模式) | 自动合并与 manual 模式 | auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
+| [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
 | [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | 未开始 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
@@ -20,7 +20,7 @@
 
 ```mermaid
 flowchart LR
-    S[骨架 ✅] --> M0 --> M1
+    S[骨架 ✅] --> M0[M0 ✅] --> M1
     M1 --> M2
     M1 --> M3
     M3 --> M4
@@ -45,16 +45,27 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 
 目标：不依赖集群，`runner --pr <url>` 就能产出一份质量不低于 v1 的评审。
 
-- [ ] `runner/src/schema.ts`：用 TypeBox 定义 schema v2（`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version`）加 `verdict`。
-- [ ] `runner/src/prompts.ts`：按 v1 的防幻觉规则重写系统提示词和用户提示词。
-- [ ] 本地模式拉取 PR 元信息和 diff，克隆到临时目录。
-- [ ] 接入模型：在 pi 里注册 OpenAI 兼容 provider（DeepSeek 等），读取 API key 和 `baseUrl`。
-- [ ] `submit_review` 工具；模型未调用时最多追加 2 次提示。
-- [ ] 输出 `--format markdown|json`；结束时打印 token 和金额。
-- [ ] Go 侧定义同一份 schema，加 Go / TS 契约测试。
-- [ ] 核对 pi `usage` 是否包含 cache 相关字段。
+- [x] `runner/src/schema.ts`：用 TypeBox 定义评审结论。设计调整为 schema v3：模型直接给出 `verdict` 并写评审正文，结构只保留 `comments` 的 `path`、`line`、`severity`、`confidence`（见架构 §4.4）。
+- [x] `runner/src/prompts.ts`：按 v1 的防幻觉规则重写系统提示词和用户提示词，新增判定规则和不可信输入说明。
+- [x] 本地模式拉取 PR 元信息和 diff，部分克隆到临时目录。
+- [x] 接入模型：DeepSeek 是 pi 内置 provider，`LLM_BASE_URL` 覆盖地址；非内置 provider 按 OpenAI 兼容接口注册（架构 §4.5）。
+- [x] `submit_review` 工具：校验评论锚点落在 diff 内；模型未调用时最多追加 2 次提示。
+- [x] 输出 `--format markdown|json`；结束时打印 token 和金额。
+- [x] Go 侧定义同一份 schema（`go/internal/review`），`contract/` 下的生成 schema 与样例由 Go / TS 两侧测试共同校验。
+- [x] 核对 pi `usage` 是否包含 cache 相关字段：包含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`。
+- [x] 评审阶段用只读 `git` 工具代替 `bash`；不加载被评审仓库里的扩展和 `AGENTS.md`。
 
 验收：对 3 个历史 PR 输出通过 schema 校验的 JSON，人工对比结论质量不低于 v1。
+
+验收记录（2026-10-23，`deepseek/deepseek-flash`，thinking high；v1 使用同一模型，经 DeepSeek 的 Anthropic 兼容接口）：
+
+| PR | 本项目结论 | 耗时 / 花费 | v1（同模型） | 对比 |
+| --- | --- | --- | --- | --- |
+| [ai-pr-review#15](https://github.com/RooobinYe/ai-pr-review/pull/15)：带安全问题的 webhook | request_changes，10 条评论（3 critical） | 70s / $0.020 | 9 条 must_fix，68s | 两边都找到硬编码密钥、两处 shell 注入、`rm -rf` 空路径、world-writable 权限、CI 中 PR 代码可读密钥 |
+| [ai-pr-review#14](https://github.com/RooobinYe/ai-pr-review/pull/14)：JSON 输出与 `--fail-on` | request_changes，10 条评论（2 high） | 79s / $0.025 | 8 条 must_fix，205s | 共同发现 `--fail-on` 在写 `--output` 前退出（已对照源码确认）、拼错阈值时门禁失效、`pr_info` 字段为大驼峰、前置失败没有 JSON 输出；双方各有 3 到 4 条对方没有的有效发现 |
+| [ai-pr-review#12](https://github.com/RooobinYe/ai-pr-review/pull/12)：Windows 控制台 API 修复 | approve，4 条 medium/low 评论 | 71s / $0.021 | 无 must_fix，136s | 结论一致；两边都指出 CI 里重复维护的 Go 版本 |
+
+三个 PR 的结论与 v1 一致（v1 有 must_fix 即视为 request_changes），关键问题覆盖相当，单次耗时更短。所有输出通过 schema 校验，`submit_review` 都是一次调用成功，没有触发提醒。
 
 ## M1 最小闭环
 
@@ -67,9 +78,11 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 - [ ] controller 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 run，创建 Job（fetch init 容器 + runner）。
 - [ ] fetch：浅克隆 head、拉取 base、写出 `/workspace/pr.json`。
 - [ ] runner 集群模式：读取 `/workspace`，结果回调 `POST /runs/{id}/result`。
-- [ ] controller 创建 Check Run、发布 PR Review 逐行评论，每个写操作记录到 `github_action`。
+- [ ] controller 创建 Check Run，发布 PR Review 投票（默认 `vote` 模式，见架构 §6.3）：正文加逐行评论，结论为 approve 时事件为 APPROVE，否则为 COMMENT，`commit_id` 取结果里的 `head_sha`；每个写操作记录到 `github_action`。
+- [ ] 同一 PR 的新 `head_sha` 到达时，dismiss bot 在该 PR 上仍然有效的 APPROVE；`github_action` 增加对应类型。
+- [ ] 实测 bot 的 APPROVE 是否计入"需要 N 个 approval"，以及 App 能否 dismiss 自己的 review；结果写回架构 §10。
 
-验收：在 demo 仓库开 PR，几分钟内出现 "AI Review" Check Run 和评审评论。
+验收：在 demo 仓库开 PR，几分钟内出现 "AI Review" Check Run 和评审评论；在要求 2 个审批的分支上，AI approve 加一个人的 approve 即可合并，有问题的 PR 只收到 COMMENT、不被阻塞。
 
 ## M2 安全边界
 
@@ -96,16 +109,16 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 
 验收：评审进行中 `kubectl delete pod`，run 自动恢复完成，PR 上没有重复评论。
 
-## M4 自动合并与 manual 模式
+## M4 仓库配置与可选合并模式
 
-目标：AI 结论驱动 approve 与合并，等待人工时不占算力。
+目标：默认的 `vote` 模式只投票、不合并；仓库可以选择让 AI 结论驱动合并，等待人工时不占算力。
 
-- [ ] 解析仓库根目录的 `.ai-pr-review.yaml`（`approvalMode`、`failOn`、`budgetUSD`、`language`）。
-- [ ] `failOn` 校验：存在超标的 `must_fix` 时把 approve 改写为 request_changes。
-- [ ] `decideMerge` 与合并执行；结论为 approve 时提交 APPROVE review。
+- [ ] 解析仓库根目录的 `.ai-pr-review.yaml`（`approvalMode`、`failOn`、`budgetUSD`、`language`），缺省时 `approvalMode` 为 `vote`。
+- [ ] `failOn` 校验：存在 `severity` 达到阈值的评论时，把 approve 改写为 request_changes，即只发 COMMENT、不投 APPROVE。
+- [ ] `decideMerge` 与 auto 模式的合并执行。
 - [ ] manual 模式：进入 `awaiting_approval`，接收 `/merge` 评论和人工 approve（`issue_comment`、`pull_request_review` 事件）。
 
-验收：auto 模式下 approve 后自动合并；manual 模式下等待期间没有 runner Pod，评论 `/merge` 后合并。
+验收：没有配置文件时只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间没有 runner Pod，评论 `/merge` 后合并。
 
 ## M5 预览环境验证
 
@@ -137,7 +150,7 @@ M1 之后，M2、M3、M5、M6 可以并行。M5 依赖 demo 仓库自己的 CI �
 
 - [ ] README 的快速开始从零验证一遍（全新机器或全新 Kind 集群）。
 - [ ] 架构设计定稿，补充关键技术选型理由。
-- [ ] 录制演示视频：开 PR → 评审 → 预览验证 → 自动合并；穿插一次 Pod 崩溃恢复和成本看板。
+- [ ] 录制演示视频：开 PR → 评审 → 预览验证 → AI 投票并与人工审批一起满足合并要求（再演示一次 auto 模式自动合并）；穿插一次 Pod 崩溃恢复和成本看板。
 - [ ] 发布镜像与 chart 的版本 tag。
 
 验收：评委按 README 能在本机复现；视频覆盖"发现 → 分析 → 定位 → 修复建议 → 验证"的完整闭环。
