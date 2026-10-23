@@ -9,7 +9,7 @@
 | [骨架](#骨架) | 仓库结构、4 个镜像、Helm chart、Makefile、CI；gateway 签名校验；状态机与表结构 | `make lint`、`make test` 通过；Kind 上 4 个 Pod 就绪；签名正确的 webhook 返回 202，错误返回 401 | ✅ 完成 |
 | [M0](#m0-runner-本地模式) | runner 本地模式：pi SDK + 重写的提示词 + `submit_review` | 对 3 个历史 PR 输出合法的 schema v3 JSON，质量不低于 v1 | ✅ 完成 |
 | [M1](#m1-最小闭环) | 最小闭环：gateway 写库 + controller 建 Job + fetch 拉代码，Kind 上跑通 | 开 PR 后自动出现 Check Run 和评审评论；结论为 approve 时 AI 投出的 APPROVE 计入必需审批数 | ✅ 完成 |
-| [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | 未开始 |
+| [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | 🟡 验收项通过，经 LiteLLM 的完整评审待补测 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | 未开始 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | 未开始 |
 | [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
@@ -109,6 +109,18 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 - [x] 验证 `max_budget` 超出后 proxy 拒绝请求，run 以 `failed(budget_exceeded)` 结束。
 
 验收：在 runner 容器里执行 `env` 看不到真实密钥；`curl` 任意外网地址失败。
+
+验收记录（2026-10-23，Kind，单独的 `ai-pr-review-m2` namespace，LiteLLM `v1.104.2`，评审对象为本仓库 [PR #5](https://github.com/RooobinYe/ai-pr-review-cloud/pull/5)）：
+
+| 检查 | 结果 |
+| --- | --- |
+| fetch 经 controller 代理拉代码 | 第一次失败：libcurl 对不带端口的代理地址默认用 1080；改为显式端口后，`api.github.com` 和 `github.com` 都经代理访问成功 |
+| runner 容器的 `env` | 只有 `LLM_API_KEY`（25 个字符的 LiteLLM 虚拟 key）和 `RUN_TOKEN` 两个凭据；没有 GitHub token、代理凭据、App 私钥、webhook secret、master key |
+| runner 容器访问外网 | `https://example.com`、`https://api.github.com`、`http://1.1.1.1`、`https://api.deepseek.com` 全部超时；controller 和 LiteLLM 可达（runner 镜像没有 curl，用 `node` 的 `fetch` 测） |
+| runner 容器使用 controller 的代理 | 不带凭据 407；用 `RUN_TOKEN` 或虚拟 key 冒充代理凭据 403 |
+| 预算 | 预算为 0 的 run：LiteLLM 拒绝第一个请求，run 以 `failed`、原因 `budget_exceeded: ...` 结束，Check Run 显示同一原因；本地对 mock 上游验证了花费累积到上限后拒绝 |
+| 吊销 | 上面两次失败的 run 结束后，LiteLLM 里不再有有效 key |
+| 经 LiteLLM 调用 DeepSeek | 请求带真实 key 转发到了 DeepSeek，返回 402 Insufficient Balance（账户余额不足）；runner 不再追加提醒，原样报告失败。**完整评审（流式输出、thinking、工具调用经 LiteLLM）还没跑通，充值后补测** |
 
 ## M3 可靠性
 

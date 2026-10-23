@@ -468,6 +468,7 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 - **pi 的 `usage` 字段。** 已确认含 `cacheRead`、`cacheWrite`，DeepSeek 会填充 `cacheRead`（§4.5）；金额按 pi 目录单价计算，LiteLLM 按 `llm.pricing` 单独记账，两者的交叉校验在 M6 的测算里做。
 - **自定义模型接入。** DeepSeek 是 pi 内置 provider，指向 LiteLLM 只需覆盖 `baseUrl`；`deepseek-flash` 在 M0 的三个 PR 上都一次调用成功 `submit_review`。换用其他模型时要重新验证工具调用的稳定性。
 - **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库，不能与本系统共用一个库的不同 schema：v1.104.2 的迁移在非 `public` schema 下失败）。已用 v1.104.2 验证 `max_budget` 在花费达到上限后拒绝请求（422，`type: budget_exceeded`），删除后的 key 立即失效；`/key/info` 里的 `spend` 是批量写库的，比实际花费滞后，不能用来判断是否超预算。
+- **DNS 仍是一条出站通道。** runner 可以查询任意域名，集群 DNS 会替它递归解析，理论上能把少量数据编码进查询名带出去。代价是必须先拿到值得带出的数据：runner 只有本 run 的虚拟 key（有预算、会吊销）和被评审的代码。需要堵住时，可以给 CoreDNS 配置只解析集群内域名的视图。
 - **NetworkPolicy 依赖 CNI。** Kind 的 kindnet 通过 kube-network-policies 实施，策略对新 Pod 的生效有几秒延迟（Pod IP 被异步加入规则集，此前 fail-open）。runner Pod 里先跑的是 fetch，模型在这之后才启动，所以这段窗口里没有不可信代码在运行；不实施 NetworkPolicy 的 CNI 上这层隔离不存在，chart 无法替你检查。
 - **工具链版本较新。** runner 用 TypeScript 7.0、Go 镜像用 `golang:1.27`，本地验证通过，GitHub Actions 上还没跑过。
 - **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，controller 发布时以结果里的 `head_sha` 为 `commit_id`，PR 之后的推送不会让锚点错位；GitHub 仍拒绝时把评论折叠进正文（§6.3）。
