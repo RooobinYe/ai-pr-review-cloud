@@ -13,9 +13,10 @@ import { Value } from "typebox/value";
 import { commentableLines } from "./diff.ts";
 import type { PiModel, ThinkingLevel } from "./model.ts";
 import type { PRContext } from "./pr.ts";
-import { RESUME_PROMPT, SUBMIT_REMINDER, systemPrompt, userPrompt } from "./prompts.ts";
+import { BUDGET_REMINDER, RESUME_PROMPT, SUBMIT_REMINDER, systemPrompt, userPrompt } from "./prompts.ts";
 import { ReviewSubmissionSchema, type ReviewSubmission } from "./schema.ts";
-import { gitTool, invalidAnchors, submitReviewTool } from "./tools.ts";
+import { gitTool, invalidAnchors, normalizePath, submitReviewTool } from "./tools.ts";
+import { overNudgeThreshold, turnProblem } from "./usage.ts";
 
 /** Reminders sent when the model stops without calling submit_review. */
 export const MAX_SUBMIT_REMINDERS = 2;
@@ -30,6 +31,8 @@ export interface ReviewOptions {
   modelRuntime: ModelRuntime;
   thinkingLevel: ThinkingLevel;
   language: string;
+  /** Spending at which the model is told to submit (§7.3); none when unset. */
+  budgetUSD?: number;
   onProgress?: (line: string) => void;
   /** Session entries of an earlier attempt to continue from (docs/architecture.md §4.3). */
   resumeFrom?: FileEntry[];
@@ -37,7 +40,7 @@ export interface ReviewOptions {
    * Called after every turn with the session so far. Calls run one at a time
    * in turn order; a failing call is reported and does not stop the review.
    */
-  onTurn?: (snapshot: TurnSnapshot) => Promise<void>;
+  onTurn?: (snapshot: TurnSnapshot) => void | Promise<void>;
 }
 
 /** The state after one completed turn: what a later attempt resumes from. */
@@ -58,6 +61,8 @@ export interface TurnSnapshot {
 export interface ReviewOutcome {
   submission: ReviewSubmission;
   stats: SessionStats;
+  /** Whether the budget reminder was sent. */
+  nudged: boolean;
 }
 
 /** A review that ended without a submission; carries the usage spent on it. */
@@ -123,7 +128,9 @@ export function acceptedSubmission(entries: FileEntry[], commentable: Map<string
     for (const c of m.content as Entry[]) {
       if (c.type !== "toolCall" || c.name !== "submit_review" || !accepted.has(c.id)) continue;
       const args = c.arguments;
-      if (Value.Check(ReviewSubmissionSchema, args) && invalidAnchors(args.comments, commentable).length === 0) return args;
+      if (Value.Check(ReviewSubmissionSchema, args) && invalidAnchors(args.comments, commentable).length === 0) {
+        return { ...args, comments: args.comments.map((comment) => ({ ...comment, path: normalizePath(comment.path) })) };
+      }
     }
   }
   return undefined;
@@ -195,13 +202,23 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
 
   // Snapshots are taken synchronously at turn_end, while the session matches
   // the turn, and uploaded in order behind each other.
+  let spent = session.getSessionStats().cost;
+  let nudged = false;
   let uploads = Promise.resolve();
   const unsubscribe = session.subscribe((event) => {
-    if (event.type === "turn_end" && opts.onTurn) {
+    if (event.type === "turn_end") {
       const snapshot = snapshotOf(sessionManager, event.message);
+      const problem = turnProblem(event.message);
+      if (problem) opts.onProgress?.(problem.text);
+      spent += snapshot.cost;
+      if (!nudged && !submission && overNudgeThreshold(spent, opts.budgetUSD)) {
+        nudged = true;
+        opts.onProgress?.(`spent ${spent.toFixed(4)} of the ${opts.budgetUSD} budget; asking the model to submit`);
+        session.steer(BUDGET_REMINDER).catch((err: unknown) => opts.onProgress?.(`budget reminder failed: ${String(err)}`));
+      }
       const onTurn = opts.onTurn;
       uploads = uploads
-        .then(() => onTurn(snapshot))
+        .then(() => onTurn?.(snapshot))
         .catch((err: unknown) => opts.onProgress?.(`saving turn ${snapshot.turn} failed: ${err instanceof Error ? err.message : String(err)}`));
     } else if (event.type === "tool_execution_start") {
       opts.onProgress?.(describeToolCall(event.toolName, event.args ?? {}));
@@ -232,7 +249,7 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
     await uploads;
     const stats = session.getSessionStats();
     if (!submission) throw new ReviewNotSubmittedError(stats);
-    return { submission, stats };
+    return { submission, stats, nudged };
   } finally {
     unsubscribe();
     session.dispose();

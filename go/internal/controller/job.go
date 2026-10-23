@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -103,6 +104,10 @@ func BuildJob(cfg JobConfig, r store.Run) kube.Job {
 			runnerEnv = append(runnerEnv, kube.EnvVar{Name: name, Value: v})
 		}
 	}
+	if r.BudgetUSD > 0 {
+		// The runner asks the model to wrap up at 80% of it (§7.3).
+		runnerEnv = append(runnerEnv, kube.EnvVar{Name: "REVIEW_BUDGET_USD", Value: strconv.FormatFloat(r.BudgetUSD, 'f', -1, 64)})
+	}
 
 	return kube.Job{
 		Metadata: kube.ObjectMeta{Name: r.JobName, Labels: labels},
@@ -177,6 +182,17 @@ func BuildRunSecret(job kube.Job, githubToken, runToken string) kube.Secret {
 	}
 }
 
+// FetchTiming returns when the fetch init container of a runner Pod ran, and
+// false until it has finished successfully.
+func FetchTiming(pod kube.Pod) (started, finished time.Time, ok bool) {
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if t := cs.State.Terminated; cs.Name == "fetch" && t != nil && t.ExitCode == 0 && !t.StartedAt.IsZero() && !t.FinishedAt.IsZero() {
+			return t.StartedAt, t.FinishedAt, true
+		}
+	}
+	return time.Time{}, time.Time{}, false
+}
+
 // PodFailure explains why a runner Pod failed, from its container states, and
 // reports whether the container said retrying cannot help (run.ExitFinal). It
 // returns "" when no container has failed.
@@ -188,7 +204,7 @@ func PodFailure(pod kube.Pod) (reason string, final bool) {
 				if msg == "" {
 					msg = t.Reason
 				}
-				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncate(msg, 1500)), t.ExitCode == run.ExitFinal
+				return fmt.Sprintf("%s exited with code %d: %s", cs.Name, t.ExitCode, truncateFront(strings.TrimSpace(msg), 1500)), t.ExitCode == run.ExitFinal
 			}
 			if w := cs.State.Waiting; w != nil && w.Reason != "" && w.Reason != "PodInitializing" && w.Reason != "ContainerCreating" {
 				return fmt.Sprintf("%s is stuck: %s %s", cs.Name, w.Reason, truncate(w.Message, 500)), false
@@ -207,4 +223,16 @@ func truncate(s string, n int) string {
 		n--
 	}
 	return s[:n] + "…"
+}
+
+// truncateFront keeps the last n bytes of s, without splitting a UTF-8 sequence.
+func truncateFront(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return "…" + s[i:]
 }

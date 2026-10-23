@@ -1,0 +1,34 @@
+{
+  "pr": "go-chi/chi#1159",
+  "head_sha": "0802ce17c110795f14827f1f0b046d51458b5268",
+  "model": "deepseek/deepseek-flash",
+  "thinking": "high",
+  "budget_usd": null,
+  "files": 2,
+  "changed_lines": 45,
+  "seconds": {
+    "fetch": 1.9,
+    "clone": 3.328,
+    "review": 117.028,
+    "total": 122.259
+  },
+  "turns": 17,
+  "tool_calls": 27,
+  "tokens": {
+    "input": 18872,
+    "output": 17149,
+    "cache_read": 328192,
+    "cache_write": 0
+  },
+  "cost_usd": 0.028209551999999992,
+  "nudged": false,
+  "verdict": "approve",
+  "comments": {
+    "critical": 0,
+    "high": 0,
+    "medium": 1,
+    "low": 0
+  },
+  "error": null,
+  "tier": "small"
+}

@@ -17,6 +17,37 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 )
 
+func TestMigrateIndependentMilestones(t *testing.T) {
+	for _, migration := range []string{"0002_metrics.sql", "0002_recovery.sql"} {
+		t.Run(migration, func(t *testing.T) {
+			s := testStore(t, "migrations/0001_init.sql", "migrations/"+migration)
+			ctx := context.Background()
+			if err := s.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Ready(ctx); err != nil {
+				t.Fatal(err)
+			}
+			id, _, err := s.RecordTrigger(ctx, "migration-upgrade", newRun("a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Claim(ctx, 1, jobName); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PutUsage(ctx, id, Usage{Turn: 1, Model: "m", CacheReadTokens: 5, CostUSD: 0.1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PutSession(ctx, id, 1, []byte("session")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Stats(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestActionKindsMatchMigration(t *testing.T) {
 	sql, err := os.ReadFile("migrations/0001_init.sql")
 	if err != nil {
@@ -45,7 +76,7 @@ func TestStatesMatchMigration(t *testing.T) {
 }
 
 // testStore migrates a fresh schema in the database named by TEST_DATABASE_URL.
-func testStore(t *testing.T) *Store {
+func testStore(t *testing.T, priorMigrations ...string) *Store {
 	t.Helper()
 	base := os.Getenv("TEST_DATABASE_URL")
 	if base == "" {
@@ -80,6 +111,26 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
+	if len(priorMigrations) > 0 {
+		if _, err := s.pool.Exec(ctx, "CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range priorMigrations {
+			sql, err := Migrations.ReadFile(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.pool.Exec(ctx, strings.ReplaceAll(string(sql), "IF NOT EXISTS ", "")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.pool.Exec(ctx, "INSERT INTO schema_migration (version) VALUES ($1)", name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Ready(ctx); err == nil {
+			t.Fatal("partially migrated database is ready")
+		}
+	}
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}

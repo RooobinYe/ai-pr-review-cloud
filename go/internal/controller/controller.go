@@ -35,6 +35,7 @@ type Store interface {
 	PutSession(ctx context.Context, id string, turn int, jsonl []byte) error
 	GetSession(ctx context.Context, id string) ([]byte, int, error)
 	PutUsage(ctx context.Context, id string, u store.Usage) error
+	RecordFetchTiming(ctx context.Context, runID string, started, finished time.Time) error
 }
 
 // GitHubClient is the subset of *githubapp.Client the controller uses.
@@ -443,6 +444,9 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 		return errors.New("reviewed run has no result")
 	}
 	res := *r.Result
+	if !r.FetchTimed {
+		c.recordFetchTiming(ctx, r)
+	}
 	gh := c.gh.Client(r.InstallationID)
 	// The vote actually cast. If the controller restarted after voting, the
 	// Check Run falls back to the verdict's vote.
@@ -472,13 +476,13 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 	if err != nil {
 		return err
 	}
-	if checkRunID, opened := r.Actions[store.ActionCheckRunCreate]; opened {
+	id, err := checkRun(ctx, gh, r)
+	if err != nil {
+		return err
+	}
+	if id != 0 {
 		err = c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
-			id, err := strconv.ParseInt(checkRunID, 10, 64)
-			if err != nil {
-				return "", err
-			}
-			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res, event))
+			return strconv.FormatInt(id, 10), gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res, event))
 		})
 		if err != nil {
 			return err
@@ -491,6 +495,26 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 	}
 	c.runLog(r).Info("run done", "verdict", res.Verdict)
 	return nil
+}
+
+// recordFetchTiming copies when fetch ran from the runner Pod into the run, for
+// the fetch phase metric (§7.1). It only feeds metrics, so a failure is logged
+// and publishing goes on; the Pod lingers until the Job's TTL, so a later pass
+// can still record it.
+func (c *Controller) recordFetchTiming(ctx context.Context, r store.Run) {
+	pods, err := c.kube.ListPods(ctx, "job-name="+r.JobName)
+	if err != nil {
+		c.runLog(r).Warn("read runner pod for fetch timing", "err", err)
+		return
+	}
+	for _, p := range pods {
+		if started, finished, ok := FetchTiming(p); ok {
+			if err := c.store.RecordFetchTiming(ctx, r.ID, started, finished); err != nil {
+				c.runLog(r).Warn("record fetch timing", "err", err)
+			}
+			return
+		}
+	}
 }
 
 // voteEvent picks the review event. An approval is only cast while the

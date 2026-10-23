@@ -19,6 +19,7 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/controller"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/githubapp"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
+	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/metrics"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/store"
 )
 
@@ -69,6 +70,8 @@ func run(log *slog.Logger) error {
 	if err := migrate(ctx, log, db); err != nil {
 		return err
 	}
+	// Metrics come from the database, so they work without a GitHub App too.
+	mux.Handle("GET /metrics", metrics.Handler(db.Stats, log))
 	ctl, err := newController(ctx, log, db)
 	if err != nil {
 		return err

@@ -96,6 +96,24 @@ func (c *Controller) callerRun(w http.ResponseWriter, req *http.Request) (r stor
 	return r, true
 }
 
+// maxUsageBytes bounds a usage report, a handful of numbers.
+const maxUsageBytes = 4 << 10
+
+// ValidUsage checks a usage report before it is stored.
+func ValidUsage(u store.Usage) error {
+	switch {
+	case u.Turn < 1:
+		return fmt.Errorf("turn must be at least 1, got %d", u.Turn)
+	case u.Model == "" || len(u.Model) > 200:
+		return errors.New("model must be 1 to 200 bytes")
+	case u.InputTokens < 0 || u.OutputTokens < 0 || u.CacheReadTokens < 0 || u.CacheWriteTokens < 0:
+		return errors.New("token counts must not be negative")
+	case !(u.CostUSD >= 0 && u.CostUSD < 1000): // also rejects NaN
+		return fmt.Errorf("cost_usd must be in [0, 1000), got %v", u.CostUSD)
+	}
+	return nil
+}
+
 func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 	r, ok := c.callerRun(w, req)
 	if !ok {
@@ -197,17 +215,21 @@ func (c *Controller) handlePutUsage(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	var u store.Usage
-	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, 64<<10))
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, maxUsageBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&u); err != nil {
 		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if u.Turn < 0 || u.Model == "" || u.InputTokens < 0 || u.OutputTokens < 0 || u.CacheReadTokens < 0 || u.CacheWriteTokens < 0 || u.CostUSD < 0 {
-		http.Error(w, "invalid usage: negative counts or missing model", http.StatusBadRequest)
+	if err := ValidUsage(u); err != nil {
+		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := c.store.PutUsage(req.Context(), r.ID, u); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown run", http.StatusNotFound)
+			return
+		}
 		c.runLog(r).Error("record usage", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

@@ -72,7 +72,7 @@ func final(err error) bool {
 
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "fetch: "+format+"\n", args...)
-	os.Exit(1)
+	os.Exit(run.ExitFinal)
 }
 
 func envOr(key, fallback string) string {

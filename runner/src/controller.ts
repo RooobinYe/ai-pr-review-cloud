@@ -1,6 +1,8 @@
 // Cluster mode: report to the controller (docs/architecture.md §4.2, §4.3).
 // The runner has no GitHub credentials; the controller performs every write.
 import type { ReviewResult } from "./schema.ts";
+import type { TurnUsage } from "./usage.ts";
+import type { TurnSnapshot } from "./review.ts";
 
 export interface CallOptions {
   /** The run's callback token (RUN_TOKEN), sent as a bearer token. */
@@ -13,17 +15,6 @@ export interface CallOptions {
 
 /** A response the controller will not change its mind about, such as a result for the wrong commit. */
 export class RejectedError extends Error {}
-
-/** One turn's model usage, as PUT /runs/{id}/usage takes it. */
-export interface TurnUsage {
-  turn: number;
-  model: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
-  cost_usd: number;
-}
 
 const retryable = (status: number) => status >= 500 || status === 408 || status === 429;
 
@@ -67,6 +58,14 @@ async function call(
 }
 
 const runPath = (runId: string, rest: string) => `/runs/${encodeURIComponent(runId)}/${rest}`;
+
+export async function putCheckpoint(controllerUrl: string, runId: string, snapshot: TurnSnapshot, opts: CallOptions): Promise<void> {
+  await putUsage(controllerUrl, runId, {
+    turn: snapshot.turn, model: snapshot.model, input_tokens: snapshot.input, output_tokens: snapshot.output,
+    cache_read_tokens: snapshot.cacheRead, cache_write_tokens: snapshot.cacheWrite, cost_usd: snapshot.cost,
+  }, opts).catch((err: unknown) => opts.log?.(`usage for turn ${snapshot.turn} not recorded: ${String(err)}`));
+  await putSession(controllerUrl, runId, snapshot.turn, snapshot.jsonl, opts);
+}
 
 /**
  * POSTs the result to {controllerUrl}/runs/{runId}/result. 8 attempts back off

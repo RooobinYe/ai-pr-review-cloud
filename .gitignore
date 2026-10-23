@@ -7,6 +7,9 @@
 node_modules/
 /runner/dist/
 
+# Cost benchmark run logs and review texts (bench/results is kept)
+/bench/logs/
+
 # Local secrets and planning
 .env
 .env.*

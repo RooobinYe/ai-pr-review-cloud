@@ -79,6 +79,23 @@ func TestLostPodResumesFromSnapshot(t *testing.T) {
 	}
 }
 
+func TestResultBeforeReconcileRecoversUnrecordedCheck(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	delete(h.store.runs[runID].Actions, store.ActionCheckRunCreate)
+	h.restart()
+	h.post(result(review.VerdictApprove))
+	h.reconcile()
+	h.reconcile()
+	updates := h.gh.checkRuns[100]
+	if h.state().State != run.StateDone || len(h.gh.checkRuns) != 1 || len(h.gh.posted) != 1 {
+		t.Fatalf("state %s, checks %d, reviews %d", h.state().State, len(h.gh.checkRuns), len(h.gh.posted))
+	}
+	if updates[len(updates)-1].Status != "completed" || h.state().Actions[store.ActionCheckRunComplete] != "100" {
+		t.Fatalf("check was not completed: %+v", updates)
+	}
+}
+
 func TestRetriesStopAtMaxAttempts(t *testing.T) {
 	h := newHarness()
 	h.reconcile()

@@ -18,12 +18,13 @@ import (
 
 // fakeStore mirrors the semantics of *store.Store in memory.
 type fakeStore struct {
-	mu       sync.Mutex
-	runs     map[string]*store.Run
-	seq      int
-	sessions map[string]session
-	usage    map[string]map[int]store.Usage
-	now      func() time.Time
+	mu           sync.Mutex
+	runs         map[string]*store.Run
+	seq          int
+	sessions     map[string]session
+	usage        map[string]map[int]store.Usage
+	fetchSeconds map[string]float64
+	now          func() time.Time
 	// crashOn makes the next RecordAction of that kind fail, as if the
 	// controller stopped right after the GitHub write.
 	crashOn store.ActionKind
@@ -197,8 +198,18 @@ func (s *fakeStore) Transition(_ context.Context, id string, from, to run.State,
 	return nil
 }
 
-// fakeGitHub records every write. Reviews it accepts show up in ListReviews
-// as the bot's, like on GitHub.
+func (s *fakeStore) RecordFetchTiming(_ context.Context, id string, started, finished time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runs[id].FetchTimed = true
+	if s.fetchSeconds == nil {
+		s.fetchSeconds = map[string]float64{}
+	}
+	s.fetchSeconds[id] = finished.Sub(started).Seconds()
+	return nil
+}
+
+// fakeGitHub records every write.
 type fakeGitHub struct {
 	mu          sync.Mutex
 	head        string

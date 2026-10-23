@@ -68,9 +68,12 @@ type Run struct {
 	Verdict        review.Verdict
 	Result         *review.Result
 	Error          string
+	BudgetUSD      float64
 	CreatedAt      time.Time
 	// ClaimedAt is when the current attempt was claimed.
 	ClaimedAt time.Time
+	// FetchTimed reports whether the fetch phase's timing has been recorded.
+	FetchTimed bool
 	// Actions maps each completed GitHub action to its external ID.
 	Actions map[ActionKind]string
 }
@@ -175,7 +178,8 @@ func (s *Store) RecordTrigger(ctx context.Context, deliveryID string, nr NewRun)
 }
 
 const runColumns = `r.id, r.repo, r.pr_number, r.head_sha, r.installation_id, r.state, r.attempt,
-	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.created_at,
+	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.budget_usd::float8, r.created_at,
+	r.fetch_finished_at IS NOT NULL,
 	COALESCE(r.claimed_at, r.created_at),
 	COALESCE((SELECT jsonb_object_agg(a.kind, a.external_id) FROM github_action a
 	          WHERE a.run_id = r.id AND a.external_id IS NOT NULL), '{}')`
@@ -184,7 +188,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var result, actions []byte
 	err := row.Scan(&r.ID, &r.Repo, &r.PRNumber, &r.HeadSHA, &r.InstallationID, &r.State, &r.Attempt,
-		&r.JobName, &r.Verdict, &result, &r.Error, &r.CreatedAt, &r.ClaimedAt, &actions)
+		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &r.ClaimedAt, &actions)
 	if err != nil {
 		return Run{}, err
 	}
@@ -251,7 +255,7 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 		for _, r := range queued {
 			r.State, r.Attempt = run.StateRunning, r.Attempt+1
 			r.JobName = jobName(r.ID, r.Attempt)
-			if err := tx.QueryRow(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, claimed_at = now(), updated_at = now()
+			if err := tx.QueryRow(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, claimed_at = now(), started_at = COALESCE(started_at, now()), updated_at = now()
 				WHERE id = $1 RETURNING claimed_at`, r.ID, r.State, r.Attempt, r.JobName).Scan(&r.ClaimedAt); err != nil {
 				return err
 			}
@@ -319,7 +323,7 @@ func (s *Store) SubmitResult(ctx context.Context, id string, res review.Result) 
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = 'reviewed', verdict = $2, result = $3, updated_at = now()
+	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = 'reviewed', verdict = $2, result = $3, reviewed_at = now(), updated_at = now()
 		WHERE id = $1 AND state = 'running'`, id, res.Verdict, data)
 	if err != nil {
 		return fmt.Errorf("submit result for run %s: %w", id, err)
@@ -338,8 +342,9 @@ func (s *Store) Transition(ctx context.Context, id string, from, to run.State, r
 	}
 	// Reasons quote external messages; PostgreSQL rejects invalid UTF-8.
 	reason = strings.ToValidUTF8(reason, "\uFFFD")
-	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now()
-		WHERE id = $1 AND state = $2`, id, from, to, reason)
+	tag, err := s.pool.Exec(ctx, `UPDATE review_run SET state = $3, error = COALESCE(NULLIF($4, ''), error), updated_at = now(),
+		finished_at = CASE WHEN $5 THEN now() ELSE finished_at END
+		WHERE id = $1 AND state = $2`, id, from, to, reason, to.Terminal())
 	if err != nil {
 		return fmt.Errorf("transition run %s to %s: %w", id, to, err)
 	}
@@ -388,34 +393,8 @@ func (s *Store) GetSession(ctx context.Context, id string) (jsonl []byte, turn i
 	return jsonl, turn, nil
 }
 
-// Usage is the model usage of one turn.
-type Usage struct {
-	Turn             int     `json:"turn"`
-	Model            string  `json:"model"`
-	InputTokens      int     `json:"input_tokens"`
-	OutputTokens     int     `json:"output_tokens"`
-	CacheReadTokens  int     `json:"cache_read_tokens"`
-	CacheWriteTokens int     `json:"cache_write_tokens"`
-	CostUSD          float64 `json:"cost_usd"`
-}
-
-// PutUsage records one turn's usage. Reporting a turn again replaces it, so
-// retried uploads are not counted twice. Usage is accepted in any state: the
-// tokens were spent either way.
 func (s *Store) PutUsage(ctx context.Context, id string, u Usage) error {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO run_usage (run_id, turn, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-		SELECT id, $2, $3, $4, $5, $6, $7, $8 FROM review_run WHERE id = $1
-		ON CONFLICT (run_id, turn) DO UPDATE SET model = EXCLUDED.model, input_tokens = EXCLUDED.input_tokens,
-			output_tokens = EXCLUDED.output_tokens, cache_read_tokens = EXCLUDED.cache_read_tokens,
-			cache_write_tokens = EXCLUDED.cache_write_tokens, cost_usd = EXCLUDED.cost_usd`,
-		id, u.Turn, u.Model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens, u.CostUSD)
-	if err != nil {
-		return fmt.Errorf("record usage of run %s: %w", id, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.RecordUsage(ctx, id, u)
 }
 
 // Ready reports whether the newest embedded migration has been applied, so
@@ -423,18 +402,20 @@ func (s *Store) PutUsage(ctx context.Context, id string, u Usage) error {
 // then: GitHub does not retry a webhook it failed to record.
 func (s *Store) Ready(ctx context.Context) error {
 	names, err := fs.Glob(Migrations, "migrations/*.sql")
-	if err != nil || len(names) == 0 {
-		return fmt.Errorf("no migrations embedded: %v", err)
+	if err != nil {
+		return fmt.Errorf("list migrations: %w", err)
 	}
-	latest := slices.Max(names)
+	if len(names) == 0 {
+		return errors.New("no migrations embedded")
+	}
 	// Fails with "relation does not exist" before the first migration.
 	var applied bool
-	err = s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migration WHERE version = $1)", latest).Scan(&applied)
+	err = s.pool.QueryRow(ctx, "SELECT count(*) = $2 FROM schema_migration WHERE version = ANY($1)", names, len(names)).Scan(&applied)
 	if err != nil {
 		return fmt.Errorf("check schema: %w", err)
 	}
 	if !applied {
-		return fmt.Errorf("schema migration %s is not applied yet", latest)
+		return errors.New("schema migrations are not all applied yet")
 	}
 	return nil
 }

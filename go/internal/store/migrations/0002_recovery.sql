@@ -6,5 +6,5 @@ ALTER TABLE review_run ADD COLUMN claimed_at timestamptz;
 
 -- Cache hits are billed differently from fresh input (§4.5).
 ALTER TABLE run_usage
-  ADD COLUMN cache_read_tokens  int NOT NULL DEFAULT 0,
-  ADD COLUMN cache_write_tokens int NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS cache_read_tokens  int NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS cache_write_tokens int NOT NULL DEFAULT 0;

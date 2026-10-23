@@ -46,7 +46,7 @@ async function fauxModel(dir: string) {
   return { faux, modelRuntime, model: modelRuntime.getModel("faux", "faux-1")! };
 }
 
-async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefined, responses: Parameters<ReturnType<typeof createFauxCore>["setResponses"]>[0]) {
+async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefined, responses: Parameters<ReturnType<typeof createFauxCore>["setResponses"]>[0], budgetUSD?: number) {
   const dir = await mkdtemp(join(tmpdir(), "review-test-"));
   await writeFile(join(dir, "a.go"), "new\n");
   const { faux, modelRuntime, model } = await fauxModel(dir);
@@ -61,6 +61,7 @@ async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefine
     thinkingLevel: "off",
     language: "English",
     resumeFrom,
+    budgetUSD,
     onTurn: async (s) => {
       snapshots.push(s);
     },
@@ -104,6 +105,20 @@ test("a review submitted before the crash is reported without calling the model"
   assert.equal(second.faux.state.callCount, 0);
 });
 
+test("budget reminders include spending from the restored session", async () => {
+  const exploring = fauxAssistantMessage(fauxToolCall("read", { path: "a.go" }));
+  const first = await run(undefined, [exploring, fauxAssistantMessage(fauxToolCall("submit_review", submission))]);
+  const saved = parseSessionEntries(first.snapshots[0]!.jsonl);
+  for (const entry of saved) {
+    if (entry.type === "message" && entry.message.role === "assistant") entry.message.usage.cost.total = 0.9;
+  }
+  const second = await run(saved, [
+    fauxAssistantMessage(fauxToolCall("read", { path: "a.go" })),
+    fauxAssistantMessage(fauxToolCall("submit_review", submission)),
+  ], 1);
+  assert.equal(second.outcome.nudged, true);
+});
+
 test("acceptedSubmission ignores rejected calls", async () => {
   const first = await run(undefined, [
     fauxAssistantMessage(fauxToolCall("submit_review", { ...submission, comments: [{ ...submission.comments[0]!, line: 99 }] })),
@@ -113,6 +128,16 @@ test("acceptedSubmission ignores rejected calls", async () => {
   const commentable = commentableLines(pr.diff);
   assert.equal(acceptedSubmission(parseSessionEntries(first.snapshots[1]!.jsonl), commentable), undefined, "rejected anchor counted as submitted");
   assert.deepEqual(acceptedSubmission(parseSessionEntries(first.snapshots.at(-1)!.jsonl), commentable), submission);
+});
+
+test("a recovered submission keeps normalized comment paths", async () => {
+  const first = await run(undefined, [fauxAssistantMessage(fauxToolCall("submit_review", {
+    ...submission,
+    comments: [{ ...submission.comments[0]!, path: "./b/a.go" }],
+  }))]);
+  const second = await run(parseSessionEntries(first.snapshots.at(-1)!.jsonl), []);
+  assert.deepEqual(second.outcome.submission, submission);
+  assert.equal(second.faux.state.callCount, 0);
 });
 
 test("a failed model request is retryable, not a missing submission", async () => {

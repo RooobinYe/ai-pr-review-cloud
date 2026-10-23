@@ -1,0 +1,34 @@
+{
+  "pr": "RooobinYe/ai-pr-review#12",
+  "head_sha": "4f9c1664799b2611a778426ad7db5f4b2e8b7146",
+  "model": "deepseek/deepseek-flash",
+  "thinking": "low",
+  "budget_usd": null,
+  "files": 3,
+  "changed_lines": 19,
+  "seconds": {
+    "fetch": 1.529,
+    "clone": 3.148,
+    "review": 36.477,
+    "total": 41.155
+  },
+  "turns": 9,
+  "tool_calls": 24,
+  "tokens": {
+    "input": 15143,
+    "output": 5255,
+    "cache_read": 107648,
+    "cache_write": 0
+  },
+  "cost_usd": 0.011494787999999999,
+  "nudged": false,
+  "verdict": "approve",
+  "comments": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 0
+  },
+  "error": null,
+  "tier": "small"
+}

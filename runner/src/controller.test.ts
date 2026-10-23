@@ -4,10 +4,28 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
-import { getSession, postResult, putSession, putUsage, RejectedError } from "./controller.ts";
+import { getSession, postResult, putCheckpoint, putSession, putUsage, RejectedError } from "./controller.ts";
 import type { ReviewResult } from "./schema.ts";
 
 const RESULT = JSON.parse(readFileSync(join(import.meta.dirname, "../../contract/examples/valid-approve.json"), "utf8")) as ReviewResult;
+
+test("checkpoint uploads usage even when the snapshot is rejected, and snapshots when usage fails", async () => {
+  for (const rejected of ["session", "usage"]) {
+    const seen: string[] = [];
+    await withServer(
+      (req, _body, res) => {
+        seen.push(req.url!);
+        res.writeHead(req.url!.includes(rejected) ? 409 : 204).end();
+      },
+      async (url) => {
+        const uploading = putCheckpoint(url, "r1", { turn: 1, jsonl: "{}\n", model: "m", input: 1, output: 2, cacheRead: 3, cacheWrite: 0, cost: 0.01 }, { token: "t" });
+        if (rejected === "session") await assert.rejects(uploading, RejectedError);
+        else await uploading;
+      },
+    );
+    assert.deepEqual(seen, ["/runs/r1/usage", "/runs/r1/session?turn=1"]);
+  }
+});
 
 async function withServer(handler: (req: IncomingMessage, body: string, res: ServerResponse) => void, fn: (url: string) => Promise<void>) {
   const server = createServer((req, res) => {
@@ -86,4 +104,18 @@ test("putSession and putUsage send the turn", async () => {
     "PUT /runs/r1/session?turn=3 application/x-ndjson a\nb\n",
     'PUT /runs/r1/usage application/json {"turn":3,"model":"m","input_tokens":1,"output_tokens":2,"cache_read_tokens":3,"cache_write_tokens":0,"cost_usd":0.5}',
   ]);
+});
+
+test("putUsage PUTs one turn and gives up quickly", async () => {
+  const usage = { turn: 2, model: "deepseek/deepseek-flash", input_tokens: 10, output_tokens: 5, cache_read_tokens: 100, cache_write_tokens: 0, cost_usd: 0.001 };
+  const seen: string[] = [];
+  await withServer(
+    (req, body, res) => {
+      seen.push(`${req.method} ${req.url}`);
+      assert.deepEqual(JSON.parse(body), usage);
+      res.writeHead(503).end("busy");
+    },
+    (url) => assert.rejects(putUsage(url, "run-1", usage, { token: "t", retryDelayMs: 1 }), /usage failed after 3 attempts/),
+  );
+  assert.deepEqual(seen, Array(3).fill("PUT /runs/run-1/usage"));
 });
