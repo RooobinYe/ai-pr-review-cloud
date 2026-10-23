@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：M1 实现最小闭环（gateway 写库、controller 建 Job 并投票、fetch、runner 集群模式）；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M1 完成，最小闭环在本仓库的 PR 上实测通过；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -29,7 +29,7 @@ ai-pr-review v1 是一个本地 / CI 里运行的 CLI：输入 PR URL，克隆�
 
 **基础能力：PR 评审。** 沿用 v1 验证过的两阶段评审（先探索、再结论）。结论由模型自己决定：approve 还是 request_changes，加上一段评审正文和逐行评论，以 PR Review 和 Check Run 的形式呈现（§4.4）。
 
-**AI 作为审批人之一。** 安装后，AI 以 GitHub App bot 的身份参与评审，和人类审批人一样投票：结论为 approve 时提交 APPROVE review；发现问题时只提交 COMMENT review，指出问题但不阻塞合并。仓库要求"N 个 approval 才能合并"时，AI 的 approve 可以算作其中一票（是否计入待实测，见 §10），其余由人来投。这是默认的 `vote` 模式，controller 不执行合并（§6.3）。
+**AI 作为审批人之一。** 安装后，AI 以 GitHub App bot 的身份参与评审，和人类审批人一样投票：结论为 approve 时提交 APPROVE review；发现问题时只提交 COMMENT review，指出问题但不阻塞合并。仓库要求"N 个 approval 才能合并"时，AI 的 approve 算作其中一票（前提是 App 有 Contents: write，§6.4），其余由人来投。这是默认的 `vote` 模式，controller 不执行合并（§6.3）。
 
 **差异化能力：预览环境验证（按仓库开启）。** 只看代码看不出的问题，在运行起来以后才暴露：配置错误、镜像起不来、探针失败、资源不足、依赖服务连不上。开启后，controller 为 PR 创建独立的 namespace 并部署，agent 用 kubectl 查看 Pod 状态、事件和日志，把运行时证据和代码评审结论合在一起，再给出结论。
 
@@ -214,6 +214,8 @@ runner 交给 controller 的 `ReviewResult` 在此之外加上 `schema_version: 
 
 两侧定义：TypeScript 在 [`runner/src/schema.ts`](../runner/src/schema.ts)（TypeBox，同时作为 `submit_review` 的参数 schema），Go 在 [`go/internal/review`](../go/internal/review/review.go)。[`contract/review-result.schema.json`](../contract/review-result.schema.json) 由 TypeBox 生成，`contract/examples/` 里的合法、非法样例由两侧测试共同校验；Go 测试还会核对字段、枚举、上限与生成的 schema 一致，并检查 `verdict` 取值与数据库 CHECK 约束一致。
 
+逐行评论只留给合并前值得处理的问题（critical、high，以及中高置信度的 medium），通常 0 到 5 条；风格和低级别建议最多 3 条，以一行一条的形式写进正文的 "Minor" 部分。每条评论都要占用作者的注意力，评论太多反而会淹没真正的问题。
+
 提示词里的判定规则（`verdict_policy`）：存在中高置信度的 critical 或 high 问题时 request_changes；中低级别、风格建议和不确定的发现只作为评论，不阻塞合并；没能审到最可能出问题的部分时也应 request_changes 并说明原因。防幻觉规则沿用 v1：每条评论必须引用读到的代码，不确定的标 `[Uncertain]` 并给低置信度，critical/high 要做反向检验。
 
 ### 4.5 模型接入
@@ -279,7 +281,7 @@ AI 的身份是 GitHub App bot（如 `ai-pr-review[bot]`）。每个 run 结束�
 - **只在评审的提交仍是 head 时投 APPROVE。** 旧提交的 run 可能在新 run 撤销旧票之后才完成；此时投 APPROVE 会给没看过的代码计一票。所以投票前查一次 PR 的 head，不一致就改投 COMMENT。M3 的 `superseded` 会更早终止这类 run。
 - **逐行评论被拒时折叠进正文。** `submit_review` 已保证锚点落在 diff 内，GitHub 仍返回 422 时，controller 把评论按严重程度列进 review 正文重新提交，不丢内容。
 - **Check Run 的结论**：approve 为 `success`，request_changes 为 `neutral`（结论由投票表达；若仓库把 "AI Review" 设为必需检查，`failure` 会阻塞合并），run 失败为 `failure` 并附原因。
-- **AI 的票计入"需要 N 个 approval"的前提**是 GitHub 把 App 的 APPROVE 算作有效审批（待实测，§10）。branch protection 要求 Code Owners 审批时，这一项只能由人满足，App 不能成为 code owner。
+- **AI 的票计入"需要 N 个 approval"的前提**是 App 对仓库有写权限（Contents: write，M1 实测，§6.4）。branch protection 要求 Code Owners 审批时，这一项只能由人满足，App 不能成为 code owner。
 
 是否合并只在一个函数里决定：
 
@@ -299,10 +301,12 @@ func decideMerge(run ReviewRun, cfg RepoConfig) bool {
 | 项 | 取值 |
 | --- | --- |
 | 订阅事件 | `pull_request`（opened、synchronize、reopened、closed）、`issue_comment`（`/review`、`/merge`）、`pull_request_review` |
-| 权限 | Pull requests: write（投票、撤销旧票）、Contents: read（fetch 克隆代码；`auto` / `manual` 合并需要 write，M4）、Checks: write、Metadata: read |
+| 权限 | Pull requests: write（投票、撤销旧票）、Contents: write（见下）、Checks: write、Metadata: read |
 | 呈现方式 | 一个 "AI Review" Check Run 显示进度和结果摘要；一条 PR Review，正文为结论的 `body`，逐行评论来自 `comments` 的 `path`、`line`；review 事件按 `verdict` 取 APPROVE 或 COMMENT（§6.3） |
 
 gateway 已实现签名校验（`X-Hub-Signature-256`）和 `pull_request` 的 opened、synchronize、reopened 三种触发，按 delivery ID 去重后写入 `queued` 的 run；`closed`、`issue_comment`、`pull_request_review` 在 M3 到 M5 接入。
+
+**Contents 必须是 write，否则 AI 的票不算数。** 分支保护只计算对仓库有写权限的账号的审批，对 App 来说就是 Contents: write。M1 实测：App 只有 Contents: read 时，bot 的 APPROVE 显示在 PR 上，但 `reviewDecision` 仍为 `REVIEW_REQUIRED`；授予 write 后，同一张票不用重投就变成 `APPROVED`，说明 GitHub 按 App 当前的权限计算。代价是 controller 的 installation token 能写代码；它只在 controller 里，fetch 的 token 仍然限定为只读（`contents: read`）。`auto` / `manual` 模式的合并（M4）也依赖这项权限。
 
 controller 用 App 私钥签 JWT（RS256，9 分钟有效），换取 installation token：自己的写操作用全权限 token，按 installation 缓存、过期前 5 分钟续期；fetch 的 token 每个 run 单独签发，限定到被评审的仓库和 `contents`、`pull_requests`、`metadata` 的只读权限。bot 的登录名（`<slug>[bot]`）启动时通过 `GET /app` 取得，用来识别要撤销的旧票。
 
@@ -443,7 +447,7 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 - **LiteLLM 虚拟 key 与预算。** 依赖其 key 管理和花费统计（需要它自己的数据库）；落地前用选定版本验证 `max_budget` 是否按预期拒绝请求。
 - **工具链版本较新。** runner 用 TypeScript 7.0、Go 镜像用 `golang:1.27`，本地验证通过，GitHub Actions 上还没跑过。
 - **评论锚点与后续推送。** `submit_review` 保证评论落在 diff 内，controller 发布时以结果里的 `head_sha` 为 `commit_id`，PR 之后的推送不会让锚点错位；GitHub 仍拒绝时把评论折叠进正文（§6.3）。
-- **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；社区经验是专用 GitHub App 的 approve 会计入。M1 已验证 bot 能投出 APPROVE（`commit_id` 为评审的提交），是否计入还要在开启分支保护的仓库上实测：bot 加一个人能否合并。若不计入，退路是用一个机器用户账号投票，代价是要管理它的凭据。
+- **GitHub App 的 approve 是否计入"需要 N 个 approval"。** 这是 `vote` 模式的前提。GitHub 文档没有明确说明 App 的 review 是否计入，只明确说 Copilot 的 review 不计入；M1 已实测：App 有 Contents: write 时计入，只有 read 时不计入（§6.4）。在要求 1 个审批的分支上，bot 的一票就能满足要求；"AI 加一个人"的 2 票场景需要第二个人类账号，机制相同，留到 M7 演示时验证。
 - **撤销旧票的权限。** dismiss review 需要 App 有 Pull requests: write。M1 已在没有分支保护的仓库上验证 App 能 dismiss 自己的 APPROVE；若 branch protection 限制了谁能 dismiss review，要把 App 加入允许名单。
 - **webhook 丢失。** GitHub 不会自动重投失败的 delivery；本地开发时 smee 转发在 gateway 重启期间失败的事件同样会丢。可在 App 设置的 Advanced → Recent Deliveries 里手动重投（gateway 按 delivery ID 去重，重投安全）。生产部署需要定时对账：列出近期 delivery，重投失败的那些。
 - **预览环境的镜像约定。** 需要 demo 仓库的 CI 配合推送 `:<head_sha>` 镜像。

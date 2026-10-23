@@ -2,7 +2,7 @@
 
 装在 GitHub 上、跑在 Kubernetes 上的 AI PR 评审服务。PR 打开或更新时自动触发，每个 PR 在独立的 Pod 里由 agent 探索代码并给出结构化结论，结果以 Check Run 和 PR Review 呈现。AI 像人类审批人一样投票：没问题时提交 approve，可以计入"需要 N 个 approval"；有问题时只留评论、不阻塞合并。可按仓库开启自动合并和预览环境验证。
 
-> 状态：M1 最小闭环。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
+> 状态：M1 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
 
 ## 架构
 
@@ -48,7 +48,7 @@ make deploy
 1. 新建一个 smee.io 通道（打开 https://smee.io/new），记下地址。
 2. 在 GitHub 的 Settings → Developer settings → GitHub Apps 注册一个 App：
    - Webhook URL 填 smee 通道地址，Webhook secret 自己生成一个随机串；
-   - Repository 权限：Pull requests 读写、Checks 读写、Contents 只读、Metadata 只读；
+   - Repository 权限：Pull requests 读写、Checks 读写、Contents 读写、Metadata 只读（Contents 必须可写，否则 bot 的 APPROVE 不计入分支保护要求的审批数）；
    - 订阅事件：Pull request、Issue comment、Pull request review。
 3. 生成私钥（.pem，放在仓库外），把 App 安装到要评审的仓库。
 4. 设置环境变量后部署，再启动转发：

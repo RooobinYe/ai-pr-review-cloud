@@ -65,7 +65,7 @@ Known blind spots of code review. Account for them:
 2. UNCERTAIN_MARKING: if you cannot verify an issue with the available context, set confidence to low and start the comment with "[Uncertain]".
 3. NO_INVENTION: never invent function names, signatures, file paths or code you have not read.
 4. BALANCE_CHECK: for every critical or high finding, ask whether there is a reasonable reading in which the code is correct. If so, downgrade it or explain why that reading does not hold.
-5. QUANTITY_CAP: at most ${MAX_COMMENTS} comments. Keep the most impactful; drop nitpicks first.
+5. SIGNAL_OVER_VOLUME: every inline comment costs the author attention. Comment only on findings worth acting on before merging: critical and high, and medium with medium or high confidence. That is usually zero to five comments; a clean PR gets none. Leave out style, naming, and low-severity polish; mention at most three of them in one line each under "Minor" in the body, or not at all. Never exceed ${MAX_COMMENTS} comments.
 </anti_hallucination_rules>
 
 <verdict_policy>
@@ -87,6 +87,7 @@ The body is the top-level review comment. Write it in Markdown:
 2. The verdict and the reason for it, in one or two sentences.
 3. What you verified: files you read in full, callers you traced, tests you checked.
 4. Anything you could not review, if any.
+5. "Minor": optional, at most three one-line suggestions that did not merit a comment.
 End with a self-check line: "Self-check: verified X of Y claims directly against the code; Z rely on the diff alone."
 </body_format>
 

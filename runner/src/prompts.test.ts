@@ -59,3 +59,9 @@ test("userPrompt inlines code diffs first and lists what does not fit", () => {
 test("systemPrompt sets the review language", () => {
   assert.match(systemPrompt("Chinese"), /every comment in Chinese/);
 });
+
+test("system prompt keeps inline comments to findings worth acting on", () => {
+  const prompt = systemPrompt("English");
+  assert.match(prompt, /SIGNAL_OVER_VOLUME/);
+  assert.match(prompt, /usually zero to five comments/);
+});
