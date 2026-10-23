@@ -518,6 +518,8 @@ runner 镜像也可以脱离集群单独使用：`docker run` 加 `--pr <url>` �
 
 ## 10. 风险与待确认
 
+- **Kind 上的启动隔离窗口。** 2026-10-24 的 [整合验收](kind-integration-acceptance.md) 中，匹配 runner NetworkPolicy 的新探测 Pod 启动立即访问外网成功，稳定后被阻断；旧 M2 namespace/镜像也复现。当前 kindnet 的稳态策略有效，但不能把 fetch init 的耗时当作启动隔离保证。此环境限制尚未解决。
+
 - **run 进行中的失败处理。** Pod 失败按 §4.3 重试并从快照续跑；超时、确定性退出码、GitHub 返回确定性错误（401、403（限流除外）、404、410、422）时，run 直接置为 `failed`；投票被拒也一样（`reviewed` → `failed`）。失败一律写到 Check Run，Check Run 还没创建时补建一个已失败的；连 Check Run 都写不进去时只记日志，不再重试。
 - **快照的体积。** 每轮上传完整 session，总流量随轮数平方增长。M3 实测 9 轮约 250 KB，集群内网可以接受；单个快照上限 32 MiB。若长评审成为瓶颈，再改为只上传新增 entry。
 - **pi SDK 版本变动快。** 包名已从 `@mariozechner` 迁到 `@earendil-works`，初始化方式也从 `AuthStorage` 换成了 `ModelRuntime`，两周内从 1.1 发到 1.4。目前精确锁定 `1.3.0`，升级单独提交并跑一遍 M0 的验收。

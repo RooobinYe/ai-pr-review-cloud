@@ -100,6 +100,8 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 ## M2 安全边界
 
+2026-10-24 最新 main 的 [Kind 整合验收](kind-integration-acceptance.md) 已跑通 M2/M3/M6 主流程；发现旧 M2 环境同样存在的 kindnet Pod 启动隔离窗口，稳态外网阻断通过，但启动瞬间隔离仍待解决。
+
 目标：模型和 runner 拿不到任何真实凭据，也连不上外网。
 
 - [x] chart 加入 LiteLLM proxy（`v1.104.2`），真实模型 key 只放在 proxy 里。
