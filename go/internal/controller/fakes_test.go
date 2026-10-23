@@ -68,7 +68,7 @@ func (s *fakeStore) Claim(_ context.Context, maxRunning int, jobName func(string
 	defer s.mu.Unlock()
 	inFlight := 0
 	for _, r := range s.runs {
-		if r.State == run.StateRunning {
+		if r.State == run.StateRunning || r.State == run.StatePreviewing {
 			inFlight++
 		}
 	}
@@ -92,7 +92,7 @@ func (s *fakeStore) Active(context.Context) ([]store.Run, error) {
 	var out []store.Run
 	for _, r := range s.sorted() {
 		unreported := (r.State == run.StateFailed || r.State == run.StateSuperseded) && !r.Done(store.ActionCheckRunComplete)
-		if r.State == run.StateRunning || r.State == run.StateReviewed || r.State == run.StateAwaitingApproval || r.State == run.StateMerging || unreported {
+		if r.State == run.StateRunning || r.State == run.StatePreviewing || r.State == run.StateReviewed || r.State == run.StateAwaitingApproval || r.State == run.StateMerging || unreported {
 			out = append(out, s.copyOf(r))
 		}
 	}
@@ -434,6 +434,20 @@ func (f *fakeKeys) Delete(_ context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.live, key)
+	return nil
+}
+
+func (s *fakeStore) TransitionAttempt(_ context.Context, id string, attempt int, from, to run.State) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.runs[id]
+	if r == nil || r.Attempt != attempt || r.State != from {
+		return store.ErrConflict
+	}
+	if !run.CanTransition(from, to) {
+		return fmt.Errorf("invalid transition")
+	}
+	r.State = to
 	return nil
 }
 

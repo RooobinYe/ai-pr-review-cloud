@@ -1,0 +1,4 @@
+image:
+  repository: ghcr.io/rooobinye/ai-pr-review-cloud-preview
+  tag: dev
+readinessPath: /healthz

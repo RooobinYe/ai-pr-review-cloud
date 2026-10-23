@@ -34,6 +34,7 @@ type Store interface {
 	RecordAction(ctx context.Context, runID string, kind store.ActionKind, externalID string) error
 	SubmitResult(ctx context.Context, id string, res review.Result) error
 	Transition(ctx context.Context, id string, from, to run.State, reason string) error
+	TransitionAttempt(ctx context.Context, id string, attempt int, from, to run.State) error
 	PutSession(ctx context.Context, id string, turn int, jsonl []byte) error
 	GetSession(ctx context.Context, id string) ([]byte, int, error)
 	PutUsage(ctx context.Context, id string, u store.Usage) error
@@ -87,6 +88,7 @@ type Config struct {
 	// EgressHosts are the host:port pairs fetch may reach through EgressProxy.
 	EgressHosts []string
 	Job         JobConfig
+	Preview     *PreviewConfig
 }
 
 type Controller struct {
@@ -179,7 +181,7 @@ func (c *Controller) runLog(r store.Run) *slog.Logger {
 
 func (c *Controller) advance(ctx context.Context, r store.Run) error {
 	switch r.State {
-	case run.StateRunning, run.StateReviewed, run.StateAwaitingApproval, run.StateMerging:
+	case run.StateRunning, run.StatePreviewing, run.StateReviewed, run.StateAwaitingApproval, run.StateMerging:
 		step := c.advanceRunning
 		if r.State == run.StateReviewed {
 			step = c.publish
@@ -241,7 +243,7 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		if err := c.deleteJob(ctx, r.JobName); err != nil {
 			return err
 		}
-		return c.fail(ctx, r, run.StateRunning, fmt.Sprintf("attempt %d timed out: no result %s after it was claimed", r.Attempt, elapsed.Round(time.Second)))
+		return c.fail(ctx, r, r.State, fmt.Sprintf("attempt %d timed out: no result %s after it was claimed", r.Attempt, elapsed.Round(time.Second)))
 	}
 	gh := c.gh.Client(r.InstallationID)
 	err := c.once(ctx, &r, store.ActionDismissStaleApprovals, func() (string, error) {
@@ -276,7 +278,7 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 	// Revoke old approvals before validating configuration: even a malformed
 	// policy must not leave an earlier commit's approval counting for new code.
 	r, err = c.loadConfig(ctx, r)
-	if err != nil || r.State != run.StateRunning {
+	if err != nil || (r.State != run.StateRunning && r.State != run.StatePreviewing) {
 		return err
 	}
 
@@ -290,7 +292,7 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 	if _, failed := job.Status.Condition(kube.JobFailed); failed {
 		reason, retryable := c.jobFailure(ctx, job)
 		// A result may have arrived just before the Pod failed.
-		if cur, err := c.store.Get(ctx, r.ID); err != nil || cur.State != run.StateRunning {
+		if cur, err := c.store.Get(ctx, r.ID); err != nil || (cur.State != run.StateRunning && cur.State != run.StatePreviewing) {
 			return err
 		}
 		return c.retryOrFail(ctx, r, reason, retryable)
@@ -298,10 +300,10 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 	if _, complete := job.Status.Condition(kube.JobComplete); complete {
 		// A result moves the run to reviewed before the runner exits. Re-read
 		// in case it arrived after this pass listed the run.
-		if cur, err := c.store.Get(ctx, r.ID); err != nil || cur.State != run.StateRunning {
+		if cur, err := c.store.Get(ctx, r.ID); err != nil || (cur.State != run.StateRunning && cur.State != run.StatePreviewing) {
 			return err
 		}
-		return c.fail(ctx, r, run.StateRunning, "runner exited without submitting a review")
+		return c.fail(ctx, r, r.State, "runner exited without submitting a review")
 	}
 	// The controller may have stopped between creating the Job and its Secret.
 	if _, err := c.kube.GetSecret(ctx, runSecretName(r.JobName)); !errors.Is(err, kube.ErrNotFound) {
@@ -376,16 +378,16 @@ func (c *Controller) jobFailure(ctx context.Context, job kube.Job) (reason strin
 // from the run's last session snapshot.
 func (c *Controller) retryOrFail(ctx context.Context, r store.Run, reason string, retryable bool) error {
 	if !retryable {
-		return c.fail(ctx, r, run.StateRunning, reason)
+		return c.fail(ctx, r, r.State, reason)
 	}
 	if r.Attempt >= c.cfg.MaxAttempts {
-		return c.fail(ctx, r, run.StateRunning, fmt.Sprintf("gave up after %d attempts; the last one failed: %s", r.Attempt, reason))
+		return c.fail(ctx, r, r.State, fmt.Sprintf("gave up after %d attempts; the last one failed: %s", r.Attempt, reason))
 	}
 	c.revokeKey(ctx, r)
 	if err := c.deleteJob(ctx, r.JobName); err != nil {
 		return err
 	}
-	err := c.store.Transition(ctx, r.ID, run.StateRunning, run.StateQueued, reason)
+	err := c.store.Transition(ctx, r.ID, r.State, run.StateQueued, reason)
 	if errors.Is(err, store.ErrConflict) {
 		return nil
 	}

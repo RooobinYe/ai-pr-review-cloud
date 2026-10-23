@@ -1,6 +1,6 @@
 # ai-pr-review-cloud 架构设计
 
-> 状态：M1、M3、M4、M6 完成，最小闭环与删除 Pod 后恢复完成均在本仓库的 PR 上实测通过，成本测算见 [cost-report](cost-report.md)；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
+> 状态：M1、M2、M3、M4、M5、M6 完成，最小闭环与删除 Pod 后恢复完成均在本仓库的 PR 上实测通过，成本测算见 [cost-report](cost-report.md)；其余按 [roadmap](roadmap.md) 推进 · 目标：赛道 B「云原生 Agent 实战」参赛作品
 > 前身：[ai-pr-review v1](https://github.com/RooobinYe/ai-pr-review)（Go CLI，见 §8.1） · 赛题见 [赛道B-AI-Application-赛题.md](赛道B-AI-Application-赛题.md)
 
 ## 0. 背景与目标
@@ -76,7 +76,7 @@ stateDiagram-v2
     [*] --> queued: pull_request opened / synchronize 或 /review 评论
     queued --> running: controller 领取并创建 Job
     running --> previewing: 仓库开启了预览，且评审阶段完成
-    previewing --> running: 预览部署就绪，进入验证阶段
+    previewing --> running: 预览就绪或等待超时，进入验证阶段
     running --> reviewed: runner 提交结论
     reviewed --> done: 已投票；approvalMode = vote（默认），或结论不是 approve
     reviewed --> awaiting_approval: approvalMode = manual 且结论为 approve
@@ -88,7 +88,8 @@ stateDiagram-v2
     merging --> failed: 合并被 GitHub 拒绝
     running --> queued: Pod 失败且未超过重试次数
     running --> failed: 超过重试次数或超时
-    previewing --> failed: 预览部署超时
+    previewing --> failed: 尝试超时或不可恢复错误
+    previewing --> queued: Pod 失败，重试部署与评审
     queued --> superseded: 新的 head_sha 到达
     running --> superseded
     previewing --> superseded
@@ -160,7 +161,7 @@ runner 在集群模式下把失败原因写进 `/dev/termination-log`。容器�
 
 1. 读 `/workspace/pr.json`，构造系统提示词和用户提示词。提示词按 v1 的防幻觉规则重写，放在 `runner/src/prompts.ts`。
 2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
-3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才加入 `bash`，其中的 `kubectl` 只能访问这个 namespace。
+3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才启用受限的 `kubectl` 工具，只允许读取这个 namespace 的 Pod、事件、Deployment、ReplicaSet 和日志，不开放 shell。
 4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。最后一轮是模型服务报错（pi 重试后仍失败，例如 402 余额不足）时不再提醒，直接以 `model API error: ...` 失败，免得被误读成模型不肯提交。
 5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`，带 `Authorization: Bearer <RUN_TOKEN>`，controller 读本 run 的 Secret 比对，不符返回 401：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
 
@@ -295,17 +296,26 @@ LiteLLM 自己的入站也用 NetworkPolicy 限定为 runner 和 controller。
 - runner 所在 namespace 配 `ResourceQuota` 和 `LimitRange`，防止一次大 PR 吃光节点。
 - Job 设置 `activeDeadlineSeconds`、`ttlSecondsAfterFinished`；`backoffLimit: 0`，重试由 controller 统一决定（这样才能带上 session 快照恢复，§4.3）。
 - 冷启动优化：runner 镜像预装 pi 依赖和 git（M5 再加 kubectl）；fetch 阶段浅克隆（depth 1 + 按需拉 base）。实测后再决定要不要加 git mirror 缓存。
-- 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 GitHub token 和代理凭据、runner 的回调 token 和虚拟 key）。M5 的预览环境需要创建 namespace，届时再加一个只含 `namespaces` 的 ClusterRole。
+- 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 GitHub token 和代理凭据、runner 的回调 token 和虚拟 key）。开启 M5 预览时，另外启用 §6.2 的 ClusterRole，授予动态 namespace 及明确列出的预览资源权限。
 - Kubernetes 访问：controller 只用到 Job、Secret、Pod 的少数几个调用，`go/internal/kube` 直接调 REST API（in-cluster token 每次请求重读），不引入 client-go，controller 镜像保持在十几 MB。M5 需要部署 Helm chart 时再评估。
 - 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run，并按仓库策略推进到 `done`、`awaiting_approval` 或 `merging`；等待人工确认时回收 runner Job 和虚拟 key，确认权限及当前 head 后才合并；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。
 - 同一 PR 的新提交到达后，旧 run 只要还没到 `reviewed`（`queued`、`running`、`previewing`、`awaiting_approval`）就被取代，它的 Job 连同 Pod 和 Secret 一起删除（`propagationPolicy: Background`），之后再到的结果、快照都被拒绝。已经 `reviewed` 的 run 让它投完：投票前会检查 head（§6.3）。
 
 ### 6.2 预览环境
 
-- 仓库在 `.ai-pr-review.yaml` 里声明部署方式（Helm chart 路径或 kustomize 目录）。
+- 仓库在 `.ai-pr-review.yaml` 里声明 Helm chart 路径和可选 values 文件（初版不支持 kustomize）。
 - controller 创建 `pr-<owner>-<repo>-<n>` namespace，配 ResourceQuota，用 PR 的镜像 tag 部署，等待 Ready 或超时。
 - PR 关闭或合并时删除 namespace；另有定时清理，删掉超过 24 小时的孤儿 namespace。
 - 构建镜像依赖仓库自己的 CI。demo 里约定 PR 的 CI 推送 `:<head_sha>` 镜像，controller 等这个 tag 出现。
+
+M5 预览实现约定（验收记录见 roadmap）：
+
+- 本仓库新增独立 HTTP 示例应用作为预览目标；故障验收 PR 只修改示例 chart 的 readiness 路径，避免破坏评审服务本身。
+- runner 在代码探索后把配置和 chart 的普通文件作为有大小上限的数据包交给 controller。controller 离线执行 `helm template`，强制操作者映射中的 `image.repository` 和 `image.tag=<head_sha>`，并检查实际镜像完整匹配，先校验全部资源，再部署；不执行 PR 程序、Helm 插件或下载依赖。初版只支持 Deployment、ClusterIP Service 和 ConfigMap。
+- 预览 namespace 使用 ResourceQuota、Restricted Pod Security admission 和默认拒绝网络策略。只读 ServiceAccount 的短期 token 在等待 Ready 或超时后才交给 runner，只在内存中保存，经 stdin 传入 kubectl，不写入文件或工具输出；超时保留现场，由模型读取实际证据，不能仅凭超时推断探针错误。
+- `previewing` 表示部署等待，结束后返回 `running` 做运行时评审。此阶段失败可回到 `queued` 重试；状态取值未新增，数据库 CHECK 中已有 `previewing`。
+- “ClusterRole 只含 namespaces”的权限不足以在动态 namespace 中创建工作负载、配额和只读授权。采用显式开关的预览 ClusterRole，列出所需资源及操作；Kubernetes RBAC 不能按 namespace 名称前缀约束它，controller 必须校验归属。chart 通过 `preview.enabled` 显式开启，默认关闭。开启时 controller 必须为单副本，升级使用 Recreate，避免多个进程同时部署同一 PR。
+- PR 关闭清理由 controller 定时查询 GitHub 状态执行，使漏收 closed webhook 时也能清理；超过 24 小时、PR 已不可访问或没有进行中评审的 namespace 作为孤儿清理；GitHub 暂时出错时不删除。清理在取得该 PR 的锁后重新读取 namespace 的归属和创建时间，避免旧列表误删刚重建的环境。gateway 保持只记录触发的边界。
 
 ### 6.3 投票与合并
 
@@ -381,7 +391,7 @@ preview:
 
 controller 在创建 runner Job 前，从 PR **目标分支的 base SHA** 读取根目录 `.ai-pr-review.yaml`，将解析结果与 SHA 一起保存到 run；重试与恢复复用快照。PR 中修改配置不会改变自身的合并模式，新配置合入目标分支后才对新 run 生效。
 
-没有配置文件或省略字段时，`approvalMode` 默认 `vote`，`failOn` 默认 `high`，预算和语言沿用部署默认值（语言为空时用 `zh`）。模式只接受 `vote`、`auto`、`manual`，阈值接受 `critical`、`high`、`medium`、`low`，预算必须是有限非负数；零预算会在发放虚拟 key 时结束为预算耗尽。配置最多 64 KiB，未知字段、重复字段、多 YAML 文档和非法值使 run 失败并报告 Check Run，不启动 runner。`preview` 字段目前只保留解析兼容，执行能力在 M5 实现。
+没有配置文件或省略字段时，`approvalMode` 默认 `vote`，`failOn` 默认 `high`，预算和语言沿用部署默认值（语言为空时用 `zh`）。模式只接受 `vote`、`auto`、`manual`，阈值接受 `critical`、`high`、`medium`、`low`，预算必须是有限非负数；零预算会在发放虚拟 key 时结束为预算耗尽。配置最多 64 KiB，未知字段、重复字段、多 YAML 文档和非法值使 run 失败并报告 Check Run，不启动 runner。`preview` 字段在策略快照中保留解析兼容。M5 的部署参数和 chart 来自被评审的 head，由 runner 打包后交给 controller 校验；可信镜像仓库映射和集群开关由操作者设置。它们不会改变 base SHA 决定的合并策略。
 
 `failOn` 在 controller 里对 `result.comments` 做确定性校验：模型给了 approve 但存在 `severity` 达到阈值的评论时，结论改写为 request_changes，即只发 COMMENT、不投 APPROVE。这是把原 CLI 的 `--fail-on` 门禁搬到服务端，作为模型判断之外的一道确定性兜底。
 
@@ -411,11 +421,11 @@ controller 的 `GET /metrics`（与 runner 回调同一个端口）输出以下�
 | `publish` | 收到结果 → done：投票、完成 Check Run | `reviewed_at` → `finished_at`（进入终态时写入） |
 | `total` | 创建 → done | `created_at` → `finished_at` |
 
-fetch 的起止时间由 controller 在发布投票前读 runner Pod 的状态得到（只用于指标，读取失败只记日志）。预览阶段在 M5 加入。
+fetch 的起止时间由 controller 在发布投票前读 runner Pod 的状态得到（只用于指标，读取失败只记日志）。M5 的预览部署等待和运行时检查目前计入 `review`，尚未拆分独立阶段指标。
 
 **指标在抓取时由数据库计算**，controller 不在内存里累计。这样 controller 重启后计数不归零，多副本时每个副本报出的值一致，Prometheus 只需抓任意一个副本。代价是每次抓取扫描所有 done run，演示规模下可以忽略；run 数量大时改为只扫描最近一段时间，或在状态转换时累加计数。Prometheus 文本格式手写输出，不引入 client 库，与不用 client-go 的理由相同（§6.1）。
 
-**用量由 runner 每轮上报**：`turn_end` 时 runner 把本轮 assistant 消息的 `usage`（含 `cacheRead`、`cacheWrite`）`PUT /runs/{id}/usage`，带 `RUN_TOKEN`；同一轮重复上报覆盖，不累加。上报在后台按顺序进行，失败只少一个样本，不影响评审；提交结果前等待上报完成，所以 done run 的花费是完整的。run 处于 `running` 或 `previewing` 以外的状态时不接受上报（409）。
+**用量由 runner 每轮上报**：`turn_end` 时 runner 把本轮 assistant 消息的 `usage`（含 `cacheRead`、`cacheWrite`）`PUT /runs/{id}/usage`，带 `RUN_TOKEN`；同一轮重复上报覆盖，不累加。上报在后台按顺序进行，失败只少一个样本，不影响评审；提交结果前等待上报完成，所以 done run 的花费是完整的。用量在任何状态下都可记录；已经花费的金额不会因状态变化而丢失。
 
 | 来源 | 内容 |
 | --- | --- |
@@ -521,7 +531,7 @@ chart 目前包含：
 - 仅供开发用的单副本 PostgreSQL（`postgres.dev.enabled`，数据不持久化）；关闭后通过 `database.existingSecret` 接入外部数据库。
 - 仅供开发用的 Prometheus 和 Grafana（`monitoring.dev.enabled`，不持久化）：Prometheus 抓取 controller 的 `/metrics`，Grafana 预置数据源和成本看板，匿名只读。生产环境关闭它，用已有的监控抓取 controller Service 并导入看板 JSON。
 
-预览环境所需的 ClusterRole 在 M5 加入。
+预览环境所需的 ClusterRole 由 `preview.enabled` 显式开启，默认关闭。配置、升级和验收步骤见 [预览验证](preview.md)。
 
 `make deploy` 的密钥只从环境变量读取：`GITHUB_WEBHOOK_SECRET`（缺省时用一个固定的开发值）、`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY_FILE`、`LLM_API_KEY`（真实模型 key，交给 LiteLLM）。没有 App ID 时 controller 照常启动，但 run 停在 `queued`，所以不配置 GitHub App 也能把整套服务拉起来。
 

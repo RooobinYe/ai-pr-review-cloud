@@ -1,0 +1,5 @@
+apiVersion: v2
+name: preview-demo
+version: 0.1.0
+type: application
+description: Isolated HTTP application for runtime review acceptance

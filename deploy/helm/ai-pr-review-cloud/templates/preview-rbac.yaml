@@ -1,0 +1,50 @@
+{{- if .Values.preview.enabled }}
+{{- if not .Values.preview.imageRepositories }}
+{{- fail "preview.imageRepositories must map approved repositories to their image repositories" }}
+{{- end }}
+{{- if ne (int .Values.controller.replicas) 1 }}
+{{- fail "preview requires one controller replica to serialize deployments per PR" }}
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "aprc.fullname" . }}-{{ .Release.Namespace }}-preview
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "delete"]
+  # Dynamic namespaces cannot be covered by a static namespaced RoleBinding.
+  # The controller checks ownership and resource allowlists before deployment.
+  - apiGroups: [""]
+    resources: ["resourcequotas", "serviceaccounts", "services", "configmaps"]
+    verbs: ["create", "get", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["preview-reader"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["create", "get", "list", "watch", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "aprc.fullname" . }}-{{ .Release.Namespace }}-preview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "aprc.fullname" . }}-{{ .Release.Namespace }}-preview
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "aprc.fullname" . }}-controller
+    namespace: {{ .Release.Namespace }}
+{{- end }}

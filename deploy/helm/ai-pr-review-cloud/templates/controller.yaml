@@ -46,6 +46,9 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.controller.replicas }}
+  {{- if .Values.preview.enabled }}
+  strategy: { type: Recreate, rollingUpdate: null }
+  {{- end }}
   selector:
     matchLabels: {{- include "aprc.selector" $sel | nindent 6 }}
   template:
@@ -61,6 +64,10 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
           env:
+            - name: PREVIEW_IMAGE_REPOSITORIES
+              value: {{ toJson .Values.preview.imageRepositories | quote }}
+            - name: PREVIEW_ENABLED
+              value: {{ .Values.preview.enabled | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef: { name: {{ include "aprc.databaseSecret" . }}, key: DATABASE_URL }
@@ -109,12 +116,17 @@ spec:
               value: {{ .Values.runs.deadlineSeconds | quote }}
             - name: RUNNER_RESOURCES
               value: {{ toJson .Values.runner.resources | quote }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
           readinessProbe:
             httpGet: { path: /readyz, port: http }
           livenessProbe:
             httpGet: { path: /healthz, port: http }
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
           securityContext: {{- include "aprc.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
 ---
 # Runner callbacks (result, session snapshot, usage) and fetch's egress proxy
 # to GitHub arrive here.

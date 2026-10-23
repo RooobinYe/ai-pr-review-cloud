@@ -12,7 +12,7 @@
 | [M2](#m2-安全边界) | 安全边界：LiteLLM 虚拟 key、NetworkPolicy | runner 容器里 `env` 看不到任何真实密钥；`curl` 外网失败 | ✅ 完成 |
 | [M3](#m3-可靠性) | 可靠性：幂等、session 快照恢复、superseded | 评审中途 `kubectl delete pod`，run 自动恢复且 PR 上没有重复评论 | ✅ 完成 |
 | [M4](#m4-仓库配置与可选合并模式) | 仓库配置与可选合并模式（默认 vote 只投票） | 默认只投票不合并；auto 模式下 approve 后自动合并；manual 模式下等待期间无 runner Pod，`/merge` 后合并 | ✅ 完成 |
-| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | 未开始 |
+| [M5](#m5-预览环境验证) | 预览环境验证 | 故意提交一个探针配置错误的 PR，agent 通过 kubectl 发现并给出 request_changes | ✅ 完成 |
 | [M6](#m6-成本看板与测算报告) | 成本看板与测算报告 | Grafana 看板 + 成本测算结果 | ✅ 完成 |
 | [M7](#m7-参赛交付) | 参赛交付：演示视频、文档定稿 | 评委按 README 能在本机复现，视频覆盖完整闭环 | 未开始 |
 
@@ -169,14 +169,25 @@ AI 的发现中有一个安全问题（回调未鉴权，可伪造结论让 bot 
 
 目标：把运行时证据纳入评审结论。
 
-- [ ] demo 仓库的 CI 为每个 PR 推送 `:<head_sha>` 镜像。
-- [ ] controller 增加只含 `namespaces` 的 ClusterRole；为 PR 创建 `pr-<owner>-<repo>-<n>` namespace 并配 ResourceQuota。
-- [ ] 按 `.ai-pr-review.yaml` 的 `preview` 配置用 Helm 部署，等待 Ready 或超时。
-- [ ] runner 镜像加入 kubectl；预览阶段使用只能读该 namespace 的 ServiceAccount。
-- [ ] runner 收到 follow-up 提示后用 kubectl 检查 Pod、事件、日志。
-- [ ] PR 关闭时删除 namespace；定时清理超过 24 小时的孤儿 namespace。
+配置与权限范围见 [预览验证](preview.md)。实现 PR 为 [#9](https://github.com/RooobinYe/ai-pr-review-cloud/pull/9)，故障验收使用本仓库的独立示例应用。
+
+- [x] demo 仓库的 CI 为每个 PR 推送 `:<head_sha>` 镜像。
+- [x] controller 通过显式开关启用预览 ClusterRole（namespace 及必要的预览资源权限，见架构 §6.2）；为 PR 创建 `pr-<owner>-<repo>-<n>` namespace 并配 ResourceQuota。
+- [x] 按 `.ai-pr-review.yaml` 的 `preview` 配置用 Helm 部署，等待 Ready 或超时。
+- [x] runner 镜像加入 kubectl；预览阶段使用只能读该 namespace 的 ServiceAccount。
+- [x] runner 收到 follow-up 提示后用 kubectl 检查 Pod、事件、日志。
+- [x] PR 关闭时删除 namespace；定时清理超过 24 小时的孤儿 namespace。
 
 验收：提交一个探针配置错误的 PR，agent 通过 kubectl 发现问题并给出 request_changes。
+
+验收记录（2026-10-24，Kind，`deepseek/deepseek-flash`，thinking high）：
+
+| PR / 场景 | 结果 | 耗时 / 花费 |
+| --- | --- | --- |
+| [#10](https://github.com/RooobinYe/ai-pr-review-cloud/pull/10)，head `f296c6f`，错误探针 | agent 通过 kubectl 读取 Pod、Deployment、事件和日志，确认 `/readyz` 返回 HTTP 404；request_changes，GitHub COMMENT | 209s / $0.0155 |
+| [#9](https://github.com/RooobinYe/ai-pr-review-cloud/pull/9)，head `dd2ef5a`，正常对照 | Pod `1/1 Ready`，agent 检查运行时证据后 APPROVE | 362s / $0.1512（含整个实现的代码评审） |
+
+故障 PR 已关闭且未合并，controller 自动删除了测试 namespace。只读账号不能读取 Secret、访问其他 namespace 或创建 Deployment；预览应用不挂载凭据。本次使用签名 webhook 重放，未覆盖 GitHub → smee 实时转发。
 
 ## M6 成本看板与测算报告
 

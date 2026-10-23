@@ -36,6 +36,7 @@ const sessionTurnHeader = "X-Session-Turn"
 // the controller and the current attempt's runner container can read.
 func (c *Controller) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /runs/{id}/result", c.handleResult)
+	mux.HandleFunc("POST /runs/{id}/preview", c.handlePreview)
 	mux.HandleFunc("PUT /runs/{id}/session", c.handlePutSession)
 	mux.HandleFunc("GET /runs/{id}/session", c.handleGetSession)
 	mux.HandleFunc("PUT /runs/{id}/usage", c.handlePutUsage)

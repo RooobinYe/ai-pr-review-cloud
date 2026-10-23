@@ -3,6 +3,7 @@
 //     /workspace and results go back to the controller.
 //   - local mode: --pr <url>; fetches the PR itself and prints the result,
 //     for development and CI use without a cluster.
+import { previewBundle, preparePreview } from "./preview.ts";
 import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -68,7 +69,7 @@ interface ReviewRun {
   nudged: boolean;
 }
 
-interface ReviewPROptions extends Pick<ReviewOptions, "resumeFrom" | "onTurn"> {
+interface ReviewPROptions extends Pick<ReviewOptions, "resumeFrom" | "onTurn" | "preparePreview"> {
   language: string;
   budgetUSD?: number;
 }
@@ -93,6 +94,7 @@ async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: Model
       onProgress: (line) => log(`  ${line}`),
       resumeFrom: opts.resumeFrom,
       onTurn: opts.onTurn,
+      preparePreview: opts.preparePreview,
     });
     log(formatUsage({ ...stats.tokens, cost: stats.cost }, (Date.now() - started) / 1000));
     const result: ReviewResult = {
@@ -196,7 +198,14 @@ async function cluster(runId: string): Promise<number> {
   const saved = await getSession(controllerUrl, runId, remote);
   const resumeFrom = saved ? parseSessionEntries(saved) : undefined;
   if (resumeFrom) log(`run ${runId}: resuming from a snapshot with ${resumeFrom.length} entries`);
+  const bundle = await previewBundle(join(workspace, "repo"));
   const { result } = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, {
+    preparePreview: bundle ? async () => {
+      log("deploying preview; waiting for Ready or timeout");
+      const access = await preparePreview(controllerUrl, runId, bundle, remote);
+      log(`preview ${access.namespace}: ${access.status}`);
+      return access;
+    } : undefined,
     language: process.env.REVIEW_LANGUAGE || values.language!,
     budgetUSD,
     resumeFrom,

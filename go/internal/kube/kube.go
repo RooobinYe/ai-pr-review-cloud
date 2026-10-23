@@ -88,6 +88,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	req.Header.Set("Accept", "application/json")
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
+		if method == http.MethodPatch {
+			req.Header.Set("Content-Type", "application/apply-patch+yaml")
+		}
 	}
 	res, err := c.HTTP.Do(req)
 	if err != nil {

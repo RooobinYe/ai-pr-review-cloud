@@ -1,0 +1,35 @@
+name: preview image
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    # Fork PRs do not receive package write credentials.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Authenticate registry client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # Registry auth is used by the client for pushing, never passed as a
+      # build argument, build secret, or file in the PR's build context.
+      - uses: docker/build-push-action@v6
+        with:
+          context: demo/preview
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/rooobinye/ai-pr-review-cloud-preview:${{ github.event.pull_request.head.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+      - name: Remove registry login
+        if: always()
+        run: docker logout ghcr.io
