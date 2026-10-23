@@ -52,6 +52,19 @@ func TestTimeoutRevokesBeforeDeletingSecret(t *testing.T) {
 	}
 }
 
+func TestFailedRunRevokesKeyAfterControllerRestart(t *testing.T) {
+	h := newHarness()
+	h.reconcile()
+	if err := h.store.Transition(context.Background(), runID, run.StateRunning, run.StateFailed, "controller stopped after persisting failure"); err != nil {
+		t.Fatal(err)
+	}
+	h.restart()
+	h.reconcile()
+	if len(h.keys.live) != 0 || !h.state().Done(store.ActionCheckRunComplete) {
+		t.Fatalf("failed run recovery: live keys=%d, actions=%v", len(h.keys.live), h.state().Actions)
+	}
+}
+
 func TestLostSecretResponseKeepsUsableKey(t *testing.T) {
 	h := newHarness()
 	h.reconcile()

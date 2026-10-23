@@ -405,7 +405,6 @@ func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reas
 	}
 	r.State, r.Error = run.StateFailed, reason
 	c.runLog(r).Warn("run failed", "reason", reason)
-	c.revokeKey(ctx, r)
 	return c.reportFailure(ctx, r)
 }
 
@@ -421,6 +420,7 @@ func checkRun(ctx context.Context, gh GitHubClient, r store.Run) (int64, error) 
 // reportFailure completes the run's Check Run as failed, creating one if the
 // run failed before opening it, so every failure is visible on the PR.
 func (c *Controller) reportFailure(ctx context.Context, r store.Run) error {
+	c.revokeKey(ctx, r)
 	gh := c.gh.Client(r.InstallationID)
 	return c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
 		id, err := checkRun(ctx, gh, r)
