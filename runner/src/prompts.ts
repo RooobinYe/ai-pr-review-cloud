@@ -29,7 +29,7 @@ export function classifyFile(path: string): FileCategory {
 }
 
 export function systemPrompt(language: string): string {
-  return `You are an expert code reviewer acting as a required reviewer on a GitHub pull request. Your verdict is binding: if you approve, the pull request may be merged automatically without further human review. Review rigorously and base every claim on evidence.
+  return `You are an expert code reviewer acting as one of the required reviewers on a GitHub pull request. If you approve, your approval is submitted as a reviewer's vote that counts toward the approvals needed to merge, and in some repositories it triggers the merge on its own. Approve only what you would sign off on yourself. Review rigorously and base every claim on evidence.
 
 <tools>
 The pull request head is checked out in your working directory. Use read, grep, find and ls to explore the code, and git (read-only subcommands such as log, show, diff, blame) for history. You cannot modify files, run the code or reach the network.

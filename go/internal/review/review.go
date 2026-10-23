@@ -19,8 +19,10 @@ const SchemaVersion = 3
 // MaxComments caps inline comments per review.
 const MaxComments = 15
 
-// Verdict is the model's merge decision. The store mirrors these values in the
-// review_run.verdict CHECK constraint; keep both in sync.
+// Verdict is the model's review decision. The controller votes APPROVE for
+// approve and COMMENT for request_changes (docs/architecture.md §6.3). The
+// store mirrors these values in the review_run.verdict CHECK constraint; keep
+// both in sync.
 type Verdict string
 
 const (
