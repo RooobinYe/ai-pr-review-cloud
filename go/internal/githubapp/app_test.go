@@ -189,3 +189,61 @@ func TestAPIErrorMessageStaysValidUTF8(t *testing.T) {
 		t.Errorf("message %q is not valid, truncated UTF-8", apiErr.Message)
 	}
 }
+
+func TestFindCheckRun(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/commits/abc/check-runs" || r.URL.Query().Get("check_name") != "AI Review" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"total_count":2,"check_runs":[{"id":1,"external_id":"other"},{"id":2,"external_id":"run-1"}]}`)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Token: StaticToken("t")}
+	for ext, want := range map[string]int64{"run-1": 2, "run-2": 0} {
+		if id, err := c.FindCheckRun(context.Background(), "o/r", "abc", "AI Review", ext); err != nil || id != want {
+			t.Errorf("FindCheckRun(%s) = %d, %v; want %d", ext, id, err, want)
+		}
+	}
+}
+
+func TestListReviewThreads(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		var req struct {
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Variables["owner"] != "o" || req.Variables["name"] != "r" || req.Variables["number"] != float64(7) {
+			fmt.Fprint(w, `{"errors":[{"message":"bad variables"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+			{"isResolved":true,"isOutdated":false,"path":"a.go","line":3,"originalLine":2,"comments":{"nodes":[{"author":{"login":"bot"},"body":"fixed?"}]}},
+			{"isResolved":false,"isOutdated":true,"path":"b.go","line":null,"originalLine":9,"comments":{"nodes":[{"author":null,"body":"ghost"}]}},
+			{"isResolved":false,"isOutdated":false,"path":"c.go","line":1,"originalLine":1,"comments":{"nodes":[]}}
+		]}}}}}`)
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+
+	threads, err := (&Client{BaseURL: srv.URL, Token: StaticToken("t")}).ListReviewThreads(ctx, "o/r", 7)
+	if err != nil || gotPath != "/graphql" {
+		t.Fatalf("threads %v, err %v, path %s", threads, err, gotPath)
+	}
+	want := []ReviewThread{
+		{Path: "a.go", Line: 3, Resolved: true, AuthorLogin: "bot", Body: "fixed?"},
+		{Path: "b.go", Line: 9, Outdated: true, Body: "ghost"},
+	}
+	if fmt.Sprint(threads) != fmt.Sprint(want) {
+		t.Errorf("threads = %+v, want %+v", threads, want)
+	}
+
+	if _, err := (&Client{BaseURL: srv.URL + "/api/v3", Token: StaticToken("t")}).ListReviewThreads(ctx, "o/r", 7); err != nil || gotPath != "/api/graphql" {
+		t.Errorf("GitHub Enterprise Server: path %s, err %v", gotPath, err)
+	}
+	if _, err := (&Client{BaseURL: srv.URL, Token: StaticToken("t")}).ListReviewThreads(ctx, "o/r", 8); err == nil || !strings.Contains(err.Error(), "bad variables") {
+		t.Errorf("GraphQL error not reported: %v", err)
+	}
+}

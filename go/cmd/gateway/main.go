@@ -41,6 +41,14 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	// Ready only once the controller has migrated the schema: GitHub does not
+	// retry a webhook the gateway failed to record, so none should reach a
+	// gateway that cannot record it.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := db.Ready(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		}
+	})
 	mux.Handle("POST /webhook", &gateway.Handler{Secret: []byte(secret), Recorder: db, BudgetUSD: budget, Log: log})
 
 	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}

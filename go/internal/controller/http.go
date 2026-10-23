@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/kube"
@@ -22,12 +23,21 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 // maxResultBytes bounds a posted result; 15 comments of Markdown fit easily.
 const maxResultBytes = 1 << 20
 
+// maxSessionBytes bounds a session snapshot. Tool output is capped per call,
+// so even a long review stays in the low megabytes.
+const maxSessionBytes = 32 << 20
+
+// sessionTurnHeader carries a snapshot's turn number on GET /runs/{id}/session.
+const sessionTurnHeader = "X-Session-Turn"
+
 // Routes registers the runner callback API on mux. Each call must carry the
 // run's RUN_TOKEN as a bearer token; it lives in the run's Secret, which only
-// the controller and that run's runner container can read.
+// the controller and the current attempt's runner container can read.
 func (c *Controller) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /runs/{id}/result", c.handleResult)
-	mux.HandleFunc("PUT /runs/{id}/usage", c.handleUsage)
+	mux.HandleFunc("PUT /runs/{id}/session", c.handlePutSession)
+	mux.HandleFunc("GET /runs/{id}/session", c.handleGetSession)
+	mux.HandleFunc("PUT /runs/{id}/usage", c.handlePutUsage)
 }
 
 // matchResult checks that a result belongs to the run it was posted for.
@@ -57,31 +67,31 @@ func (c *Controller) authorized(req *http.Request, r store.Run) (bool, error) {
 	return len(want) > 0 && subtle.ConstantTimeCompare([]byte(got), want) == 1, nil
 }
 
-// authorizedRun loads the run named in the path and checks the request's run
-// token, answering the request itself when either fails.
-func (c *Controller) authorizedRun(w http.ResponseWriter, req *http.Request) (store.Run, bool) {
+// callerRun loads the run named in the path and checks the caller's token. On
+// failure it has written the response and returns ok=false.
+func (c *Controller) callerRun(w http.ResponseWriter, req *http.Request) (r store.Run, ok bool) {
 	id := req.PathValue("id")
 	if !uuidPattern.MatchString(id) {
 		http.Error(w, "unknown run", http.StatusNotFound)
-		return store.Run{}, false
+		return r, false
 	}
 	r, err := c.store.Get(req.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		http.Error(w, "unknown run", http.StatusNotFound)
-		return store.Run{}, false
+		return r, false
 	}
 	if err != nil {
 		c.log.Error("load run", "run_id", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		return store.Run{}, false
+		return r, false
 	}
 	if ok, err := c.authorized(req, r); err != nil {
 		c.log.Error("check run token", "run_id", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		return store.Run{}, false
+		return r, false
 	} else if !ok {
 		http.Error(w, "missing or wrong run token", http.StatusUnauthorized)
-		return store.Run{}, false
+		return r, false
 	}
 	return r, true
 }
@@ -104,41 +114,12 @@ func ValidUsage(u store.Usage) error {
 	return nil
 }
 
-// handleUsage records one turn of model usage for the metrics (§7.1).
-func (c *Controller) handleUsage(w http.ResponseWriter, req *http.Request) {
-	r, ok := c.authorizedRun(w, req)
-	if !ok {
-		return
-	}
-	var u store.Usage
-	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, maxUsageBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&u); err != nil {
-		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := ValidUsage(u); err != nil {
-		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if r.State != run.StateRunning && r.State != run.StatePreviewing {
-		http.Error(w, fmt.Sprintf("run is %s and no longer accepts usage", r.State), http.StatusConflict)
-		return
-	}
-	if err := c.store.RecordUsage(req.Context(), r.ID, u); err != nil {
-		c.log.Error("store usage", "run_id", r.ID, "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
-	r, ok := c.authorizedRun(w, req)
+	r, ok := c.callerRun(w, req)
 	if !ok {
 		return
 	}
-	id, ctx := r.ID, req.Context()
+	ctx, id := req.Context(), r.ID
 	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxResultBytes))
 	if err != nil {
 		http.Error(w, "result too large or unreadable", http.StatusRequestEntityTooLarge)
@@ -175,4 +156,83 @@ func (c *Controller) handleResult(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	http.Error(w, fmt.Sprintf("run is %s and no longer accepts results", r.State), http.StatusConflict)
+}
+
+// handlePutSession stores the runner's session snapshot after a turn. The
+// next attempt resumes from it if this one fails (docs/architecture.md §4.3).
+func (c *Controller) handlePutSession(w http.ResponseWriter, req *http.Request) {
+	r, ok := c.callerRun(w, req)
+	if !ok {
+		return
+	}
+	turn, err := strconv.Atoi(req.URL.Query().Get("turn"))
+	if err != nil || turn < 0 {
+		http.Error(w, "turn must be a non-negative integer", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxSessionBytes))
+	if err != nil {
+		http.Error(w, "session too large or unreadable", http.StatusRequestEntityTooLarge)
+		return
+	}
+	switch err := c.store.PutSession(req.Context(), r.ID, turn, body); {
+	case errors.Is(err, store.ErrConflict):
+		http.Error(w, fmt.Sprintf("run is %s and no longer takes snapshots", r.State), http.StatusConflict)
+	case err != nil:
+		c.runLog(r).Error("store session", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleGetSession returns the run's latest snapshot, or 404 if it has none.
+func (c *Controller) handleGetSession(w http.ResponseWriter, req *http.Request) {
+	r, ok := c.callerRun(w, req)
+	if !ok {
+		return
+	}
+	jsonl, turn, err := c.store.GetSession(req.Context(), r.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "no session snapshot", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		c.runLog(r).Error("load session", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	c.runLog(r).Info("resuming from session snapshot", "attempt", r.Attempt, "turn", turn)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set(sessionTurnHeader, strconv.Itoa(turn))
+	_, _ = w.Write(jsonl)
+}
+
+// handlePutUsage records one turn's model usage.
+func (c *Controller) handlePutUsage(w http.ResponseWriter, req *http.Request) {
+	r, ok := c.callerRun(w, req)
+	if !ok {
+		return
+	}
+	var u store.Usage
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, maxUsageBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&u); err != nil {
+		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := ValidUsage(u); err != nil {
+		http.Error(w, "invalid usage: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := c.store.PutUsage(req.Context(), r.ID, u); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown run", http.StatusNotFound)
+			return
+		}
+		c.runLog(r).Error("record usage", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

@@ -7,18 +7,18 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import type { SessionStats } from "@earendil-works/pi-coding-agent";
+import { parseSessionEntries, type SessionStats } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { postResult, putUsage } from "./controller.ts";
+import { getSession, postResult, putCheckpoint, RejectedError } from "./controller.ts";
 import { clonePR, fetchPR } from "./github.ts";
 import { type ModelConfig, modelConfigFromEnv, parseThinking, resolveModel } from "./model.ts";
 import { parsePRContext, type PRContext } from "./pr.ts";
 import { parsePRUrl } from "./prurl.ts";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import { ReviewNotSubmittedError, review } from "./review.ts";
+import { ReviewFailedError, ReviewNotSubmittedError, type ReviewOptions, review } from "./review.ts";
 import { ReviewResultSchema, SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 import { buildRunStats } from "./stats.ts";
-import { parseBudget, type TurnUsage } from "./usage.ts";
+import { parseBudget } from "./usage.ts";
 
 const USAGE = `usage: runner --pr <github-pr-url> [--format markdown|json] [--language <name>] [--budget <usd>] [--stats <file>] [--keep]
 
@@ -50,25 +50,26 @@ const { values } = parseArgs({
 
 const log = (line: string) => console.error(`runner: ${line}`);
 
+/**
+ * Exit code for failures another attempt cannot fix; the controller retries
+ * any other exit. Mirrors run.ExitFinal in go/internal/run/exit.go.
+ */
+const EXIT_FINAL = 3;
+
+/** A failure that is final however often the run is retried. */
+class FinalError extends Error {}
+
+const isFinal = (err: unknown) => err instanceof FinalError || err instanceof RejectedError || err instanceof ReviewNotSubmittedError;
+
 interface ReviewRun {
   result: ReviewResult;
   session: SessionStats;
   nudged: boolean;
 }
 
-interface ReviewPROptions {
+interface ReviewPROptions extends Pick<ReviewOptions, "resumeFrom" | "onTurn"> {
   language: string;
   budgetUSD?: number;
-  onTurn?: (usage: TurnUsage) => void;
-}
-
-/** A review that ended without a result, carrying what it spent. */
-class ReviewFailedError extends Error {
-  readonly session?: SessionStats;
-  constructor(message: string, session?: SessionStats) {
-    super(message);
-    this.session = session;
-  }
 }
 
 /** Reviews a checked-out PR and returns the validated result; shared by both modes. */
@@ -89,6 +90,7 @@ async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: Model
       language: opts.language,
       budgetUSD: opts.budgetUSD,
       onProgress: (line) => log(`  ${line}`),
+      resumeFrom: opts.resumeFrom,
       onTurn: opts.onTurn,
     });
     log(formatUsage({ ...stats.tokens, cost: stats.cost }, (Date.now() - started) / 1000));
@@ -105,9 +107,9 @@ async function reviewPR(pr: PRContext, cwd: string, agentDir: string, cfg: Model
     }
     return { result, session: stats, nudged };
   } catch (err) {
-    if (err instanceof ReviewNotSubmittedError) {
+    if (err instanceof ReviewFailedError) {
       log(formatUsage({ ...err.stats.tokens, cost: err.stats.cost }, (Date.now() - started) / 1000));
-      throw new ReviewFailedError(err.message, err.stats);
+      throw err;
     }
     throw err;
   }
@@ -160,7 +162,7 @@ async function local(url: string, format: string): Promise<number> {
         thinking: cfg.thinking,
         budgetUSD,
         seconds,
-        session: run?.session ?? (failure instanceof ReviewFailedError ? failure.session : undefined),
+        session: run?.session ?? (failure instanceof ReviewFailedError ? failure.stats : undefined),
         nudged: run?.nudged,
         result: run?.result,
         error: failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure),
@@ -175,33 +177,33 @@ async function local(url: string, format: string): Promise<number> {
 
 async function cluster(runId: string): Promise<number> {
   const { CONTROLLER_URL: controllerUrl, RUN_TOKEN: token } = process.env;
-  if (!controllerUrl || !token) throw new Error("CONTROLLER_URL and RUN_TOKEN must be set");
+  if (!controllerUrl || !token) throw new FinalError("CONTROLLER_URL and RUN_TOKEN must be set");
   const cfg = modelConfigFromEnv(process.env);
   const budgetUSD = parseBudget(process.env.REVIEW_BUDGET_USD);
   const workspace = process.env.WORKSPACE || "/workspace";
-  const pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
-  const agentDir = await mkdtemp(join(tmpdir(), "pi-"));
-  log(`run ${runId}: ${pr.files.length} files changed`);
-  // Usage uploads run in the background, in order; a lost one only costs a
-  // metrics sample, so failures are logged and the review goes on.
-  let uploads = Promise.resolve();
-  const onTurn = (usage: TurnUsage) => {
-    uploads = uploads.then(() => putUsage(controllerUrl, runId, usage, { token, log }).catch((err: unknown) => log(`usage for turn ${usage.turn} not recorded: ${String(err)}`)));
-  };
+  let pr: PRContext;
   try {
-    const { result } = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, {
-      language: process.env.REVIEW_LANGUAGE || values.language!,
-      budgetUSD,
-      onTurn,
-    });
-    // The last turn's usage lands before the result, so a done run's cost is complete.
-    await uploads;
-    await postResult(controllerUrl, runId, result, { token, log });
-    log(`run ${runId}: posted ${result.verdict} with ${result.comments.length} comments`);
-    return 0;
-  } finally {
-    await uploads;
+    pr = parsePRContext(JSON.parse(await readFile(join(workspace, "pr.json"), "utf8")));
+  } catch (err) {
+    throw new FinalError(`read pr.json: ${err instanceof Error ? err.message : String(err)}`);
   }
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-"));
+  const remote = { token, log };
+  log(`run ${runId}: ${pr.files.length} files changed, ${pr.previousComments?.length ?? 0} earlier comments`);
+
+  // A failed earlier attempt left its session behind; continue from there.
+  const saved = await getSession(controllerUrl, runId, remote);
+  const resumeFrom = saved ? parseSessionEntries(saved) : undefined;
+  if (resumeFrom) log(`run ${runId}: resuming from a snapshot with ${resumeFrom.length} entries`);
+  const { result } = await reviewPR(pr, join(workspace, "repo"), agentDir, cfg, {
+    language: process.env.REVIEW_LANGUAGE || values.language!,
+    budgetUSD,
+    resumeFrom,
+    onTurn: (snapshot) => putCheckpoint(controllerUrl, runId, snapshot, remote),
+  });
+  await postResult(controllerUrl, runId, result, remote);
+  log(`run ${runId}: posted ${result.verdict} with ${result.comments.length} comments`);
+  return 0;
 }
 
 async function main(): Promise<number> {
@@ -215,10 +217,18 @@ async function main(): Promise<number> {
   return 2;
 }
 
+// Node as PID 1 ignores SIGTERM, so a deleted Pod (a superseded run, or one
+// being evicted) would keep reviewing, and paying, through its grace period.
+// The exit is retryable; the next attempt resumes from the last snapshot.
+process.on("SIGTERM", () => {
+  log("terminated");
+  process.exit(143);
+});
+
 main().then(
   (code) => process.exit(code),
   (err: unknown) => {
     log(err instanceof Error ? err.message : String(err));
-    process.exit(1);
+    process.exit(isFinal(err) ? EXIT_FINAL : 1);
   },
 );

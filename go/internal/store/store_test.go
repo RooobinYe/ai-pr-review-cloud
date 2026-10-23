@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,6 +16,37 @@ import (
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/review"
 	"github.com/RooobinYe/ai-pr-review-cloud/go/internal/run"
 )
+
+func TestMigrateIndependentMilestones(t *testing.T) {
+	for _, migration := range []string{"0002_metrics.sql", "0002_recovery.sql"} {
+		t.Run(migration, func(t *testing.T) {
+			s := testStore(t, "migrations/0001_init.sql", "migrations/"+migration)
+			ctx := context.Background()
+			if err := s.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Ready(ctx); err != nil {
+				t.Fatal(err)
+			}
+			id, _, err := s.RecordTrigger(ctx, "migration-upgrade", newRun("a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Claim(ctx, 1, jobName); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PutUsage(ctx, id, Usage{Turn: 1, Model: "m", CacheReadTokens: 5, CostUSD: 0.1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PutSession(ctx, id, 1, []byte("session")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Stats(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestActionKindsMatchMigration(t *testing.T) {
 	sql, err := os.ReadFile("migrations/0001_init.sql")
@@ -44,7 +76,7 @@ func TestStatesMatchMigration(t *testing.T) {
 }
 
 // testStore migrates a fresh schema in the database named by TEST_DATABASE_URL.
-func testStore(t *testing.T) *Store {
+func testStore(t *testing.T, priorMigrations ...string) *Store {
 	t.Helper()
 	base := os.Getenv("TEST_DATABASE_URL")
 	if base == "" {
@@ -79,6 +111,26 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
+	if len(priorMigrations) > 0 {
+		if _, err := s.pool.Exec(ctx, "CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range priorMigrations {
+			sql, err := Migrations.ReadFile(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.pool.Exec(ctx, strings.ReplaceAll(string(sql), "IF NOT EXISTS ", "")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.pool.Exec(ctx, "INSERT INTO schema_migration (version) VALUES ($1)", name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Ready(ctx); err == nil {
+			t.Fatal("partially migrated database is ready")
+		}
+	}
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -206,5 +258,107 @@ func TestActiveIncludesUnreportedFailures(t *testing.T) {
 	}
 	if len(active) != 2 || active[0].ID != unreported || active[1].ID != silent || active[0].Error != "boom" {
 		t.Errorf("active = %+v, want the two unreported failures (queued run %s excluded)", active, queued)
+	}
+}
+
+func TestSupersede(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	old, _, _ := s.RecordTrigger(ctx, "d1", newRun("a"))
+	reviewed, _, _ := s.RecordTrigger(ctx, "d2", NewRun{Repo: "o/r", PRNumber: 8, HeadSHA: "a", InstallationID: 42, BudgetUSD: 0.5})
+	if _, err := s.Claim(ctx, 2, jobName); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SubmitResult(ctx, reviewed, review.Result{Verdict: review.VerdictApprove}); err != nil {
+		t.Fatal(err)
+	}
+	other, _, _ := s.RecordTrigger(ctx, "d3", NewRun{Repo: "o/other", PRNumber: 7, HeadSHA: "a", InstallationID: 42, BudgetUSD: 0.5})
+	if ids, err := s.Supersede(ctx); err != nil || len(ids) != 0 {
+		t.Fatalf("nothing newer yet: %v, %v", ids, err)
+	}
+	newer, _, _ := s.RecordTrigger(ctx, "d4", newRun("b"))
+	_, _, _ = s.RecordTrigger(ctx, "d5", NewRun{Repo: "o/r", PRNumber: 8, HeadSHA: "b", InstallationID: 42, BudgetUSD: 0.5})
+	ids, err := s.Supersede(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != old {
+		t.Fatalf("Supersede = %v, %v; want only %s (reviewed runs finish their vote)", ids, err, old)
+	}
+	for id, want := range map[string]run.State{old: run.StateSuperseded, reviewed: run.StateReviewed, newer: run.StateQueued, other: run.StateQueued} {
+		if r, _ := s.Get(ctx, id); r.State != want {
+			t.Errorf("run %s is %s, want %s", id, r.State, want)
+		}
+	}
+	active, err := s.Active(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(active, func(r Run) bool { return r.ID == old }) {
+		t.Error("superseded run without a completed Check Run is not active")
+	}
+	if err := s.RecordAction(ctx, old, ActionCheckRunComplete, "none"); err != nil {
+		t.Fatal(err)
+	}
+	active, _ = s.Active(ctx)
+	if slices.ContainsFunc(active, func(r Run) bool { return r.ID == old }) {
+		t.Error("cleaned-up superseded run is still active")
+	}
+}
+
+func TestSessionSnapshots(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	id, _, _ := s.RecordTrigger(ctx, "d1", newRun("a"))
+	if err := s.PutSession(ctx, id, 1, []byte("x")); !errors.Is(err, ErrConflict) {
+		t.Errorf("snapshot of a queued run: %v, want ErrConflict", err)
+	}
+	if _, _, err := s.GetSession(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Errorf("no snapshot yet: %v, want ErrNotFound", err)
+	}
+	claimed, err := s.Claim(ctx, 1, jobName)
+	if err != nil || len(claimed) != 1 || claimed[0].ClaimedAt.IsZero() {
+		t.Fatalf("claim: %+v, %v", claimed, err)
+	}
+	for turn, data := range map[int]string{2: "two", 1: "one"} {
+		if err := s.PutSession(ctx, id, turn, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if data, turn, err := s.GetSession(ctx, id); err != nil || turn != 2 || string(data) != "two" {
+		t.Errorf("GetSession = %q, %d, %v; want the newer turn", data, turn, err)
+	}
+	if err := s.PutSession(ctx, "00000000-0000-4000-8000-000000000000", 1, nil); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown run: %v", err)
+	}
+}
+
+func TestPutUsageReplacesTurn(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	id, _, _ := s.RecordTrigger(ctx, "d1", newRun("a"))
+	for _, cost := range []float64{0.1, 0.2} {
+		if err := s.PutUsage(ctx, id, Usage{Turn: 1, Model: "m", InputTokens: 10, OutputTokens: 5, CacheReadTokens: 90, CostUSD: cost}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows int
+	var total float64
+	var cacheRead int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*), sum(cost_usd)::float8, sum(cache_read_tokens) FROM run_usage WHERE run_id = $1", id).Scan(&rows, &total, &cacheRead); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || total != 0.2 || cacheRead != 90 {
+		t.Errorf("usage rows=%d cost=%v cache_read=%d, want one replaced row", rows, total, cacheRead)
+	}
+	if err := s.PutUsage(ctx, "00000000-0000-4000-8000-000000000000", Usage{Model: "m"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown run: %v", err)
+	}
+}
+
+func TestReady(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	if err := s.Ready(ctx); err != nil {
+		t.Errorf("migrated store not ready: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, "DELETE FROM schema_migration WHERE version = 'migrations/0002_recovery.sql'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ready(ctx); err == nil {
+		t.Error("store ready without the newest migration")
 	}
 }

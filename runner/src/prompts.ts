@@ -2,7 +2,7 @@
 // submit_review flow. Static rules live in the system prompt so providers can
 // cache them; everything PR-specific goes into the user prompt.
 import { splitDiff } from "./diff.ts";
-import type { ChangedFile, PRContext } from "./pr.ts";
+import type { ChangedFile, PRContext, PreviousComment } from "./pr.ts";
 import { MAX_COMMENTS } from "./schema.ts";
 
 /** Characters of diff inlined into the prompt; the rest is left for the tools. */
@@ -136,7 +136,37 @@ function diffWithinBudget(diff: string, budget: number): { text: string; omitted
 
 /** Keeps author-controlled text from closing the tags that wrap it. */
 function untrusted(text: string): string {
-  return text.replace(/<\/(pr_|diff>)/g, "&lt;/$1");
+  return text.replace(/<\/(pr_|diff>|previous_comments_untrusted>)/g, "&lt;/$1");
+}
+
+/** Characters of each earlier comment shown to the model. */
+const PREVIOUS_COMMENT_CHARS = 800;
+
+function previousCommentLine(c: PreviousComment): string {
+  const status = [c.resolved ? "resolved" : "unresolved", ...(c.outdated ? ["code changed since"] : [])].join(", ");
+  let body = c.body.trim().replace(/\s*\n\s*/g, " ");
+  if (body.length > PREVIOUS_COMMENT_CHARS) body = `${body.slice(0, PREVIOUS_COMMENT_CHARS)}…`;
+  return `- \`${c.path}:${c.line}\` (${status}): ${body}`;
+}
+
+/**
+ * Your own comments on earlier commits, so a re-review follows up on them
+ * instead of repeating them. They quote PR code, so they stay untrusted.
+ */
+function previousReview(comments: PreviousComment[] | undefined): string {
+  if (!comments?.length) return "";
+  return `
+<previous_review>
+You reviewed earlier commits of this pull request and left the inline comments below. "resolved" means someone marked the thread resolved; "code changed since" means the line it pointed at was modified.
+- Do not repeat a point that is resolved or that the current code fixes.
+- If an issue is still present in the current code, raise it again and say it is still unresolved from the previous review.
+- Spend most of your attention on what changed since and on problems not raised before.
+</previous_review>
+
+<previous_comments_untrusted>
+${untrusted(comments.map(previousCommentLine).join("\n"))}
+</previous_comments_untrusted>
+`;
 }
 
 export function userPrompt(pr: PRContext, budget = DIFF_BUDGET): string {
@@ -172,7 +202,7 @@ ${pr.files.map(fileLine).join("\n")}
 <diff>
 ${untrusted(text)}
 </diff>
-${omittedNote}
+${omittedNote}${previousReview(pr.previousComments)}
 <exploration_checklist>
 Before submitting, work through this checklist and mention the results in the body:
 1. READ the key changed files in full (at least 3 when the PR has that many code files).
@@ -187,6 +217,10 @@ If an item does not apply or finds nothing, say so briefly.
 Review this pull request following your instructions, then call submit_review with your verdict, body and inline comments.
 </review_request>`;
 }
+
+/** Sent when a review resumes from the snapshot of an attempt that crashed. */
+export const RESUME_PROMPT =
+  "The process running this review stopped and the review has been resumed from your last completed step. The checkout is unchanged. Continue where you left off without redoing finished work, then call submit_review.";
 
 export const BUDGET_REMINDER =
   "You have used most of this review's budget. Stop exploring: call submit_review now with what you have verified so far, and name the parts you could not check in the body.";

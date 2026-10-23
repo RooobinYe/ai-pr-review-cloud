@@ -79,6 +79,13 @@ func run(log *slog.Logger) error {
 	if ctl != nil {
 		ctl.Routes(mux)
 		go ctl.Run(ctx, 5*time.Second)
+		redeliver, err := time.ParseDuration(envOr("REDELIVER_INTERVAL", "5m"))
+		if err != nil {
+			return fmt.Errorf("REDELIVER_INTERVAL: %w", err)
+		}
+		if redeliver > 0 {
+			go ctl.RedeliverEvery(ctx, redeliver)
+		}
 	} else {
 		log.Warn("GITHUB_APP_ID is not set; runs stay queued until a GitHub App is configured")
 	}
@@ -133,6 +140,10 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 	if err != nil {
 		return nil, fmt.Errorf("MAX_RUNNING: %w", err)
 	}
+	maxAttempts, err := strconv.Atoi(envOr("MAX_ATTEMPTS", "3"))
+	if err != nil {
+		return nil, fmt.Errorf("MAX_ATTEMPTS: %w", err)
+	}
 	deadline, err := strconv.ParseInt(envOr("RUNNER_DEADLINE_SECONDS", "1800"), 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("RUNNER_DEADLINE_SECONDS: %w", err)
@@ -146,13 +157,16 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 		llmEnv[name] = os.Getenv(name)
 	}
 
+	bot := slug + "[bot]"
 	cfg := controller.Config{
-		MaxRunning: maxRunning,
-		BotLogin:   slug + "[bot]",
+		MaxRunning:  maxRunning,
+		MaxAttempts: maxAttempts,
+		BotLogin:    bot,
 		Job: controller.JobConfig{
 			FetchImage:            os.Getenv("FETCH_IMAGE"),
 			RunnerImage:           os.Getenv("RUNNER_IMAGE"),
 			ImagePullPolicy:       envOr("IMAGE_PULL_POLICY", "IfNotPresent"),
+			BotLogin:              bot,
 			ControllerURL:         os.Getenv("CONTROLLER_URL"),
 			LLMSecret:             os.Getenv("LLM_SECRET"),
 			LLMEnv:                llmEnv,
@@ -167,7 +181,7 @@ func newController(ctx context.Context, log *slog.Logger, db *store.Store) (*con
 			return nil, fmt.Errorf("%s is required", name)
 		}
 	}
-	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning)
+	log.Info("GitHub App ready", "bot", cfg.BotLogin, "max_running", maxRunning, "max_attempts", maxAttempts)
 	return controller.New(cfg, db, controller.AppGitHub{App: app}, k, log), nil
 }
 

@@ -50,8 +50,8 @@ func TestUsageReports(t *testing.T) {
 
 	h.post(result(review.VerdictApprove))
 	h.reconcile()
-	if code := h.putUsage(turn(3, "0.01"), h.runToken()); code != http.StatusConflict {
-		t.Errorf("usage after the run finished: %d, want 409", code)
+	if code := h.putUsage(turn(3, "0.01"), h.runToken()); code != http.StatusNoContent {
+		t.Errorf("usage after the run finished: %d, want 204", code)
 	}
 }
 

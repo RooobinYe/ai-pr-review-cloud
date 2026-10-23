@@ -32,8 +32,17 @@ runs:
   maxRunning: 4
   # Language of review comments.
   language: English
-  # Hard limit on one runner Job (activeDeadlineSeconds).
+  # Hard limit on one runner Job (activeDeadlineSeconds). A run that hits it fails.
   deadlineSeconds: 1800
+  # Runner Jobs per run. A lost or crashed Pod is retried from the last
+  # session snapshot until then.
+  maxAttempts: 3
+
+webhooks:
+  # How often the controller redelivers webhooks the gateway failed to
+  # accept; 0 disables it. Deliveries through smee.io look successful to
+  # GitHub, so this only helps when GitHub reaches the gateway directly.
+  redeliverInterval: 5m
 
 database:
   # Existing Secret with key `DATABASE_URL`. Ignored when postgres.dev.enabled is true.

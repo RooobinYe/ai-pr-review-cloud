@@ -60,7 +60,7 @@ export function gitTool(cwd: string) {
   });
 }
 
-function normalizePath(path: string): string {
+export function normalizePath(path: string): string {
   return path.replace(/^\.\//, "").replace(/^b\//, "");
 }
 

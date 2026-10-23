@@ -26,12 +26,15 @@ import (
 // Store is the subset of *store.Store the controller uses.
 type Store interface {
 	Claim(ctx context.Context, maxRunning int, jobName func(id string, attempt int) string) ([]store.Run, error)
+	Supersede(ctx context.Context) ([]string, error)
 	Active(ctx context.Context) ([]store.Run, error)
 	Get(ctx context.Context, id string) (store.Run, error)
 	RecordAction(ctx context.Context, runID string, kind store.ActionKind, externalID string) error
 	SubmitResult(ctx context.Context, id string, res review.Result) error
 	Transition(ctx context.Context, id string, from, to run.State, reason string) error
-	RecordUsage(ctx context.Context, runID string, u store.Usage) error
+	PutSession(ctx context.Context, id string, turn int, jsonl []byte) error
+	GetSession(ctx context.Context, id string) ([]byte, int, error)
+	PutUsage(ctx context.Context, id string, u store.Usage) error
 	RecordFetchTiming(ctx context.Context, runID string, started, finished time.Time) error
 }
 
@@ -42,19 +45,24 @@ type GitHubClient interface {
 	DismissReview(ctx context.Context, repo string, number int, reviewID int64, message string) error
 	CreateReview(ctx context.Context, repo string, number int, r githubapp.NewReview) (int64, error)
 	CreateCheckRun(ctx context.Context, repo string, cr githubapp.CheckRun) (int64, error)
+	FindCheckRun(ctx context.Context, repo, sha, name, externalID string) (int64, error)
 	UpdateCheckRun(ctx context.Context, repo string, id int64, cr githubapp.CheckRun) error
 }
 
-// GitHub hands out installation clients and fetch's read-only tokens.
+// GitHub hands out installation clients and fetch's read-only tokens, and
+// manages the App's webhook deliveries.
 type GitHub interface {
 	Client(installationID int64) GitHubClient
 	FetchToken(ctx context.Context, installationID int64, repo string) (string, error)
+	ListDeliveries(ctx context.Context) ([]githubapp.Delivery, error)
+	Redeliver(ctx context.Context, deliveryID int64) error
 }
 
 // Kube is the subset of *kube.Client the controller uses.
 type Kube interface {
 	CreateJob(ctx context.Context, job kube.Job) (kube.Job, error)
 	GetJob(ctx context.Context, name string) (kube.Job, error)
+	DeleteJob(ctx context.Context, name string) error
 	CreateSecret(ctx context.Context, s kube.Secret) error
 	GetSecret(ctx context.Context, name string) (kube.Secret, error)
 	ListPods(ctx context.Context, selector string) ([]kube.Pod, error)
@@ -64,6 +72,9 @@ type Kube interface {
 type Config struct {
 	// MaxRunning caps runs with a live runner Job.
 	MaxRunning int
+	// MaxAttempts caps runner Jobs per run; a failed attempt is retried
+	// from the last session snapshot until then.
+	MaxAttempts int
 	// BotLogin is the App's bot user, "<slug>[bot]", whose approvals it dismisses.
 	BotLogin string
 	Job      JobConfig
@@ -76,10 +87,24 @@ type Controller struct {
 	kube  Kube
 	log   *slog.Logger
 	wake  chan struct{}
+	now   func() time.Time
 }
 
 func New(cfg Config, s Store, gh GitHub, k Kube, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, log: log, wake: make(chan struct{}, 1)}
+	if cfg.MaxAttempts < 1 {
+		cfg.MaxAttempts = 1
+	}
+	return &Controller{cfg: cfg, store: s, gh: gh, kube: k, log: log, wake: make(chan struct{}, 1), now: time.Now}
+}
+
+// startupGrace is how long an attempt may take to get its Job going before
+// the Job's own deadline starts counting.
+const startupGrace = 5 * time.Minute
+
+// attemptDeadline bounds one attempt from its claim, covering the time spent
+// creating the Job as well as the Job's activeDeadlineSeconds.
+func (c *Controller) attemptDeadline() time.Duration {
+	return time.Duration(c.cfg.Job.ActiveDeadlineSeconds)*time.Second + startupGrace
 }
 
 // Wake makes the loop reconcile now instead of at the next tick.
@@ -105,9 +130,17 @@ func (c *Controller) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Reconcile claims queued runs and advances every active run by as many steps
-// as it can. Errors are logged and retried on the next pass.
+// Reconcile supersedes outdated runs, claims queued runs and advances every
+// active run by as many steps as it can. Errors are logged and retried on the
+// next pass.
 func (c *Controller) Reconcile(ctx context.Context) {
+	if ids, err := c.store.Supersede(ctx); err != nil {
+		c.log.Error("supersede runs", "err", err)
+	} else {
+		for _, id := range ids {
+			c.log.Info("run superseded by a newer commit", "run_id", id)
+		}
+	}
 	if claimed, err := c.store.Claim(ctx, c.cfg.MaxRunning, JobName); err != nil {
 		c.log.Error("claim runs", "err", err)
 	} else {
@@ -148,11 +181,15 @@ func (c *Controller) advance(ctx context.Context, r store.Run) error {
 			return c.fail(ctx, r, r.State, err.Error())
 		}
 		return err
-	case run.StateFailed:
-		err := c.reportFailure(ctx, r)
+	case run.StateFailed, run.StateSuperseded:
+		step := c.reportFailure
+		if r.State == run.StateSuperseded {
+			step = c.cancel
+		}
+		err := step(ctx, r)
 		if permanent(err) {
-			// There is nowhere left to report the failure; stop trying.
-			c.runLog(r).Warn("cannot report failure on GitHub", "err", err)
+			// There is nowhere left to report the outcome; stop trying.
+			c.runLog(r).Warn("cannot report outcome on GitHub", "state", r.State, "err", err)
 			return c.store.RecordAction(ctx, r.ID, store.ActionCheckRunComplete, "unreported")
 		}
 		return err
@@ -181,6 +218,14 @@ func (c *Controller) once(ctx context.Context, r *store.Run, kind store.ActionKi
 }
 
 func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
+	if elapsed := c.now().Sub(r.ClaimedAt); elapsed > c.attemptDeadline() {
+		// Also covers attempts whose Job could never be created, or whose
+		// GitHub calls kept failing.
+		if err := c.deleteJob(ctx, r.JobName); err != nil {
+			return err
+		}
+		return c.fail(ctx, r, run.StateRunning, fmt.Sprintf("attempt %d timed out: no result %s after it was claimed", r.Attempt, elapsed.Round(time.Second)))
+	}
 	gh := c.gh.Client(r.InstallationID)
 	err := c.once(ctx, &r, store.ActionDismissStaleApprovals, func() (string, error) {
 		reviews, err := gh.ListReviews(ctx, r.Repo, r.PRNumber)
@@ -200,7 +245,11 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		return err
 	}
 	err = c.once(ctx, &r, store.ActionCheckRunCreate, func() (string, error) {
-		id, err := gh.CreateCheckRun(ctx, r.Repo, InProgressCheckRun(r.ID, r.HeadSHA))
+		// A previous controller may have created it and stopped before recording it.
+		id, err := gh.FindCheckRun(ctx, r.Repo, r.HeadSHA, CheckName, r.ID)
+		if err == nil && id == 0 {
+			id, err = gh.CreateCheckRun(ctx, r.Repo, InProgressCheckRun(r.ID, r.HeadSHA))
+		}
 		return strconv.FormatInt(id, 10), err
 	})
 	if err != nil {
@@ -215,7 +264,12 @@ func (c *Controller) advanceRunning(ctx context.Context, r store.Run) error {
 		return err
 	}
 	if _, failed := job.Status.Condition(kube.JobFailed); failed {
-		return c.fail(ctx, r, run.StateRunning, c.jobFailure(ctx, job))
+		reason, retryable := c.jobFailure(ctx, job)
+		// A result may have arrived just before the Pod failed.
+		if cur, err := c.store.Get(ctx, r.ID); err != nil || cur.State != run.StateRunning {
+			return err
+		}
+		return c.retryOrFail(ctx, r, reason, retryable)
 	}
 	if _, complete := job.Status.Condition(kube.JobComplete); complete {
 		// A result moves the run to reviewed before the runner exits. Re-read
@@ -263,18 +317,64 @@ func (c *Controller) createRunSecret(ctx context.Context, r store.Run, job kube.
 	return nil
 }
 
-// jobFailure explains a failed Job from its Pod, falling back to the Job condition.
-func (c *Controller) jobFailure(ctx context.Context, job kube.Job) string {
+// jobFailure explains a failed Job from its Pod, falling back to the Job
+// condition, and reports whether another attempt could succeed. A Pod that
+// was deleted, evicted or killed leaves no exit code to go by and is retried.
+func (c *Controller) jobFailure(ctx context.Context, job kube.Job) (reason string, retryable bool) {
+	cond, _ := job.Status.Condition(kube.JobFailed)
+	if cond.Reason == "DeadlineExceeded" {
+		return fmt.Sprintf("runner did not finish within its %d-second deadline", c.cfg.Job.ActiveDeadlineSeconds), false
+	}
 	pods, err := c.kube.ListPods(ctx, "job-name="+job.Metadata.Name)
 	if err == nil {
 		for _, p := range pods {
-			if msg := PodFailure(p); msg != "" {
-				return msg
+			if msg, final := PodFailure(p); msg != "" {
+				return msg, !final
 			}
 		}
 	}
-	cond, _ := job.Status.Condition(kube.JobFailed)
-	return fmt.Sprintf("runner job failed: %s %s", cond.Reason, cond.Message)
+	return fmt.Sprintf("runner job failed: %s %s", cond.Reason, cond.Message), true
+}
+
+// retryOrFail queues a failed attempt again, or fails the run when the
+// failure is final or the run is out of attempts. The next attempt resumes
+// from the run's last session snapshot.
+func (c *Controller) retryOrFail(ctx context.Context, r store.Run, reason string, retryable bool) error {
+	if !retryable {
+		return c.fail(ctx, r, run.StateRunning, reason)
+	}
+	if r.Attempt >= c.cfg.MaxAttempts {
+		return c.fail(ctx, r, run.StateRunning, fmt.Sprintf("gave up after %d attempts; the last one failed: %s", r.Attempt, reason))
+	}
+	err := c.store.Transition(ctx, r.ID, run.StateRunning, run.StateQueued, reason)
+	if errors.Is(err, store.ErrConflict) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	c.runLog(r).Warn("attempt failed; retrying", "attempt", r.Attempt, "reason", reason)
+	// Showing the retry is cosmetic and the update idempotent, so a failure
+	// here is only logged; the next attempt opens no new Check Run.
+	if id, err := strconv.ParseInt(r.Actions[store.ActionCheckRunCreate], 10, 64); err == nil {
+		cr := RetryingCheckRun(reason, r.Attempt+1, c.cfg.MaxAttempts)
+		if err := c.gh.Client(r.InstallationID).UpdateCheckRun(ctx, r.Repo, id, cr); err != nil {
+			c.runLog(r).Warn("show retry on check run", "err", err)
+		}
+	}
+	c.Wake()
+	return nil
+}
+
+// deleteJob deletes a run's Job and its Pods, if there is one.
+func (c *Controller) deleteJob(ctx context.Context, name string) error {
+	if name == "" {
+		return nil
+	}
+	if err := c.kube.DeleteJob(ctx, name); err != nil && !errors.Is(err, kube.ErrNotFound) {
+		return fmt.Errorf("delete job: %w", err)
+	}
+	return nil
 }
 
 func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reason string) error {
@@ -290,22 +390,51 @@ func (c *Controller) fail(ctx context.Context, r store.Run, from run.State, reas
 	return c.reportFailure(ctx, r)
 }
 
+// checkRun returns the run's Check Run: the recorded one, or one a previous
+// controller created and stopped before recording. It returns 0 if there is none.
+func checkRun(ctx context.Context, gh GitHubClient, r store.Run) (int64, error) {
+	if id, opened := r.Actions[store.ActionCheckRunCreate]; opened {
+		return strconv.ParseInt(id, 10, 64)
+	}
+	return gh.FindCheckRun(ctx, r.Repo, r.HeadSHA, CheckName, r.ID)
+}
+
 // reportFailure completes the run's Check Run as failed, creating one if the
 // run failed before opening it, so every failure is visible on the PR.
 func (c *Controller) reportFailure(ctx context.Context, r store.Run) error {
 	gh := c.gh.Client(r.InstallationID)
 	return c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
-		if checkRunID, opened := r.Actions[store.ActionCheckRunCreate]; opened {
-			id, err := strconv.ParseInt(checkRunID, 10, 64)
-			if err != nil {
-				return "", err
-			}
-			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, FailedCheckRun(r.Error))
+		id, err := checkRun(ctx, gh, r)
+		if err != nil {
+			return "", err
+		}
+		if id != 0 {
+			return strconv.FormatInt(id, 10), gh.UpdateCheckRun(ctx, r.Repo, id, FailedCheckRun(r.Error))
 		}
 		cr := FailedCheckRun(r.Error)
 		cr.Name, cr.HeadSHA, cr.ExternalID = CheckName, r.HeadSHA, r.ID
-		id, err := gh.CreateCheckRun(ctx, r.Repo, cr)
+		id, err = gh.CreateCheckRun(ctx, r.Repo, cr)
 		return strconv.FormatInt(id, 10), err
+	})
+}
+
+// cancel stops a superseded run: it deletes the runner Job, if any, and
+// completes the Check Run it opened. A run superseded while queued opened
+// none and needs none.
+func (c *Controller) cancel(ctx context.Context, r store.Run) error {
+	if err := c.deleteJob(ctx, r.JobName); err != nil {
+		return err
+	}
+	gh := c.gh.Client(r.InstallationID)
+	return c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
+		if r.Attempt == 0 {
+			return "none", nil
+		}
+		id, err := checkRun(ctx, gh, r)
+		if err != nil || id == 0 {
+			return "none", err
+		}
+		return strconv.FormatInt(id, 10), gh.UpdateCheckRun(ctx, r.Repo, id, SupersededCheckRun())
 	})
 }
 
@@ -323,28 +452,37 @@ func (c *Controller) publish(ctx context.Context, r store.Run) error {
 	// Check Run falls back to the verdict's vote.
 	event := ReviewEvent(r.Verdict)
 	err := c.once(ctx, &r, store.ActionReview, func() (string, error) {
-		var err error
+		reviews, err := gh.ListReviews(ctx, r.Repo, r.PRNumber)
+		if err != nil {
+			return "", err
+		}
+		// A previous controller may have voted and stopped before recording it.
+		if prior, ok := FindVote(reviews, c.cfg.BotLogin, r.ID); ok {
+			event = prior.Event
+			c.runLog(r).Info("vote already cast; recording it", "review_id", prior.ID)
+			return strconv.FormatInt(prior.ID, 10), nil
+		}
 		event, err = c.voteEvent(ctx, gh, r)
 		if err != nil {
 			return "", err
 		}
-		id, err := gh.CreateReview(ctx, r.Repo, r.PRNumber, BuildReview(res, event))
+		id, err := gh.CreateReview(ctx, r.Repo, r.PRNumber, BuildReview(r.ID, res, event))
 		if githubapp.StatusOf(err) == http.StatusUnprocessableEntity && len(res.Comments) > 0 {
 			c.runLog(r).Warn("inline comments rejected; folding them into the review body", "err", err)
-			id, err = gh.CreateReview(ctx, r.Repo, r.PRNumber, BuildFoldedReview(res, event))
+			id, err = gh.CreateReview(ctx, r.Repo, r.PRNumber, BuildFoldedReview(r.ID, res, event))
 		}
 		return strconv.FormatInt(id, 10), err
 	})
 	if err != nil {
 		return err
 	}
-	if checkRunID, opened := r.Actions[store.ActionCheckRunCreate]; opened {
+	id, err := checkRun(ctx, gh, r)
+	if err != nil {
+		return err
+	}
+	if id != 0 {
 		err = c.once(ctx, &r, store.ActionCheckRunComplete, func() (string, error) {
-			id, err := strconv.ParseInt(checkRunID, 10, 64)
-			if err != nil {
-				return "", err
-			}
-			return checkRunID, gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res, event))
+			return strconv.FormatInt(id, 10), gh.UpdateCheckRun(ctx, r.Repo, id, ReviewedCheckRun(res, event))
 		})
 		if err != nil {
 			return err
@@ -404,6 +542,14 @@ type AppGitHub struct{ App *githubapp.App }
 
 func (a AppGitHub) Client(installationID int64) GitHubClient {
 	return a.App.Installation(installationID)
+}
+
+func (a AppGitHub) ListDeliveries(ctx context.Context) ([]githubapp.Delivery, error) {
+	return a.App.ListDeliveries(ctx)
+}
+
+func (a AppGitHub) Redeliver(ctx context.Context, deliveryID int64) error {
+	return a.App.Redeliver(ctx, deliveryID)
 }
 
 // FetchToken mints a token that can only read the one repository under review.

@@ -28,6 +28,18 @@ type ChangedFile struct {
 	PreviousPath string `json:"previousPath,omitempty"`
 }
 
+// PreviousComment mirrors PreviousComment in runner/src/pr.ts: an inline
+// comment the bot left on an earlier commit of the PR.
+type PreviousComment struct {
+	Path string `json:"path"`
+	// Line is in the current diff, or in the commit the comment was left on
+	// when Outdated.
+	Line     int    `json:"line"`
+	Body     string `json:"body"`
+	Resolved bool   `json:"resolved"`
+	Outdated bool   `json:"outdated"`
+}
+
 // PRContext mirrors PRContext in runner/src/pr.ts.
 type PRContext struct {
 	Repo    string        `json:"repo"`
@@ -41,6 +53,37 @@ type PRContext struct {
 	HeadSHA string        `json:"headSha"`
 	Files   []ChangedFile `json:"files"`
 	Diff    string        `json:"diff"`
+	// PreviousComments lets the model follow up on its earlier review
+	// instead of repeating it.
+	PreviousComments []PreviousComment `json:"previousComments,omitempty"`
+}
+
+// Bounds on the earlier comments handed to the model.
+const (
+	maxPreviousComments    = 30
+	maxPreviousCommentBody = 2000
+)
+
+// PreviousComments selects the bot's own review threads, newest last, keeping
+// the most recent ones. GraphQL names bots without the "[bot]" suffix that
+// REST uses, so logins are compared without it.
+func PreviousComments(threads []githubapp.ReviewThread, botLogin string) []PreviousComment {
+	bot := strings.TrimSuffix(botLogin, "[bot]")
+	var out []PreviousComment
+	for _, t := range threads {
+		if bot == "" || strings.TrimSuffix(t.AuthorLogin, "[bot]") != bot {
+			continue
+		}
+		body := t.Body
+		if len(body) > maxPreviousCommentBody {
+			body = strings.ToValidUTF8(body[:maxPreviousCommentBody], "") + "…"
+		}
+		out = append(out, PreviousComment{Path: t.Path, Line: t.Line, Body: body, Resolved: t.Resolved, Outdated: t.Outdated})
+	}
+	if len(out) > maxPreviousComments {
+		out = out[len(out)-maxPreviousComments:]
+	}
+	return out
 }
 
 // BuildContext assembles the PR context from GitHub's pull and files responses.
@@ -110,6 +153,10 @@ type Options struct {
 	// GitURL is the git host, e.g. https://github.com.
 	GitURL string
 	Token  string
+	// BotLogin is the App's bot user, whose earlier comments are collected.
+	BotLogin string
+	// Warnf reports problems that do not stop the fetch.
+	Warnf func(format string, args ...any)
 }
 
 // Run fetches the PR context, checks out the head into Workspace/repo, and
@@ -127,6 +174,14 @@ func Run(ctx context.Context, gh *githubapp.Client, opts Options) error {
 		return err
 	}
 	pr := BuildContext(opts.Repo, pull, files)
+	if opts.BotLogin != "" {
+		// Earlier comments only refine the review; it goes ahead without them.
+		threads, err := gh.ListReviewThreads(ctx, opts.Repo, opts.PRNumber)
+		if err != nil && opts.Warnf != nil {
+			opts.Warnf("earlier review comments unavailable: %v", err)
+		}
+		pr.PreviousComments = PreviousComments(threads, opts.BotLogin)
+	}
 
 	dir := filepath.Join(opts.Workspace, "repo")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

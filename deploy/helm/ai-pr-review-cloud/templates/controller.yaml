@@ -95,6 +95,10 @@ spec:
               value: {{ .Values.runs.language | quote }}
             - name: MAX_RUNNING
               value: {{ .Values.runs.maxRunning | quote }}
+            - name: MAX_ATTEMPTS
+              value: {{ .Values.runs.maxAttempts | quote }}
+            - name: REDELIVER_INTERVAL
+              value: {{ .Values.webhooks.redeliverInterval | quote }}
             - name: RUNNER_DEADLINE_SECONDS
               value: {{ .Values.runs.deadlineSeconds | quote }}
             - name: RUNNER_RESOURCES

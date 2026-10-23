@@ -13,6 +13,18 @@ export const ChangedFileSchema = Type.Object({
   previousPath: Type.Optional(Type.String({ minLength: 1 })),
 });
 
+/** An inline comment the reviewer left on an earlier commit of the PR. */
+export const PreviousCommentSchema = Type.Object({
+  path: Type.String({ minLength: 1 }),
+  /** Line in the current diff, or in the commit it was left on when outdated. */
+  line: Type.Integer({ minimum: 0 }),
+  body: Type.String(),
+  /** Someone marked the thread resolved. */
+  resolved: Type.Boolean(),
+  /** The line it pointed at has changed since. */
+  outdated: Type.Boolean(),
+});
+
 export const PRContextSchema = Type.Object({
   /** owner/name */
   repo: Type.String({ pattern: "^[\\w.-]+/[\\w.-]+$" }),
@@ -27,9 +39,12 @@ export const PRContextSchema = Type.Object({
   files: Type.Array(ChangedFileSchema),
   /** Unified diff of the whole PR, one `diff --git` section per file. */
   diff: Type.String(),
+  /** The reviewer's own inline comments on earlier commits; cluster mode only. */
+  previousComments: Type.Optional(Type.Array(PreviousCommentSchema)),
 });
 
 export type ChangedFile = Static<typeof ChangedFileSchema>;
+export type PreviousComment = Static<typeof PreviousCommentSchema>;
 export type PRContext = Static<typeof PRContextSchema>;
 
 /** Validates pr.json as written by the fetch init container. */

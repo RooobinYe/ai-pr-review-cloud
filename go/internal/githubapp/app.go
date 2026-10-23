@@ -156,3 +156,30 @@ func RepoName(repo string) string {
 	_, name, _ := strings.Cut(repo, "/")
 	return name
 }
+
+// Delivery is one attempt to deliver a webhook to the App. Redeliveries are
+// new attempts that share the original's GUID.
+type Delivery struct {
+	ID          int64     `json:"id"`
+	GUID        string    `json:"guid"`
+	DeliveredAt time.Time `json:"delivered_at"`
+	Redelivery  bool      `json:"redelivery"`
+	StatusCode  int       `json:"status_code"`
+	Event       string    `json:"event"`
+	Action      string    `json:"action"`
+}
+
+// ListDeliveries returns the App's 100 most recent webhook delivery attempts,
+// newest first.
+func (a *App) ListDeliveries(ctx context.Context) ([]Delivery, error) {
+	var out []Delivery
+	if err := a.jwtClient().do(ctx, http.MethodGet, "/app/hook/deliveries?per_page=100", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Redeliver asks GitHub to send a delivery again.
+func (a *App) Redeliver(ctx context.Context, deliveryID int64) error {
+	return a.jwtClient().do(ctx, http.MethodPost, fmt.Sprintf("/app/hook/deliveries/%d/attempts", deliveryID), nil, nil)
+}

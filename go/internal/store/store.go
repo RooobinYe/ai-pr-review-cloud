@@ -70,6 +70,8 @@ type Run struct {
 	Error          string
 	BudgetUSD      float64
 	CreatedAt      time.Time
+	// ClaimedAt is when the current attempt was claimed.
+	ClaimedAt time.Time
 	// FetchTimed reports whether the fetch phase's timing has been recorded.
 	FetchTimed bool
 	// Actions maps each completed GitHub action to its external ID.
@@ -178,6 +180,7 @@ func (s *Store) RecordTrigger(ctx context.Context, deliveryID string, nr NewRun)
 const runColumns = `r.id, r.repo, r.pr_number, r.head_sha, r.installation_id, r.state, r.attempt,
 	COALESCE(r.job_name, ''), COALESCE(r.verdict, ''), r.result, COALESCE(r.error, ''), r.budget_usd::float8, r.created_at,
 	r.fetch_finished_at IS NOT NULL,
+	COALESCE(r.claimed_at, r.created_at),
 	COALESCE((SELECT jsonb_object_agg(a.kind, a.external_id) FROM github_action a
 	          WHERE a.run_id = r.id AND a.external_id IS NOT NULL), '{}')`
 
@@ -185,7 +188,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var result, actions []byte
 	err := row.Scan(&r.ID, &r.Repo, &r.PRNumber, &r.HeadSHA, &r.InstallationID, &r.State, &r.Attempt,
-		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &actions)
+		&r.JobName, &r.Verdict, &result, &r.Error, &r.BudgetUSD, &r.CreatedAt, &r.FetchTimed, &r.ClaimedAt, &actions)
 	if err != nil {
 		return Run{}, err
 	}
@@ -252,8 +255,8 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 		for _, r := range queued {
 			r.State, r.Attempt = run.StateRunning, r.Attempt+1
 			r.JobName = jobName(r.ID, r.Attempt)
-			if _, err := tx.Exec(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, started_at = now(), updated_at = now()
-				WHERE id = $1`, r.ID, r.State, r.Attempt, r.JobName); err != nil {
+			if err := tx.QueryRow(ctx, `UPDATE review_run SET state = $2, attempt = $3, job_name = $4, claimed_at = now(), started_at = COALESCE(started_at, now()), updated_at = now()
+				WHERE id = $1 RETURNING claimed_at`, r.ID, r.State, r.Attempt, r.JobName).Scan(&r.ClaimedAt); err != nil {
 				return err
 			}
 			claimed = append(claimed, r)
@@ -267,11 +270,12 @@ func (s *Store) Claim(ctx context.Context, maxRunning int, jobName func(id strin
 }
 
 // Active returns the runs the controller still has to act on: running and
-// reviewed runs, and failed runs whose failure is not on a Check Run yet.
+// reviewed runs, and failed or superseded runs whose Check Run is not
+// completed yet.
 func (s *Store) Active(ctx context.Context) ([]Run, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+runColumns+` FROM review_run r
 		WHERE r.state IN ('running', 'reviewed')
-		   OR (r.state = 'failed'
+		   OR (r.state IN ('failed', 'superseded')
 		       AND NOT EXISTS (SELECT 1 FROM github_action a WHERE a.run_id = r.id AND a.kind = 'check_run_complete' AND a.external_id IS NOT NULL))
 		ORDER BY r.created_at`)
 	if err != nil {
@@ -282,6 +286,25 @@ func (s *Store) Active(ctx context.Context) ([]Run, error) {
 		return nil, fmt.Errorf("list active runs: %w", err)
 	}
 	return runs, nil
+}
+
+// Supersede moves every unfinished run that has a newer run for the same PR
+// to superseded, and returns their IDs. Reviewed runs are left to finish:
+// their vote checks the PR head before approving (docs/architecture.md §6.3).
+func (s *Store) Supersede(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `UPDATE review_run r SET state = 'superseded', updated_at = now()
+		WHERE r.state IN ('queued', 'running', 'previewing', 'awaiting_approval')
+		  AND EXISTS (SELECT 1 FROM review_run n
+		              WHERE n.repo = r.repo AND n.pr_number = r.pr_number AND n.created_at > r.created_at)
+		RETURNING r.id`)
+	if err != nil {
+		return nil, fmt.Errorf("supersede runs: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("supersede runs: %w", err)
+	}
+	return ids, nil
 }
 
 // RecordAction marks a GitHub action of the run as done.
@@ -327,6 +350,72 @@ func (s *Store) Transition(ctx context.Context, id string, from, to run.State, r
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrConflict
+	}
+	return nil
+}
+
+// PutSession stores the run's latest session snapshot. A snapshot of an
+// earlier turn than the stored one is ignored, so a delayed upload cannot
+// roll the session back. It returns ErrConflict unless the run is running.
+func (s *Store) PutSession(ctx context.Context, id string, turn int, jsonl []byte) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var state run.State
+		err := tx.QueryRow(ctx, "SELECT state FROM review_run WHERE id = $1 FOR SHARE", id).Scan(&state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if state != run.StateRunning {
+			return ErrConflict
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO run_session (run_id, jsonl, turn) VALUES ($1, $2, $3)
+			ON CONFLICT (run_id) DO UPDATE SET jsonl = EXCLUDED.jsonl, turn = EXCLUDED.turn, updated_at = now()
+			WHERE run_session.turn <= EXCLUDED.turn`, id, jsonl, turn)
+		return err
+	})
+	if err != nil && !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("store session of run %s: %w", id, err)
+	}
+	return err
+}
+
+// GetSession returns the run's latest session snapshot, or ErrNotFound.
+func (s *Store) GetSession(ctx context.Context, id string) (jsonl []byte, turn int, err error) {
+	err = s.pool.QueryRow(ctx, "SELECT jsonl, turn FROM run_session WHERE run_id = $1", id).Scan(&jsonl, &turn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, ErrNotFound
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("load session of run %s: %w", id, err)
+	}
+	return jsonl, turn, nil
+}
+
+func (s *Store) PutUsage(ctx context.Context, id string, u Usage) error {
+	return s.RecordUsage(ctx, id, u)
+}
+
+// Ready reports whether the newest embedded migration has been applied, so
+// every table the service writes exists. The gateway is not ready before
+// then: GitHub does not retry a webhook it failed to record.
+func (s *Store) Ready(ctx context.Context) error {
+	names, err := fs.Glob(Migrations, "migrations/*.sql")
+	if err != nil {
+		return fmt.Errorf("list migrations: %w", err)
+	}
+	if len(names) == 0 {
+		return errors.New("no migrations embedded")
+	}
+	// Fails with "relation does not exist" before the first migration.
+	var applied bool
+	err = s.pool.QueryRow(ctx, "SELECT count(*) = $2 FROM schema_migration WHERE version = ANY($1)", names, len(names)).Scan(&applied)
+	if err != nil {
+		return fmt.Errorf("check schema: %w", err)
+	}
+	if !applied {
+		return errors.New("schema migrations are not all applied yet")
 	}
 	return nil
 }
