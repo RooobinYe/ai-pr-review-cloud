@@ -87,19 +87,6 @@ func TestLostSecretResponseKeepsUsableKey(t *testing.T) {
 	}
 }
 
-func TestRecreatedSecretGetsNewKey(t *testing.T) {
-	h := newHarness()
-	h.reconcile()
-	name := runSecretName(h.state().JobName)
-	first := string(h.kube.secrets[name].Data["LLM_API_KEY"])
-	clear(h.kube.secrets)
-	h.reconcile()
-	second := string(h.kube.secrets[name].Data["LLM_API_KEY"])
-	if second == "" || second == first {
-		t.Errorf("recreated secret key %q, first %q", second, first)
-	}
-}
-
 func TestLostSecretRaceDeletesUnusedKey(t *testing.T) {
 	h := newHarness()
 	h.reconcile()

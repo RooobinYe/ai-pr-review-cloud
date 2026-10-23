@@ -275,10 +275,15 @@ func TestSucceededJobWithoutResultFails(t *testing.T) {
 func TestMissingSecretIsRecreated(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
+	name := runSecretName(h.state().JobName)
+	firstKey := string(h.kube.secrets[name].Data["LLM_API_KEY"])
 	clear(h.kube.secrets)
 	h.reconcile()
 	if len(h.kube.secrets) != 1 || len(h.gh.tokens) != 2 {
 		t.Errorf("secrets %d, tokens %d", len(h.kube.secrets), len(h.gh.tokens))
+	}
+	if key := string(h.kube.secrets[name].Data["LLM_API_KEY"]); key == "" || key == firstKey {
+		t.Error("recreated Secret must contain a new model key")
 	}
 }
 
