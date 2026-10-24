@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { formatUsage, renderMarkdown } from "./render.ts";
-import type { ReviewResult } from "./schema.ts";
+import { SCHEMA_VERSION, type ReviewResult } from "./schema.ts";
 
 test("renderMarkdown lists comments by severity", () => {
   const r: ReviewResult = {
-    schema_version: 3,
+    schema_version: SCHEMA_VERSION,
     pr: { repo: "octo/demo", number: 7, head_sha: "0123456789abcdef0123456789abcdef01234567" },
     model: "deepseek/deepseek-flash",
     generated_at: "2026-10-23T08:00:00Z",
     verdict: "request_changes",
     body: "Summary.",
     comments: [
-      { path: "b.ts", line: 3, severity: "low", confidence: "low", body: "minor" },
-      { path: "a.ts", line: 9, severity: "critical", confidence: "high", body: "major" },
+      { path: "b.ts", line: 3, severity: "low", body: "minor" },
+      { path: "a.ts", line: 9, severity: "critical", body: "major" },
     ],
   };
   const md = renderMarkdown(r);

@@ -61,7 +61,7 @@ func FindVote(reviews []githubapp.Review, botLogin, runID string) (Vote, bool) {
 }
 
 func commentBody(c review.Comment) string {
-	return fmt.Sprintf("**%s** · confidence %s\n\n%s", c.Severity, c.Confidence, strings.TrimSpace(c.Body))
+	return fmt.Sprintf("**%s**\n\n%s", c.Severity, strings.TrimSpace(c.Body))
 }
 
 // BuildReview turns a result into one PR review: the body plus inline comments,

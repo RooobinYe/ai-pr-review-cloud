@@ -208,7 +208,7 @@ func TestResultAndActions(t *testing.T) {
 	if err := s.RecordAction(ctx, id, ActionCheckRunCreate, "123"); err != nil {
 		t.Fatal(err)
 	}
-	res := review.Result{SchemaVersion: 3, Verdict: review.VerdictApprove, Body: "ok", Comments: []review.Comment{}}
+	res := review.Result{SchemaVersion: review.SchemaVersion, Verdict: review.VerdictApprove, Body: "ok", Comments: []review.Comment{}}
 	if err := s.SubmitResult(ctx, id, res); err != nil {
 		t.Fatal(err)
 	}

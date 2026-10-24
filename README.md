@@ -116,7 +116,7 @@ export LLM_API_KEY=<DeepSeek API key>
 docker run --rm -e LLM_API_KEY -e GITHUB_TOKEN local/ai-pr-review-cloud-runner:dev --pr https://github.com/owner/repo/pull/1
 ```
 
-不用 Docker 时在 `runner/` 下执行 `node src/main.ts --pr <url>`。常用参数：`--format json` 输出 [schema v3](contract/review-result.schema.json) JSON，`--language Chinese` 指定评审语言，`--budget 0.05` 在花费达到 80% 时要求模型尽快提交，`--stats <文件>` 写出 token、金额和各阶段耗时。`GITHUB_TOKEN` 可选，私有仓库需要。
+不用 Docker 时在 `runner/` 下执行 `node src/main.ts --pr <url>`。常用参数：`--format json` 输出 [schema v4](contract/review-result.schema.json) JSON，`--language Chinese` 指定评审语言，`--budget 0.05` 在花费达到 80% 时要求模型尽快提交，`--stats <文件>` 写出 token、金额和各阶段耗时。`GITHUB_TOKEN` 可选，私有仓库需要。
 
 ## 目录结构
 

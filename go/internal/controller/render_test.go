@@ -42,8 +42,8 @@ func TestStaleApprovals(t *testing.T) {
 
 func TestBuildFoldedReviewOrdersBySeverity(t *testing.T) {
 	res := result(review.VerdictRequestChanges,
-		review.Comment{Path: "b.go", Line: 2, Severity: review.SeverityLow, Confidence: review.ConfidenceLow, Body: "low"},
-		review.Comment{Path: "a.go", Line: 9, Severity: review.SeverityCritical, Confidence: review.ConfidenceHigh, Body: "crit"},
+		review.Comment{Path: "b.go", Line: 2, Severity: review.SeverityLow, Body: "low"},
+		review.Comment{Path: "a.go", Line: 9, Severity: review.SeverityCritical, Body: "crit"},
 	)
 	body := BuildFoldedReview(runID, res, "COMMENT").Body
 	if strings.Index(body, "`a.go:9`") > strings.Index(body, "`b.go:2`") {

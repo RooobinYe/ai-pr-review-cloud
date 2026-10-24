@@ -1,4 +1,4 @@
-// Review result schema v3 (docs/architecture.md §4.4). The model decides the
+// Review result schema v4 (docs/architecture.md §4.4). The model decides the
 // verdict and writes the review body itself; structure exists only where the
 // controller needs it: the verdict drives the state machine, path/line anchor
 // inline comments, and severity feeds the failOn gate.
@@ -7,11 +7,10 @@
 // generated from ReviewResultSchema and checked by tests on both sides.
 import { Type, type Static } from "typebox";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const VERDICTS = ["approve", "request_changes"] as const;
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
-export const CONFIDENCES = ["high", "medium", "low"] as const;
 export const MAX_COMMENTS = 15;
 
 export const ReviewCommentSchema = Type.Object(
@@ -19,7 +18,6 @@ export const ReviewCommentSchema = Type.Object(
     path: Type.String({ minLength: 1, description: "File path relative to the repository root, as shown in the diff." }),
     line: Type.Integer({ minimum: 1, description: "Line number in the new version of the file. Must be an added or context line of the diff." }),
     severity: Type.Enum(SEVERITIES),
-    confidence: Type.Enum(CONFIDENCES),
     body: Type.String({
       minLength: 1,
       description: "Markdown comment: the evidence (quote the code), why it matters, and a concrete fix.",

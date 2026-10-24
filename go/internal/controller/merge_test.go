@@ -158,7 +158,7 @@ func TestFailOnPreventsApprovalAndMerge(t *testing.T) {
 			h := newHarness()
 			h.gh.config = []byte("approvalMode: " + mode)
 			h.reconcile()
-			res := result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"})
+			res := result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityHigh, Body: "bug"})
 			if code := h.post(res); code != http.StatusNoContent {
 				t.Fatalf("post result: %d", code)
 			}
@@ -290,7 +290,7 @@ func TestChangedOrClosedPullNeverMerges(t *testing.T) {
 func TestResultThresholdStoredOnce(t *testing.T) {
 	h := newHarness()
 	h.reconcile()
-	res := result(review.VerdictApprove, review.Comment{Path: "a", Line: 1, Severity: review.SeverityCritical, Confidence: review.ConfidenceHigh, Body: "bug"})
+	res := result(review.VerdictApprove, review.Comment{Path: "a", Line: 1, Severity: review.SeverityCritical, Body: "bug"})
 	if h.post(res) != http.StatusNoContent || h.post(res) != http.StatusNoContent {
 		t.Fatal("callback not idempotent")
 	}

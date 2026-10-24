@@ -143,7 +143,7 @@ func TestApproveFlow(t *testing.T) {
 		t.Errorf("repeated side effects: tokens %d, check runs %d, dismissals %d", len(h.gh.tokens), len(h.gh.checkRuns), len(h.gh.dismissed))
 	}
 
-	if code := h.post(result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityLow, Confidence: review.ConfidenceHigh, Body: "nit"})); code != http.StatusNoContent {
+	if code := h.post(result(review.VerdictApprove, review.Comment{Path: "a.go", Line: 3, Severity: review.SeverityLow, Body: "nit"})); code != http.StatusNoContent {
 		t.Fatalf("post result: %d", code)
 	}
 	h.kube.finish(r.JobName, kube.JobComplete)
@@ -206,7 +206,7 @@ func TestRejectedInlineCommentsAreFolded(t *testing.T) {
 	h := newHarness()
 	h.gh.rejectLines = true
 	h.reconcile()
-	h.post(result(review.VerdictRequestChanges, review.Comment{Path: "a.go", Line: 99, Severity: review.SeverityHigh, Confidence: review.ConfidenceHigh, Body: "bug"}))
+	h.post(result(review.VerdictRequestChanges, review.Comment{Path: "a.go", Line: 99, Severity: review.SeverityHigh, Body: "bug"}))
 	h.reconcile()
 	if len(h.gh.posted) != 1 {
 		t.Fatalf("posted %d reviews", len(h.gh.posted))

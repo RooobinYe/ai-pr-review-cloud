@@ -261,7 +261,7 @@ runner 在集群模式下把失败原因写进 `/dev/termination-log`。容器�
 
 1. 读 `/workspace/pr.json`，构造系统提示词和用户提示词。提示词按 v1 的防幻觉规则重写，放在 `runner/src/prompts.ts`。
 2. **探索阶段**：pi 内置的只读工具 `read`、`grep`、`find`、`ls`，加上自定义的 `git` 工具（只允许 `log`、`show`、`diff`、`blame` 等只读子命令，不经过 shell），`cwd` 为 `/workspace/repo`。评审阶段不给 `bash`：本地模式跑在开发者机器上，一个带注入的 PR 不应能执行任意命令。
-3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才启用受限的 `kubectl` 工具，只允许读取这个 namespace 的 Pod、事件、Deployment、ReplicaSet 和日志，不开放 shell。
+3. **预览验证阶段**（可选）：controller 部署好预览环境后，runner 收到一条 follow-up 提示，附上 namespace 名称；此时才启用受限的 `kubectl` 工具，只允许读取这个 namespace 的 Pod、事件、Deployment、ReplicaSet 和日志，不开放 shell。有预览时 `submit_review` 也只在这一阶段才提供。系统提示词按是否有预览生成：有预览时写明两个阶段和各自可用的工具，探索阶段的用户提示词和恢复提示只要求探索完结束本轮，只有第二阶段的提示要求调用 `submit_review`；预算提醒也按阶段措辞。不靠"工具不存在"的报错教模型。
 4. **提交阶段**：模型调用 `submit_review`，参数是 §4.4 的 `verdict`、`body`、`comments`。工具先检查每条评论的 `path:line` 是否落在 diff 的新增行或上下文行上（GitHub 只接受这些位置），不合法就把错误返回给模型让它改；合法则记录结果并结束本轮 agent。若模型结束时没调用，追加提示要求提交，最多 2 次，之后判为失败。最后一轮是模型服务报错（pi 重试后仍失败，例如 402 余额不足）时不再提醒，直接以 `model API error: ...` 失败，免得被误读成模型不肯提交。
 5. 结束 session，进程以 0 退出。集群模式把结果 `POST {CONTROLLER_URL}/runs/{id}/result`，带 `Authorization: Bearer <RUN_TOKEN>`，controller 读本 run 的 Secret 比对，不符返回 401：网络错误和 5xx 退避重试，4xx 不重试；controller 对同一结果的重复 POST 返回成功，所以响应丢失后重试是安全的。
 
@@ -278,7 +278,7 @@ const { session } = await createAgentSession({
   model,
   modelRuntime,
   thinkingLevel,
-  resourceLoader: isolatedResources(systemPrompt(language)),
+  resourceLoader: isolatedResources(systemPrompt(language, preview)), // 有预览时写明两个阶段
   sessionManager: SessionManager.inMemory(cwd, undefined, resumeFrom), // 上一次尝试的快照，见 4.3
   settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 3 } }),
   tools: ["read", "grep", "find", "ls", "git", "submit_review"],
@@ -293,13 +293,19 @@ session.subscribe((e) => {
   }
 });
 
-await session.prompt(resumeFrom ? RESUME_PROMPT : userPrompt(pr));
+// 有预览时第一条提示只要求探索；崩在第二阶段的恢复直接回到第二阶段
+if (!resumeInPreview) await session.prompt(resumeFrom ? resumePrompt(preview) : userPrompt(pr, { preview }));
+if (preview) {
+  previewAccess = await preparePreview();
+  session.setActiveToolsByName([...baseTools, "kubectl", "submit_review"]);
+  await session.prompt(previewPrompt(previewAccess.namespace, previewAccess.status, resumeInPreview));
+}
 for (let i = 0; !submitted && i < MAX_SUBMIT_REMINDERS; i++) await session.prompt(SUBMIT_REMINDER);
 ```
 
 ### 4.3 崩溃恢复
 
-runner 每轮（一次模型回复加它触发的工具调用）结束时，把整个 pi session 序列化成 JSONL（header 一行，之后每个 entry 一行，与 pi 的 session 文件格式相同）。先把本轮用量 `PUT /runs/{id}/usage`，失败记日志，然后独立尝试 `PUT /runs/{id}/session?turn=N`；快照被拒绝不会跳过用量上报，用量上传失败也不会跳过快照。快照在 `turn_end` 事件里同步取，上传在后台排队依次进行，失败不中断评审。新 Pod 启动时 `GET /runs/{id}/session`，有快照就用 `SessionManager.inMemory(cwd, undefined, entries)` 载入，追加一条"进程中断后已恢复，从上次完成的步骤继续"的提示，否则从头开始。预算提醒计入快照中已花费的金额。这三个接口和结果回调一样用本次尝试的 `RUN_TOKEN` 鉴权，旧尝试的 token 随旧 Job 的 Secret 一起失效；旧 token 被拒绝时仍可能丢失最后一轮用量。
+runner 每轮（一次模型回复加它触发的工具调用）结束时，把整个 pi session 序列化成 JSONL（header 一行，之后每个 entry 一行，与 pi 的 session 文件格式相同）。先把本轮用量 `PUT /runs/{id}/usage`，失败记日志，然后独立尝试 `PUT /runs/{id}/session?turn=N`；快照被拒绝不会跳过用量上报，用量上传失败也不会跳过快照。快照在 `turn_end` 事件里同步取，上传在后台排队依次进行，失败不中断评审。新 Pod 启动时 `GET /runs/{id}/session`，有快照就用 `SessionManager.inMemory(cwd, undefined, entries)` 载入，追加一条"进程中断后已恢复，从上次完成的步骤继续"的提示，否则从头开始。有预览时按快照判断崩在哪个阶段：快照里已有第二阶段提示的，重新取得预览访问后直接回到预览验证；否则继续探索，提示里不要求提交。预算提醒计入快照中已花费的金额。这三个接口和结果回调一样用本次尝试的 `RUN_TOKEN` 鉴权，旧尝试的 token 随旧 Job 的 Secret 一起失效；旧 token 被拒绝时仍可能丢失最后一轮用量。
 
 | 场景 | 处理 |
 | --- | --- |
@@ -330,16 +336,18 @@ runner 每轮（一次模型回复加它触发的工具调用）结束时，把�
 | 字段 | 含义 | 去向 |
 | --- | --- | --- |
 | `verdict` | `approve` / `request_changes` | 投票：`approve` 提交 APPROVE review，`request_changes` 提交 COMMENT review（§6.3）；`auto` / `manual` 模式下还决定是否进入合并 |
-| `body` | Markdown 正文：改了什么、结论理由、验证了什么、没看的部分、自检行 | review 正文、Check Run 摘要 |
-| `comments[]` | `path`、`line`（新文件行号）、`severity`（critical/high/medium/low）、`confidence`（high/medium/low）、`body` | 逐行评论；`severity` 供 `failOn` 使用 |
+| `body` | Markdown 正文，要求简短：改了什么、结论理由，以及（有的话）未验证的疑点、没看的部分和至多 3 条次要建议 | review 正文、Check Run 摘要 |
+| `comments[]` | `path`、`line`（新文件行号）、`severity`（critical/high/medium/low）、`body` | 逐行评论；`severity` 供 `failOn` 使用 |
 
-runner 交给 controller 的 `ReviewResult` 在此之外加上 `schema_version: 3`、`pr`（`repo`、`number`、`head_sha`，controller 用来拒绝不属于当前 run 的结果）、`model`、`generated_at`。评论最多 15 条，所有字段必填，不允许多余字段。
+runner 交给 controller 的 `ReviewResult` 在此之外加上 `schema_version: 4`、`pr`（`repo`、`number`、`head_sha`，controller 用来拒绝不属于当前 run 的结果）、`model`、`generated_at`。评论最多 15 条，所有字段必填，不允许多余字段。
 
 两侧定义：TypeScript 在 [`runner/src/schema.ts`](../runner/src/schema.ts)（TypeBox，同时作为 `submit_review` 的参数 schema），Go 在 [`go/internal/review`](../go/internal/review/review.go)。[`contract/review-result.schema.json`](../contract/review-result.schema.json) 由 TypeBox 生成，`contract/examples/` 里的合法、非法样例由两侧测试共同校验；Go 测试还会核对字段、枚举、上限与生成的 schema 一致，并检查 `verdict` 取值与数据库 CHECK 约束一致。
 
-逐行评论只留给合并前值得处理的问题（critical、high，以及中高置信度的 medium），通常 0 到 5 条；风格和低级别建议最多 3 条，以一行一条的形式写进正文的 "Minor" 部分。每条评论都要占用作者的注意力，评论太多反而会淹没真正的问题。
+逐行评论只留给对照代码（或预览阶段的运行时证据）核实过、合并前值得处理的 critical、high、medium 问题，通常 0 到 5 条；没能核实的疑点写进正文并注明未核实，不做逐行评论；低级别和风格建议最多 3 条，一行一条写进正文。每条评论都要占用作者的注意力，评论太多反而会淹没真正的问题。
 
-提示词里的判定规则（`verdict_policy`）：存在中高置信度的 critical 或 high 问题时 request_changes；中低级别、风格建议和不确定的发现只作为评论，不阻塞合并；没能审到最可能出问题的部分时也应 request_changes 并说明原因。防幻觉规则沿用 v1：每条评论必须引用读到的代码，不确定的标 `[Uncertain]` 并给低置信度，critical/high 要做反向检验。
+提示词里的判定规则（`verdict_policy`）：存在核实过的 critical 或 high 问题时 request_changes；medium、low、风格建议和未核实的疑点不阻塞合并；没能审到最可能出问题的部分时也应 request_changes 并说明原因。防幻觉规则沿用 v1：每条评论必须引用读到的代码，不得编造没读过的代码，critical/high 要做反向检验。探索不设固定配额（v1 要求至少读 3 个文件、追 2 个调用方），改为"读到足以证实或排除每个疑点为止"，单文件 PR 不必遍历十几个文件。
+
+schema v4 去掉了 v3 逐行评论的 `confidence`（high/medium/low）。代码里没有任何地方按它过滤，它只被渲染成 "confidence medium"，读者难以据此判断；与其让模型自评置信度，不如只让核实过的发现成为逐行评论。
 
 ### 4.5 模型接入
 
@@ -548,7 +556,7 @@ Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud
 ### 7.3 预算控制
 
 - 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明（§5）。LiteLLM 在请求前检查预算，单次尝试可能超出最后一个请求的花费；重试签发按 run 的预算减去已上报的 `run_usage.cost_usd`，余额耗尽不再发 key。这里的用量按 pi 模型目录计价，需与 LiteLLM 的 `llm.pricing` 保持一致；崩溃前未上报的请求花费可能遗漏，代理花费落库也有延迟，因此不是严格的账单硬上限。
-- runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`BUDGET_REMINDER`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
+- runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`budgetReminder`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。有预览时提示按阶段措辞：探索阶段还不能提交，只要求结束本轮；进入预览验证阶段时若仍超过阈值，再在第二阶段的提示后附一条要求提交的提醒，所以这种 run 最多收到两次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
 - 软上限按轮检查，所以实际花费会超过阈值大约一到两轮（提示送达前的那一轮，加上提交的那一轮）。测算里预算设为 $0.02 时的实际花费见 [成本测算报告](cost-report.md)。
 
 ## 8. 与 v1 的关系、仓库结构与交付形式
@@ -560,8 +568,8 @@ Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud
 | 沿用自 v1 | 在本项目中的形态 |
 | --- | --- |
 | 两阶段评审：先用工具探索仓库，再给出结构化结论 | runner 的探索阶段 + `submit_review` 工具（§4.2）；模型直接给出 verdict |
-| 评审提示词与防幻觉规则（XML 结构、证据要求、置信度说明） | runner 的系统提示词，按新流程重写 |
-| 输出 schema v2：`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version` | 改为 schema v3（§4.4）：保留严重级别和置信度，`must_fix` 的判断交给模型的 `verdict`，报告式字段换成模型直接写的正文和逐行评论；Go 与 TS 两侧用契约测试对齐 |
+| 评审提示词与防幻觉规则（XML 结构、证据要求、置信度说明） | runner 的系统提示词，按新流程重写；置信度换成"只有核实过的发现才做逐行评论" |
+| 输出 schema v2：`must_fix` / `points_of_interest`、严重级别、置信度、`schema_version` | 改为 schema v4（§4.4）：保留严重级别，去掉置信度，`must_fix` 的判断交给模型的 `verdict`，报告式字段换成模型直接写的正文和逐行评论；Go 与 TS 两侧用契约测试对齐 |
 | `--fail-on` 质量门禁 | controller 里对评论 `severity` 的确定性校验，超标时不投 APPROVE（§6.5） |
 | 按文件类型分类改动（code / test / config / doc） | 提示词里的文件分类与评论分组 |
 
@@ -583,7 +591,7 @@ ai-pr-review-cloud/
 │   ├── internal/litellm/            # LiteLLM 虚拟 key 的签发与吊销
 │   ├── internal/metrics/            # /metrics：由数据库快照生成 Prometheus 指标
 │   ├── internal/store/              # PostgreSQL 访问与迁移
-│   ├── internal/review/             # 评审结论 schema v3（与 runner 对齐）
+│   ├── internal/review/             # 评审结论 schema v4（与 runner 对齐）
 │   ├── internal/run/                # run 状态与合法转换
 │   ├── internal/store/migrations/   # PostgreSQL 表结构
 │   └── Dockerfile                   # 用 --build-arg CMD=<组件> 构建三个镜像
@@ -595,7 +603,7 @@ ai-pr-review-cloud/
 │   ├── src/pr.ts                    # PR 上下文及 pr.json 校验
 │   ├── src/review.ts                # pi session、工具、提交提醒
 │   ├── src/prompts.ts               # 系统提示词与用户提示词
-│   ├── src/schema.ts                # 评审结论 schema v3（TypeBox）
+│   ├── src/schema.ts                # 评审结论 schema v4（TypeBox）
 │   ├── src/tools.ts                 # git、submit_review 工具
 │   ├── src/github.ts                # 本地模式拉取 PR 与克隆
 │   └── Dockerfile
