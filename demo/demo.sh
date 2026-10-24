@@ -31,10 +31,9 @@ preview_namespace() {
   printf '%s' "${name}"
 }
 
-# The demo PR's version of demo/preview/server.mjs: a routing refactor with a
-# bug planted in it. It is compressed and encoded because the reviewing agent
-# reads the whole repository, this script included, and must not find the
-# answer here; models can read plain base64.
+# The demo PR's version of demo/preview/server.mjs. It is compressed and
+# encoded because the reviewing agent reads the whole repository, this script
+# included, and has to judge the change on its own; models read plain base64.
 write_buggy_server() {
   base64 -d <<'EOF' | gunzip >"$1/demo/preview/server.mjs"
 H4sIAAAAAAACA4WRQU/CQBCF7/yKdzDZkuDSGA4EgsQYEz2oRIwXMFLpQDcpu3V3oDak/90pVePN
