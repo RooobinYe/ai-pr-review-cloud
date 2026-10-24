@@ -102,7 +102,7 @@ function main() {
     }
   }
   const info = { killAfter: values["kill-after"], replay: Boolean(values.replay), speed };
-  const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false });
+  const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false, detectFailed: false });
   // busy names the demo.sh command in flight; one runs at a time.
   let state = fresh();
   let history = [];
@@ -138,13 +138,16 @@ function main() {
     const args = ["pr", "list", "--state", "open", "--json", "number,headRefName,isDraft,url"];
     execFile("gh", args, { cwd: root, timeout: 15_000 }, (err, stdout) => {
       let found;
+      let failed = false;
       try {
         if (err) throw err;
         found = findDemoPR(JSON.parse(stdout));
       } catch (e) {
         send({ kind: "task", task: "detect", raw: `gh pr list: ${String(e.message).trim()}` });
+        failed = true;
       }
-      status(found ? { busy: "", pr: found.number, url: found.url, prepared: true } : { busy: "" });
+      // A failed lookup is not "no demo PR": prepping then could open a second one.
+      status(found ? { busy: "", pr: found.number, url: found.url, prepared: true, detectFailed: false } : { busy: "", detectFailed: failed });
     });
   }
 
@@ -214,7 +217,8 @@ function main() {
       req.on("close", () => clients.delete(res));
     } else if (action?.pathname === "/prep" && !info.replay) {
       if (state.busy || state.pr) return void res.writeHead(409).end();
-      prep();
+      if (state.detectFailed) detect();
+      else prep();
       res.writeHead(204).end();
     } else if (action?.pathname === "/start") {
       if (state.busy || !state.prepared || (state.started && !info.replay)) return void res.writeHead(409).end();
@@ -347,6 +351,7 @@ function controls() {
   const s = S.status; if (!s) return;
   if (s.pr) { $("prlink").textContent = "#" + s.pr; if (s.url) $("prlink").href = s.url; }
   $("prep").disabled = Boolean(s.busy || s.pr);
+  $("prep").textContent = s.detectFailed ? "重新查找" : "准备";
   $("start").disabled = Boolean(s.busy || !s.prepared || (s.started && !S.replay));
   $("start").textContent = s.started && S.replay ? "再放一次" : "开始";
   $("cleanup").disabled = Boolean(s.busy || !s.pr);
@@ -357,6 +362,7 @@ function controls() {
   else if (s.busy === "run" || s.busy === "replay") hint = s.busy === "run" ? "演示进行中" : "回放中";
   else if (s.started) hint = S.replay ? "回放结束" : "演示结束。讲完后点「收尾」关闭 PR 并删除预览环境";
   else if (s.prepared) hint = (s.pr ? "PR #" + s.pr + " 已就绪，" : "") + "点「开始」启动演示";
+  else if (s.detectFailed) hint = "查找已有的演示 PR 失败（" + S.taskText + "），检查 gh 和网络后点「重新查找」";
   else if (s.pr) hint = "PR #" + s.pr + " 的准备没有完成（" + (S.taskText || "见原始输出") + "），点「收尾」关掉后重新准备";
   else hint = "没有找到 draft 演示 PR，点「准备」新开一个（约 1 分钟）" + (S.taskText ? "。上次输出：" + S.taskText : "");
   $("bar").textContent = hint;
