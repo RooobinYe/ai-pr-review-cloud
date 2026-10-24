@@ -66,7 +66,7 @@ prep() {
   pr="$(gh pr view "${branch}" --json number -q .number)"
   say "draft PR #${pr} opened: $(gh pr view "${pr}" --json url -q .url)"
 
-  until id="$(gh run list --workflow preview-image.yaml --branch "${branch}" --json databaseId -q '.[0].databaseId')" && [ -n "${id}" ]; do
+  until id="$(gh run list --workflow preview-image.yaml --branch "${branch}" --json databaseId -q '.[0].databaseId // empty')" && [ -n "${id}" ]; do
     sleep 3
   done
   say "waiting for the preview image (workflow run ${id})"
@@ -77,7 +77,10 @@ prep() {
 follower=""
 stop_follower() {
   if [ -n "${follower}" ]; then
-    kill "${follower}" 2>/dev/null || true
+    # run turns on job control, so the follower is its own process group and
+    # this also stops its retry loop and kubectl.
+    kill -- "-${follower}" 2>/dev/null || true
+    wait "${follower}" 2>/dev/null || true
     follower=""
   fi
 }
@@ -94,10 +97,12 @@ follow() {
 
 run() {
   local pr="$1" head ns row id="" state="" attempt="" job="" verdict=""
-  local last="" last_job="" pods="" last_pods="" running_since="" killed=""
+  local last="" last_job="" pods="" last_pods="" running_since="" killed="" hinted=""
   head="$(gh pr view "${pr}" --json headRefOid -q .headRefOid)"
   ns="$(preview_namespace "${pr}")"
+  set -m
   trap 'stop_follower' EXIT
+  trap 'exit 130' INT TERM
 
   gh pr ready "${pr}" >/dev/null 2>&1
   say "PR #${pr} marked ready for review: $(gh pr view "${pr}" --json url -q .url)"
@@ -118,6 +123,9 @@ run() {
         last_job="${job}"
         running_since="$(date +%s)"
       fi
+    elif [ -z "${hinted}" ] && [ $(($(date +%s) - started)) -ge 60 ]; then
+      say "no run after a minute: is the webhook forwarder (make webhook-forward) running?"
+      hinted=1
     fi
 
     pods="$(kubectl -n "${ns}" get pods --no-headers \
