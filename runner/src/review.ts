@@ -241,7 +241,16 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
   // Snapshots are taken synchronously at turn_end, while the session matches
   // the turn, and uploaded in order behind each other.
   let spent = session.getSessionStats().cost;
+  // With a preview, a reminder sent while exploring cannot ask for a
+  // submission, so phase 2 gets its own reminder.
   let nudged = false;
+  let submitNudged = false;
+  const nudge = (deliver: (text: string) => void) => {
+    nudged = true;
+    submitNudged = canSubmit;
+    opts.onProgress?.(`spent ${spent.toFixed(4)} of the ${opts.budgetUSD} budget; asking the model to ${canSubmit ? "submit" : "end exploration"}`);
+    deliver(budgetReminder(canSubmit));
+  };
   let uploads = Promise.resolve();
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "turn_end") {
@@ -249,10 +258,8 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
       const problem = turnProblem(event.message);
       if (problem) opts.onProgress?.(problem.text);
       spent += snapshot.cost;
-      if (!nudged && !submission && overNudgeThreshold(spent, opts.budgetUSD)) {
-        nudged = true;
-        opts.onProgress?.(`spent ${spent.toFixed(4)} of the ${opts.budgetUSD} budget; asking the model to submit`);
-        session.steer(budgetReminder(canSubmit)).catch((err: unknown) => opts.onProgress?.(`budget reminder failed: ${String(err)}`));
+      if (!submission && !(canSubmit ? submitNudged : nudged) && overNudgeThreshold(spent, opts.budgetUSD)) {
+        nudge((text) => session.steer(text).catch((err: unknown) => opts.onProgress?.(`budget reminder failed: ${String(err)}`)));
       }
       const onTurn = opts.onTurn;
       uploads = uploads
@@ -286,7 +293,9 @@ export async function review(opts: ReviewOptions): Promise<ReviewOutcome> {
         previewAccess = await opts.preparePreview();
         session.setActiveToolsByName([...baseTools, "kubectl", "submit_review"]);
         canSubmit = true;
-        await prompt(previewPrompt(previewAccess.namespace, previewAccess.status, resumeInPreview));
+        let text = previewPrompt(previewAccess.namespace, previewAccess.status, resumeInPreview);
+        if (overNudgeThreshold(spent, opts.budgetUSD)) nudge((reminder) => (text += `\n\n${reminder}`));
+        await prompt(text);
       }
     }
     for (let i = 0; !submission && i < MAX_SUBMIT_REMINDERS; i++) {

@@ -456,7 +456,7 @@ Grafana 看板 [`dashboards/review-cost.json`](../deploy/helm/ai-pr-review-cloud
 ### 7.3 预算控制
 
 - 虚拟 key 自带 `max_budget`，超出后 proxy 直接拒绝，run 以 `failed(budget_exceeded)` 结束，并在 Check Run 上说明（§5）。LiteLLM 在请求前检查预算，单次尝试可能超出最后一个请求的花费；重试签发按 run 的预算减去已上报的 `run_usage.cost_usd`，余额耗尽不再发 key。这里的用量按 pi 模型目录计价，需与 LiteLLM 的 `llm.pricing` 保持一致；崩溃前未上报的请求花费可能遗漏，代理花费落库也有延迟，因此不是严格的账单硬上限。
-- runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`BUDGET_REMINDER`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
+- runner 侧是软上限：`turn_end` 时累计 `usage.cost.total`，达到预算 80% 且还没提交时，用 pi 的 `steer` 插入一条提示（[`budgetReminder`](../runner/src/prompts.ts)），要求停止探索、按已核实的内容提交，并在正文里写明没查到的部分。提示在当前轮的工具调用执行完、下一次模型调用前送达，每个 run 只发一次。有预览时提示按阶段措辞：探索阶段还不能提交，只要求结束本轮；进入预览验证阶段时若仍超过阈值，再在第二阶段的提示后附一条要求提交的提醒，所以这种 run 最多收到两次。集群模式的预算来自 `review_run.budget_usd`（controller 以 `REVIEW_BUDGET_USD` 传入），本地模式用 `--budget`。
 - 软上限按轮检查，所以实际花费会超过阈值大约一到两轮（提示送达前的那一轮，加上提交的那一轮）。测算里预算设为 $0.02 时的实际花费见 [成本测算报告](cost-report.md)。
 
 ## 8. 与 v1 的关系、仓库结构与交付形式

@@ -253,3 +253,28 @@ test("a preview review that crashed during runtime verification goes straight ba
   assert.deepEqual(second.outcome.submission, submission);
   assert.equal(second.faux.state.callCount, 1);
 });
+
+test("a preview review over budget is reminded again once it can submit", async () => {
+  const first = await run(undefined, [
+    fauxAssistantMessage(fauxToolCall("read", { path: "a.go" })),
+    fauxAssistantMessage("done exploring"),
+    fauxAssistantMessage(fauxToolCall("submit_review", submission)),
+  ], undefined, previewOptions().opts);
+  const saved = parseSessionEntries(first.snapshots[0]!.jsonl);
+  for (const entry of saved) {
+    if (entry.type === "message" && entry.message.role === "assistant") entry.message.usage.cost.total = 0.9;
+  }
+  const second = await run(saved, [
+    fauxAssistantMessage(fauxToolCall("read", { path: "a.go" })),
+    (context) => {
+      assert.match(lastUserText(context), /end your turn now/);
+      return fauxAssistantMessage("done exploring");
+    },
+    (context) => {
+      assert.match(lastUserText(context), /pr-demo-1[^]*call submit_review now/);
+      return fauxAssistantMessage(fauxToolCall("submit_review", submission));
+    },
+  ], 1, previewOptions().opts);
+  assert.equal(second.outcome.nudged, true);
+  assert.deepEqual(second.outcome.submission, submission);
+});
