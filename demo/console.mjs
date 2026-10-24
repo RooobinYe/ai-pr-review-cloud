@@ -340,7 +340,8 @@ function apply(ev, t) {
   switch (ev.type) {
     case "ready": $("prlink").textContent = "#" + ev.pr; $("prlink").href = ev.url; row(t, "sys", "", "PR 标为待评审，GitHub 发出 webhook"); break;
     case "state":
-      row(t, "sys", "", "run " + ev.run + " → " + ev.state + "（第 " + ev.attempt + " 次尝试）");
+      // attempt counts started attempts, so a queued run is still at 0.
+      row(t, "sys", "", "run " + ev.run + " → " + ev.state + (ev.attempt ? "（第 " + ev.attempt + " 次尝试）" : ""));
       if (ev.state === "queued") advance("queue", t);
       else if (ev.state === "running") advance(S.previewSeen ? "evidence" : "review", t);
       else if (ev.state === "previewing") advance("preview", t);
