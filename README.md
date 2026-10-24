@@ -77,6 +77,10 @@ kubectl -n ai-pr-review-cloud logs deploy/ai-pr-review-cloud-controller -f
 
 M5 已用本仓库的错误探针 PR 验收：agent 读取 Kubernetes 事件和日志，确认探针返回 404，再给出 `request_changes`。验收记录见 [roadmap](docs/roadmap.md#m5-预览环境验证)。
 
+### 三分钟演示
+
+[`demo/demo.sh`](demo/demo.sh) 在本机部署上现场跑一次完整闭环：开 PR、独立 Pod 评审、中途删 Pod 后恢复、预览环境里用 kubectl 取证、投票并给出修复建议。步骤、时间线和彩排记录见 [演示指南](docs/demo.md)。
+
 ### 成本看板
 
 `make deploy` 同时装上仅供开发用的 Prometheus 和 Grafana，Grafana 首页就是吞吐、各阶段耗时和每次评审成本的看板（[看板 JSON](deploy/helm/ai-pr-review-cloud/dashboards/review-cost.json)，指标见 [架构 §7.1](docs/architecture.md#71-指标)）。转发端口后打开 http://localhost:3000 ，匿名即可查看：

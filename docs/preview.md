@@ -62,7 +62,7 @@ preview:
   helm:
     chart: demo/preview/chart
     # valuesFile: demo/preview/values-preview.yaml
-  readyTimeout: 2m
+  readyTimeout: 45s
 ```
 
 仓库要求预览但服务端未开启，或未配置可信镜像仓库时，评审会明确失败。不会静默跳过必需的运行时验证。
