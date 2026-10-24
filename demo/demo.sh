@@ -167,7 +167,7 @@ summary() {
 cleanup() {
   local pr="$1" ns
   ns="$(preview_namespace "${pr}")"
-  gh pr close "${pr}" --delete-branch >/dev/null
+  gh pr close "${pr}" --delete-branch >/dev/null 2>&1
   say "PR #${pr} closed; the controller deletes ${ns} within a minute"
   while kubectl get namespace "${ns}" >/dev/null 2>&1; do sleep 3; done
   say "preview namespace ${ns} deleted"
