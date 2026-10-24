@@ -61,7 +61,7 @@ test("findDemoPR", () => {
   const cases = [
     [[], undefined],
     [[pr(21, "feat/demo-console", false)], undefined],
-    [[pr(20, "demo/version-endpoint-1024153202", false)], undefined],
+    [[pr(20, "demo/version-endpoint-1024153202", false)], pr(20, "demo/version-endpoint-1024153202", false)],
     [[pr(21, "feat/demo-console", true), pr(22, "demo/version-endpoint-1025090000", true)], pr(22, "demo/version-endpoint-1025090000", true)],
     [[pr(22, "demo/version-endpoint-1", true), pr(24, "demo/version-endpoint-2", true)], pr(24, "demo/version-endpoint-2", true)],
   ];

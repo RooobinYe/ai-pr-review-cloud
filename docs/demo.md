@@ -20,7 +20,7 @@ kubectl -n ai-pr-review-cloud port-forward svc/ai-pr-review-cloud-grafana 3000:3
 node demo/console.mjs
 ```
 
-打开 `http://localhost:8787`。演示页启动时会找已开的 draft 演示 PR（分支 `demo/version-endpoint-*`），找到就直接可以开始；没找到就点"准备"，等提示条显示"已就绪"。
+打开 `http://localhost:8787`。演示页启动时会找已开的演示 PR（分支 `demo/version-endpoint-*`）：还是 draft 的直接可以开始；已经演示过、不再是 draft 的，提示先"收尾"；都没有就点"准备"，等提示条显示"已就绪"。
 
 "准备"运行 `demo.sh prep`：从 `main` 建分支、提交改动、开 **draft** PR，然后等 CI 把 `:<head_sha>` 预览镜像推到 GHCR（约 1 分钟）。draft 不触发评审，所以开演时镜像已经就绪，不用在镜头前等 CI。不用演示页时，在终端直接跑 `demo/demo.sh prep`，它最后打印的 `demo/demo.sh run <pr>` 就是要用的 PR 号；`node demo/console.mjs <pr>` 也可以直接指定 PR。
 
