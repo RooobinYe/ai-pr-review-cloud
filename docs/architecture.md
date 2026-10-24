@@ -25,7 +25,26 @@ ai-pr-review v1 是一个本地 / CI 里运行的 CLI：输入 PR URL，克隆�
 - 不做多集群、多租户；只支持一个 GitHub App 实例。
 - 不做 Web UI；交互全部发生在 GitHub（PR 评论、Check Run）和 Grafana。
 
-## 1. 场景定位
+## 1. 场景与价值
+
+### 1.1 目标用户
+
+用 GitHub 协作、合并前要求代码评审的研发团队，尤其是：
+
+- **评审人手紧的小团队和开源维护者。** 仓库要求"至少 N 个 approval"，PR 经常要等审批人有空才能往前走。
+- **把服务部署在 Kubernetes 上的团队。** 很多问题只看代码看不出，要部署起来才暴露：配置写错、镜像起不来、探针失败、资源不足。
+- **对代码和密钥外流敏感的团队。** 希望评审服务部署在自己的集群里，模型只拿到受限的临时凭据。
+
+### 1.2 痛点与现有做法
+
+| 现有做法 | 能做到 | 做不到 |
+| --- | --- | --- |
+| 人工评审 | 理解改动意图，对合并负责 | 审批人时间有限，PR 要排队等；大 PR 容易扫一遍就过；不会为每个 PR 部署一遍再看运行效果 |
+| CI 静态检查（lint、单测、SAST） | 确定、便宜、可重复 | 只能发现写成规则的问题，不理解改动意图，也不会去读改动牵连到的其他代码 |
+| SaaS 类 AI 评审机器人 | PR 上自动出评论 | 结论停在评论层面，不进入审批流程（GitHub 文档明确说 Copilot 的 review 不计入必需审批数）；代码要发给第三方服务；一般只看代码，不部署运行 |
+| 本项目的前身 v1 CLI（§8.1） | agent 主动探索代码，给出结构化结论，`--fail-on` 当门禁 | 要人手动运行或写进 CI；单进程，崩溃就从头再来；没有团队维度的成本统计和预算控制 |
+
+### 1.3 方案定位
 
 **基础能力：PR 评审。** 沿用 v1 验证过的两阶段评审（先探索、再结论）。结论由模型自己决定：approve 还是 request_changes，加上一段评审正文和逐行评论，以 PR Review 和 Check Run 的形式呈现（§4.4）。
 
@@ -34,6 +53,20 @@ ai-pr-review v1 是一个本地 / CI 里运行的 CLI：输入 PR URL，克隆�
 **差异化能力：预览环境验证（按仓库开启）。** 只看代码看不出的问题，在运行起来以后才暴露：配置错误、镜像起不来、探针失败、资源不足、依赖服务连不上。开启后，controller 为 PR 创建独立的 namespace 并部署，agent 用 kubectl 查看 Pod 状态、事件和日志，把运行时证据和代码评审结论合在一起，再给出结论。
 
 这也是 agent 需要 kubectl 的唯一理由。纯代码评审阶段不给集群权限。
+
+### 1.4 Agent 带来的改进
+
+这里用 agent 而不是一次性把 diff 交给模型，是因为评审需要多步取证：看到一处改动，要去读调用方、查历史、确认边界条件，开启预览时还要查 Pod 状态和日志。每一步看什么，取决于上一步看到了什么。
+
+| 改进 | 做法 | 证据 |
+| --- | --- | --- |
+| 不需要人去触发 | GitHub App 收到 PR 事件后自动评审，每个新提交评审一次 | M1 验收（[roadmap](roadmap.md#m1-最小闭环)） |
+| 不止看 diff | 只读工具 `read`、`grep`、`find`、`ls`、`git`（§4.2），平均每次评审 14.6 轮、26 次工具调用 | [成本报告](cost-report.md#瓶颈分析) |
+| 发现运行时问题 | 为 PR 部署预览环境，agent 用 kubectl 读事件和日志 | M5：探针路径写错的 PR，agent 查到探针返回 404，给出 request_changes（[roadmap](roadmap.md#m5-预览环境验证)） |
+| 结论进入审批流程 | AI 以 bot 身份投票，approve 计入"需要 N 个 approval"；发现问题只评论、不阻塞合并 | M1 实测：App 有 Contents: write 时这一票计入（§6.4） |
+| 判断可信 | 结论由模型给出，`failOn` 做确定性兜底（§6.5） | 20 个真实 PR 各跑 3 次，19 个三次结论一致；标明 DO NOT MERGE 的安全问题 PR 三次都是 request_changes；go-chi/chi 的 7 个已合并 PR 全部 approve（[成本报告](cost-report.md#稳定性与结论质量)） |
+| 成本和时长可控 | 每个 run 的虚拟 key 带预算硬上限，runner 侧还有软预算（§7.3） | 一次评审 P50 $0.029、端到端 P50 106 秒；每 100 个 PR 每月约 $9 |
+| 中断后接着跑 | 每轮上传 session 快照，新 Pod 从快照继续（§4.3） | M3：评审中途删 Pod，run 自动恢复，PR 上没有重复评论（[roadmap](roadmap.md#m3-可靠性)） |
 
 ## 2. 总体架构
 
@@ -66,6 +99,73 @@ flowchart LR
 - **所有副作用集中在 controller。** runner 只产出数据，不改变外部世界（预览环境除外，且只读）。这样 runner 可以随意重试，GitHub 上不会出现重复评论。
 - **状态都在 PostgreSQL。** gateway、controller、runner 都可以随时重启。
 - **等待不占 Pod。** 任何需要等人或等事件的环节，都表现为数据库里的一个状态，而不是一个挂着的进程。
+
+### 2.1 关键技术选型
+
+| 决策 | 选择 | 考虑过的方案 | 理由 |
+| --- | --- | --- | --- |
+| 服务拆分 | gateway、controller、runner 三个组件，外加现成的 LiteLLM 和 PostgreSQL | 单体服务 | 三者的信任级别和伸缩方式不同。gateway 面向公网，要在 GitHub 的超时内快速返回，不该持有 GitHub 凭据；controller 是唯一执行副作用的地方，便于做幂等；runner 运行受 PR 内容影响的模型，必须隔离、可随时丢弃。拆开后每个组件的权限可以按最小原则给 |
+| 评审的执行单元 | 每个 run 一个 Kubernetes Job，每次尝试一个新 Pod | 常驻 worker 进程池 | PR 内容不可信，提示注入可能让模型乱用工具。一次性 Pod 天然隔离：独立的文件系统、本次尝试专用的凭据 Secret、单独的 NetworkPolicy 和资源上限，结束即销毁。空闲时不占资源。代价是每次几秒的冷启动，集群内实测建 Pod 加拉代码 6 到 37 秒，相比 100 秒以上的模型评审可以接受（[成本报告](cost-report.md#集群内实测)） |
+| 状态与调度 | PostgreSQL 里的状态机，controller 轮询 reconcile，用 `FOR UPDATE SKIP LOCKED` 领取任务 | 消息队列（Kafka、Redis Streams）；工作流引擎（Temporal、Argo Workflows） | 评审要等的东西可能持续几天（manual 模式等人确认），用一行数据表示比一条挂着的消息或一个长期运行的工作流更简单。唯一约束、CHECK 约束和事务直接表达"一个提交只评审一次""结论非空才能投票"等规则。少引入一个有状态组件，Kind 上一键就能拉起整套系统 |
+| GitHub 写操作的幂等 | `github_action` 表记录每个写操作，写之前先在 GitHub 上找已存在的结果（§3.1） | 依赖 GitHub 去重；分布式事务 | GitHub API 不支持幂等键。先记账、再查找、再写，可以让 controller 在任何时刻崩溃后重跑，都不会重复评论或重复投票 |
+| Agent 运行时 | pi SDK（`@earendil-works/pi-coding-agent`，精确锁定版本） | 继续用 v1 自研的循环；LangChain / LangGraph | pi 的 session 可以序列化成 JSONL 再原样载入，这是崩溃恢复的基础（§4.3）；自带只读工具、模型重试和用于测试的 faux 模型。v1 自研循环的维护成本高；LangGraph 的状态是图节点粒度，要让它和 Pod 生命周期、per-turn 上传对齐，改造量不比直接用 pi 小 |
+| 结论的输出方式 | 模型调用带 schema 的 `submit_review` 工具 | 让模型输出 JSON 再解析（v1 的做法） | 参数由 schema 约束，评论锚点由工具当场校验并把错误返回给模型修改，彻底消除"JSON 格式不对"一类的失败（§4.2） |
+| 模型凭据 | LiteLLM proxy 持有真实 key，每个 run 签发带预算上限、会过期的虚拟 key | 把真实 key 注入 runner；自己写一个代理 | 模型拿不到真实 key，被注入时最多花掉本 run 的预算；吊销、预算和花费统计 LiteLLM 都已实现，不必自己造（§5） |
+| 模型 | DeepSeek `deepseek-flash`，thinking `high` | 更大的模型；降低思考强度 | 成本约 $0.03 一次，93% 以上的输入命中前缀缓存；测算的 100 次运行都成功调用了 `submit_review`。降低思考强度会漏掉问题（[成本报告](cost-report.md#优化对比)） |
+| 编程语言 | gateway、controller、fetch 用 Go；runner 用 TypeScript | 全部用 TypeScript | pi SDK 是 TypeScript 的。控制面用 Go 静态编译，镜像约 13 MB，直接调 Kubernetes REST API、不引入 client-go（§6.1） |
+| GitHub 集成 | GitHub App | 个人 token（PAT）；GitHub Actions | App 有自己的 bot 身份，有 Contents: write 时 approve 能计入审批数；按 installation 签发短期 token，fetch 拿到的是只读、只能访问本仓库的 token（§6.4）。Actions 要求每个仓库各自配置 workflow 和 secret，也无法跨 PR 统一调度和统计 |
+| 网络隔离 | NetworkPolicy：runner 只能连 DNS、LiteLLM、controller；fetch 经 controller 的 CONNECT 代理访问 GitHub | 允许 runner 出网 | 即使模型被注入，也无法把代码或凭据发到外部（§4.1、§5） |
+| 部署与观测 | Helm chart；controller 输出 Prometheus 指标，Grafana 看板随 chart 部署 | 手写 YAML；在内存里累计指标 | 一条 `make deploy` 拉起整套系统。指标在抓取时由数据库计算，controller 重启或多副本时数值一致（§7.1） |
+
+### 2.2 负载、状态、扩缩容与故障恢复
+
+**负载特征。** PR 事件是突发的：一次推送触发一个 run，团队集中提交时会同时来好几个。每个 run 的端到端 P50 106 秒、P95 224 秒，其中 95% 以上是模型评审的时间（[成本报告](cost-report.md#瓶颈分析)）。runner 主要在等模型 API，申请的资源很少（250m CPU、512Mi 内存）。所以吞吐的上限不在集群算力，而在模型 API 的并发、限流和预算。
+
+**扩缩容。** 各组件的伸缩方式不同：
+
+| 组件 | 状态 | 怎么扩 | 当前配置 |
+| --- | --- | --- | --- |
+| gateway | 无状态，去重靠数据库主键 | 水平扩副本 | 2 副本 |
+| controller | 内存里不保存状态，指标从数据库计算 | 领取任务（advisory lock 加 `SKIP LOCKED`）和迁移已在多副本间串行化；领取之后的步骤靠"先查再写"保证幂等，没有在多副本并发下验证过；开启预览时必须单副本（§6.2） | 1 副本，故障时由 Deployment 重建。reconcile 是轻量的数据库扫描，不是瓶颈 |
+| runner | 一次性 Job | 并发数由 `maxRunning` 控制：有空位就从队列领取，空闲时 0 个 Pod | `runs.maxRunning` 默认 4 |
+| LiteLLM | 虚拟 key 和花费在它自己的数据库里 | 可以多副本 | 1 副本 |
+| PostgreSQL | 全部业务状态 | 生产环境接外部托管数据库（`database.existingSecret`） | 开发用单副本，不持久化 |
+
+runner 的弹性来自"按需建 Job"：排队的 run 越多，同时存在的 Pod 越多，直到 `maxRunning`；评审结束 Pod 就被回收。没有用 HPA 按 CPU 扩缩，因为 runner 的瓶颈不是 CPU，而是模型 API 的并发和花费；并发上限直接按模型账户的限额设置。按 `maxRunning` 4、P50 106 秒估算，约每小时 135 次评审，远高于"每 100 个 PR 每月约 300 次评审"的预估量。节点资源不够时 Job 的 Pod 会 Pending，托管集群上可以配合节点自动扩容补节点。下一步可以按 `review_queue_depth` 指标（§7.1）动态调整并发，例如接入 KEDA。
+
+**状态管理。** Pod 里没有不能重建的东西，所有状态都在 PostgreSQL：
+
+| 状态 | 存在哪里 | 丢了 Pod 会怎样 |
+| --- | --- | --- |
+| 评审进度 | `review_run.state` 和状态机（§3） | 不受影响 |
+| 哪些 GitHub 写操作已完成 | `github_action`（§3.1） | 不受影响；重跑时跳过已完成的写操作 |
+| agent 的上下文 | `run_session`，每轮一份 JSONL 快照 | 新 Pod 从最近一轮继续 |
+| 已花的钱 | `run_usage`，每轮上报 | 下次签发的虚拟 key 只给剩余预算 |
+| 凭据 | 每次尝试一个 Secret，归 Job 所有 | 随 Job 删除，新尝试签发新的 |
+| 等待人工确认 | 一行 `awaiting_approval` 状态 | 等待期间本来就没有 Pod |
+
+**故障恢复与异常处理。** 下表按故障来源汇总，细节见 §4.3、§6.3、§6.4：
+
+| 故障 | 影响 | 处理 |
+| --- | --- | --- |
+| 工具调用出错（读不存在的文件、git 子命令不允许等） | 一次工具调用失败 | 错误作为工具结果返回给模型，由模型换一种方式继续 |
+| 模型输出异常：评论锚点不在 diff 上 | `submit_review` 拒绝 | 把错误返回给模型修改后重新提交（§4.2） |
+| 模型输出异常：结束时没有提交结论 | 没有结论 | 追加提示，最多 2 次，仍不提交则以确定性失败结束 |
+| 模型 API 超时、限流、5xx | 当前请求失败 | pi 重试 3 次；仍失败则 Pod 以可重试的退出码结束，controller 从快照重试 |
+| runner Pod 被删除、驱逐、OOM，节点故障 | 当前一轮白跑 | controller 把 run 放回队列，新 Pod 从快照继续，最多 3 次尝试（§4.3） |
+| 单次尝试超时 | 评审卡住 | Job 的 `activeDeadlineSeconds` 到期即失败；controller 另有按领取时间计算的兜底超时 |
+| 超出预算 | LiteLLM 拒绝请求 | 以 `budget_exceeded` 失败，不重试；runner 在花到 80% 时会先提醒模型尽快提交（§7.3） |
+| controller 崩溃或重启 | 状态推进暂停 | 状态都在数据库，重启后重新扫描；所有步骤幂等，不会重复评论或投票 |
+| GitHub API 失败 | 写操作没完成 | 限流、网络错误和 5xx 下一轮重试；确定性错误（404、422 等）直接失败 |
+| webhook 投递失败 | 漏掉一次触发 | gateway 在数据库就绪前不接流量；controller 每 5 分钟重投 GitHub 记录为失败的投递（§6.4） |
+| 同一 PR 来了新提交 | 旧评审过时 | 旧 run 标为 `superseded`，删除 Job，Check Run 完成为 cancelled |
+
+**人工介入。** 系统不替人做最终决定，也不在出错时静默：
+
+- 每次失败都写进 Check Run，附失败原因和尝试次数，开发者在 PR 页面就能看到。
+- 失败的 run 不会无限重试。要重新评审，推送一个新提交即可（`/review` 命令尚未接入，§6.4）。
+- 默认的 `vote` 模式只投一票，是否合并由人和 branch protection 决定；`manual` 模式要有写权限的人评论 `/merge` 或提交 approve 才合并（§6.3）。
+- 本地开发经 smee 转发时，自动重投帮不上忙，需要在 GitHub App 设置里手动重投（§10）。
 
 ## 3. Run 状态机
 
@@ -292,10 +392,10 @@ LiteLLM 自己的入站也用 NetworkPolicy 限定为 runner 和 controller。
 
 ### 6.1 并发与调度
 
-- 全局最大并发 `maxRunning`，单仓库最大并发 `maxRunningPerRepo`，超出的 run 留在 `queued`。
-- runner 所在 namespace 配 `ResourceQuota` 和 `LimitRange`，防止一次大 PR 吃光节点。
+- 全局最大并发 `maxRunning`（`runs.maxRunning`，默认 4），超出的 run 留在 `queued`，按创建时间先后领取。按仓库限制并发尚未实现，一个仓库集中推送时会占满全部并发。
+- runner Pod 设置 requests 和 limits（`runner.resources`，默认申请 250m CPU、512Mi 内存，内存上限 1536Mi），防止一次大 PR 吃光节点。runner 所在 namespace 尚未配 `ResourceQuota` 和 `LimitRange`，同时存在的 Pod 数由 `maxRunning` 限制；预览 namespace 有自己的 ResourceQuota（§6.2）。
 - Job 设置 `activeDeadlineSeconds`、`ttlSecondsAfterFinished`；`backoffLimit: 0`，重试由 controller 统一决定（这样才能带上 session 快照恢复，§4.3）。
-- 冷启动优化：runner 镜像预装 pi 依赖和 git（M5 再加 kubectl）；fetch 阶段浅克隆（depth 1 + 按需拉 base）。实测后再决定要不要加 git mirror 缓存。
+- 冷启动优化：runner 镜像预装 pi 依赖、git 和 kubectl；fetch 只拉 head 往前 20 个提交加 base（§4.1）。集群内实测拉代码 4 到 9 秒，暂不需要 git mirror 缓存。
 - 权限：controller 只有自己 namespace 内的 Role，可以管理 `jobs`、读取 `pods`、创建、读取和删除每个 run 的 `secrets`（fetch 的 GitHub token 和代理凭据、runner 的回调 token 和虚拟 key）。开启 M5 预览时，另外启用 §6.2 的 ClusterRole，授予动态 namespace 及明确列出的预览资源权限。
 - Kubernetes 访问：controller 只用到 Job、Secret、Pod 的少数几个调用，`go/internal/kube` 直接调 REST API（in-cluster token 每次请求重读），不引入 client-go，controller 镜像保持在十几 MB。M5 需要部署 Helm chart 时再评估。
 - 每轮 reconcile（5 秒一次，收到结果或放回队列时立即触发）：把有更新提交的未完成 run 标为 `superseded`；领取 `queued`；对 `running` 先检查尝试是否超时，再依次撤销旧票、创建 Check Run、确保 Job 和 token Secret 存在、按 Job 状态决定重试或失败；对 `reviewed` 投票、完成 Check Run，并按仓库策略推进到 `done`、`awaiting_approval` 或 `merging`；等待人工确认时回收 runner Job 和虚拟 key，确认权限及当前 head 后才合并；对已失败但 Check Run 还没收尾的 run 补写失败结论；对 `superseded` 的 run 删除 Job、把 Check Run 完成为 `cancelled`。每一步都是幂等的，崩溃后重跑即可。

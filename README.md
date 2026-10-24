@@ -4,6 +4,21 @@
 
 > 状态：M1、M2、M3、M4、M5、M6 完成。装上 GitHub App 后，PR 打开或更新会在 Kind 里起一个 runner Pod 评审，结果以 Check Run 和 PR Review（投票）出现在 PR 上；后续里程碑见 [roadmap](docs/roadmap.md)。
 
+## 参赛材料
+
+本项目参加赛道 B「云原生 Agent 实战」。各项材料的位置：
+
+| 材料 | 位置 |
+| --- | --- |
+| 场景与价值分析 | [架构 §1 场景与价值](docs/architecture.md#1-场景与价值) |
+| 系统架构设计 | [架构 §2 总体架构](docs/architecture.md#2-总体架构)、[§2.1 关键技术选型](docs/architecture.md#21-关键技术选型)、[§2.2 负载、状态、扩缩容与故障恢复](docs/architecture.md#22-负载状态扩缩容与故障恢复) |
+| Agent 执行流程 | [架构 §4.2 执行流程](docs/architecture.md#42-执行流程)、[§4.4 评审结论](docs/architecture.md#44-评审结论模型决定形状对齐-github-review)、[§3 Run 状态机](docs/architecture.md#3-run-状态机) |
+| 异常处理 | [架构 §2.2](docs/architecture.md#22-负载状态扩缩容与故障恢复)、[§4.3 崩溃恢复](docs/architecture.md#43-崩溃恢复) |
+| Demo 与部署 | 下文"本地运行"、[三分钟演示](docs/demo.md)、[预览验证](docs/preview.md) |
+| 成本与性能分析 | [成本与延迟测算报告](docs/cost-report.md) |
+| 可观测性 | [架构 §7](docs/architecture.md#7-可观测性与成本)、[Grafana 看板截图](docs/cost-report.md#集群内实测) |
+| 开发进度与验收记录 | [roadmap](docs/roadmap.md) |
+
 ## 架构
 
 ```mermaid
