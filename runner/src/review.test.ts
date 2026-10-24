@@ -8,9 +8,9 @@ import { test } from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { ModelRuntime, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import type { PRContext } from "./pr.ts";
-import { RESUME_PROMPT } from "./prompts.ts";
+import { PREVIEW_PHASE, resumePrompt } from "./prompts.ts";
 import type { SessionStats } from "@earendil-works/pi-coding-agent";
-import { BudgetExceededError, ModelError, modelError, acceptedSubmission, ModelRequestError, review, type TurnSnapshot } from "./review.ts";
+import { BudgetExceededError, ModelError, modelError, acceptedSubmission, ModelRequestError, review, type ReviewOptions, type TurnSnapshot } from "./review.ts";
 import { commentableLines } from "./diff.ts";
 
 const stats = {} as SessionStats;
@@ -49,7 +49,7 @@ const pr: PRContext = {
 const submission = {
   verdict: "request_changes" as const,
   body: "Found a bug.",
-  comments: [{ path: "a.go", line: 1, severity: "high" as const, confidence: "high" as const, body: "`new` is wrong" }],
+  comments: [{ path: "a.go", line: 1, severity: "high" as const, body: "`new` is wrong" }],
 };
 
 /** A runtime whose only model answers with the scripted responses. */
@@ -66,7 +66,7 @@ async function fauxModel(dir: string) {
   return { faux, modelRuntime, model: modelRuntime.getModel("faux", "faux-1")! };
 }
 
-async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefined, responses: Parameters<ReturnType<typeof createFauxCore>["setResponses"]>[0], budgetUSD?: number) {
+async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefined, responses: Parameters<ReturnType<typeof createFauxCore>["setResponses"]>[0], budgetUSD?: number, extra: Partial<ReviewOptions> = {}) {
   const dir = await mkdtemp(join(tmpdir(), "review-test-"));
   await writeFile(join(dir, "a.go"), "new\n");
   const { faux, modelRuntime, model } = await fauxModel(dir);
@@ -85,6 +85,7 @@ async function run(resumeFrom: ReturnType<typeof parseSessionEntries> | undefine
     onTurn: async (s) => {
       snapshots.push(s);
     },
+    ...extra,
   });
   return { outcome, snapshots, faux };
 }
@@ -113,7 +114,7 @@ test("a crashed review resumes from its last snapshot", async () => {
   assert.deepEqual(resumed.map((m) => m.role), ["user", "assistant", "toolResult", "user"]);
   assert.match(JSON.stringify(resumed[0]!.content), /<review_request>/);
   assert.match(JSON.stringify(resumed[2]!.content), /new/);
-  assert.equal(JSON.stringify(resumed[3]!.content).includes(RESUME_PROMPT), true);
+  assert.equal(JSON.stringify(resumed[3]!.content).includes(resumePrompt(false)), true);
   assert.deepEqual(second.snapshots.map((s) => s.turn), [2], "turns are numbered across attempts");
 });
 
@@ -167,25 +168,88 @@ test("a failed model request is retryable, not a missing submission", async () =
   });
 });
 
-test("preview follow-up occurs before final submission and includes runtime status", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "preview-review-test-"));
-  const { faux, modelRuntime, model } = await fauxModel(dir);
-  let prepared = false;
-  faux.setResponses([
-    () => {
-      assert.equal(prepared, false);
-      return fauxAssistantMessage("Code exploration complete; waiting for runtime evidence.");
+type FauxContext = { messages: { role: string; content: unknown; toolsAdded?: { name: string }[]; toolsRemoved?: { name: string }[] }[] };
+
+/** The tools offered to the model: pi records them as deltas on system entries. */
+function toolNames(context: FauxContext): string[] {
+  const active = new Set<string>();
+  for (const m of context.messages) {
+    for (const t of m.toolsAdded ?? []) active.add(t.name);
+    for (const t of m.toolsRemoved ?? []) active.delete(t.name);
+  }
+  return [...active].sort();
+}
+const lastUserText = (context: FauxContext) => JSON.stringify(context.messages.filter((m) => m.role === "user").at(-1)!.content);
+
+function previewOptions() {
+  const calls = { prepared: 0 };
+  const opts: Partial<ReviewOptions> = {
+    preparePreview: async () => {
+      calls.prepared++;
+      return { namespace: "pr-demo-1", status: "timeout", kubeconfig: "/unused" };
+    },
+  };
+  return { calls, opts };
+}
+
+test("with a preview, submit_review is neither offered nor asked for until runtime verification", async () => {
+  const { calls, opts } = previewOptions();
+  const { outcome, faux } = await run(undefined, [
+    (context) => {
+      assert.equal(calls.prepared, 0);
+      assert.deepEqual(toolNames(context), ["find", "git", "grep", "ls", "read"]);
+      assert.doesNotMatch(lastUserText(context), /call submit_review/);
+      return fauxAssistantMessage("Code exploration complete; want to check the readiness probe.");
     },
     (context) => {
-      assert.equal(prepared, true);
-      assert.match(JSON.stringify(context.messages), /pr-demo-1/);
-      assert.match(JSON.stringify(context.messages), /timeout/);
+      assert.equal(calls.prepared, 1);
+      assert.deepEqual(toolNames(context), ["find", "git", "grep", "kubectl", "ls", "read", "submit_review"]);
+      assert.match(lastUserText(context), /pr-demo-1[^]*timeout[^]*call submit_review/);
       return fauxAssistantMessage(fauxToolCall("submit_review", submission));
     },
-  ]);
-  const outcome = await review({ pr, cwd: dir, agentDir: dir, model, modelRuntime, thinkingLevel: "off", language: "English",
-    preparePreview: async () => { prepared = true; return { namespace: "pr-demo-1", status: "timeout", kubeconfig: "/unused" }; },
-  });
+  ], undefined, opts);
   assert.equal(outcome.submission.verdict, "request_changes");
   assert.equal(faux.state.callCount, 2);
+});
+
+test("a preview review that crashed while exploring resumes exploring without asking to submit", async () => {
+  const { opts } = previewOptions();
+  const first = await run(undefined, [
+    fauxAssistantMessage(fauxToolCall("read", { path: "a.go" })),
+    fauxAssistantMessage("done exploring"),
+    fauxAssistantMessage(fauxToolCall("submit_review", submission)),
+  ], undefined, opts);
+  const exploring = parseSessionEntries(first.snapshots[0]!.jsonl);
+  const second = await run(exploring, [
+    (context) => {
+      assert.equal(lastUserText(context).includes(resumePrompt(true)), true);
+      assert.doesNotMatch(lastUserText(context), /call submit_review/);
+      assert.equal(toolNames(context).includes("submit_review"), false);
+      return fauxAssistantMessage("done exploring");
+    },
+    fauxAssistantMessage(fauxToolCall("submit_review", submission)),
+  ], undefined, previewOptions().opts);
+  assert.deepEqual(second.outcome.submission, submission);
+});
+
+test("a preview review that crashed during runtime verification goes straight back to it", async () => {
+  const { opts } = previewOptions();
+  const first = await run(undefined, [
+    fauxAssistantMessage("done exploring"),
+    fauxAssistantMessage(fauxToolCall("kubectl", { args: ["get", "pods"] })),
+    fauxAssistantMessage(fauxToolCall("submit_review", submission)),
+  ], undefined, opts);
+  const verifying = parseSessionEntries(first.snapshots[1]!.jsonl);
+  const resumed = previewOptions();
+  const second = await run(verifying, [
+    (context) => {
+      assert.equal(resumed.calls.prepared, 1);
+      assert.match(lastUserText(context), /resumed/);
+      assert.equal(lastUserText(context).includes(PREVIEW_PHASE), true);
+      assert.equal(toolNames(context).includes("submit_review"), true);
+      return fauxAssistantMessage(fauxToolCall("submit_review", submission));
+    },
+  ], undefined, resumed.opts);
+  assert.deepEqual(second.outcome.submission, submission);
+  assert.equal(second.faux.state.callCount, 1);
 });

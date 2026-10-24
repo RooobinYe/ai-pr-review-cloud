@@ -13,7 +13,7 @@ test("checkGitArgs allows read-only subcommands only", () => {
 });
 
 const commentable = new Map([["src/a.ts", new Set([10, 11])]]);
-const comment = (path: string, line: number): ReviewComment => ({ path, line, severity: "high", confidence: "high", body: "x" });
+const comment = (path: string, line: number): ReviewComment => ({ path, line, severity: "high", body: "x" });
 
 test("invalidAnchors reports files and lines outside the diff", () => {
   assert.deepEqual(invalidAnchors([comment("src/a.ts", 10), comment("./src/a.ts", 11), comment("b/src/a.ts", 10)], commentable), []);

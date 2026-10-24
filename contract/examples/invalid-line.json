@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "pr": {
     "repo": "octo/demo.js",
     "number": 12,
@@ -14,15 +14,13 @@
       "path": "src/run.ts",
       "line": 0,
       "severity": "critical",
-      "confidence": "high",
       "body": "`exec(\"sh -c \" + input)` allows command injection; use execFile."
     },
     {
       "path": "src/run.ts",
       "line": 20,
       "severity": "low",
-      "confidence": "low",
-      "body": "[Uncertain] The timeout may be too short."
+      "body": "`setTimeout(abort, 50)` aborts before a typical request finishes; raise it to a few seconds."
     }
   ]
 }

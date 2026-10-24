@@ -15,7 +15,7 @@ export function renderMarkdown(r: ReviewResult): string {
       (a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || a.path.localeCompare(b.path) || a.line - b.line,
     );
     for (const c of sorted) {
-      out.push("", `### \`${c.path}:${c.line}\` · ${c.severity} · confidence ${c.confidence}`, "", c.body.trim());
+      out.push("", `### \`${c.path}:${c.line}\` · ${c.severity}`, "", c.body.trim());
     }
   }
   return `${out.join("\n")}\n`;

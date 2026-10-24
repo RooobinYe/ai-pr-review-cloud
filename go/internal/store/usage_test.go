@@ -42,7 +42,7 @@ func TestUsageAndStats(t *testing.T) {
 	if err := s.RecordFetchTiming(ctx, done, now.Add(-2*time.Second), now.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SubmitResult(ctx, done, review.Result{SchemaVersion: 3, Verdict: review.VerdictApprove, Body: "ok", Comments: []review.Comment{}}); err != nil {
+	if err := s.SubmitResult(ctx, done, review.Result{SchemaVersion: review.SchemaVersion, Verdict: review.VerdictApprove, Body: "ok", Comments: []review.Comment{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Transition(ctx, done, run.StateReviewed, run.StateDone, ""); err != nil {

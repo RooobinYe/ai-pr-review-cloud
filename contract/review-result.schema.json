@@ -12,7 +12,7 @@
   "properties": {
     "schema_version": {
       "type": "number",
-      "const": 3
+      "const": 4
     },
     "pr": {
       "type": "object",
@@ -65,7 +65,6 @@
           "path",
           "line",
           "severity",
-          "confidence",
           "body"
         ],
         "properties": {
@@ -82,13 +81,6 @@
           "severity": {
             "enum": [
               "critical",
-              "high",
-              "medium",
-              "low"
-            ]
-          },
-          "confidence": {
-            "enum": [
               "high",
               "medium",
               "low"

@@ -105,7 +105,6 @@ func TestSchemaMatchesGoTypes(t *testing.T) {
 	}{
 		{"verdict", s.Properties["verdict"].Enum, strs(Verdicts)},
 		{"severity", comment.Properties["severity"].Enum, strs(Severities)},
-		{"confidence", comment.Properties["confidence"].Enum, strs(Confidences)},
 	}
 	for _, e := range enums {
 		if !slices.Equal(e.schema, e.goVals) {

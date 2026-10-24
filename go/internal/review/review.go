@@ -1,5 +1,5 @@
 // Package review defines the review result the runner hands to the controller
-// (schema v3, docs/architecture.md §4.4). runner/src/schema.ts defines the same
+// (schema v4, docs/architecture.md §4.4). runner/src/schema.ts defines the same
 // schema; contract/ holds the generated JSON schema and examples both sides test.
 package review
 
@@ -14,7 +14,7 @@ import (
 )
 
 // SchemaVersion is bumped on breaking changes to Result.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // MaxComments caps inline comments per review.
 const MaxComments = 15
@@ -40,19 +40,9 @@ const (
 	SeverityLow      Severity = "low"
 )
 
-// Confidence the model has in an inline comment.
-type Confidence string
-
-const (
-	ConfidenceHigh   Confidence = "high"
-	ConfidenceMedium Confidence = "medium"
-	ConfidenceLow    Confidence = "low"
-)
-
 var (
 	Verdicts    = []Verdict{VerdictApprove, VerdictRequestChanges}
 	Severities  = []Severity{SeverityCritical, SeverityHigh, SeverityMedium, SeverityLow}
-	Confidences = []Confidence{ConfidenceHigh, ConfidenceMedium, ConfidenceLow}
 	repoPattern = regexp.MustCompile(`^[\w.-]+/[\w.-]+$`)
 	shaPattern  = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
@@ -67,11 +57,10 @@ type PR struct {
 
 // Comment is an inline review comment on the new side of the diff.
 type Comment struct {
-	Path       string     `json:"path"`
-	Line       int        `json:"line"`
-	Severity   Severity   `json:"severity"`
-	Confidence Confidence `json:"confidence"`
-	Body       string     `json:"body"`
+	Path     string   `json:"path"`
+	Line     int      `json:"line"`
+	Severity Severity `json:"severity"`
+	Body     string   `json:"body"`
 }
 
 // Result is the runner's output for one run.
@@ -122,7 +111,6 @@ func (r Result) Validate() error {
 		check(c.Path != "", "comments[%d].path is required", i)
 		check(c.Line >= 1, "comments[%d].line must be positive", i)
 		check(slices.Contains(Severities, c.Severity), "comments[%d]: unknown severity %q", i, c.Severity)
-		check(slices.Contains(Confidences, c.Confidence), "comments[%d]: unknown confidence %q", i, c.Confidence)
 		check(c.Body != "", "comments[%d].body is required", i)
 	}
 	return errors.Join(errs...)
