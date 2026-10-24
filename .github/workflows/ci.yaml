@@ -49,6 +49,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm test
+      - run: node --test ../demo/console.test.mjs
 
   chart:
     runs-on: ubuntu-latest

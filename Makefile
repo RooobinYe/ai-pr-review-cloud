@@ -12,6 +12,7 @@ DEPLOYMENTS  := deployment/ai-pr-review-cloud-gateway deployment/ai-pr-review-cl
 test:
 	cd go && go test -count=1 ./...
 	cd runner && npm test
+	node --test demo/console.test.mjs
 
 lint:
 	cd go && test -z "$$(gofmt -l .)" && go vet ./...
