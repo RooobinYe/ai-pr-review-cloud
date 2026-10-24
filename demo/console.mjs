@@ -92,6 +92,15 @@ function main() {
   const port = Number(values.port);
   const speed = Number(values.speed) || 1;
   const root = dirname(dirname(fileURLToPath(import.meta.url)));
+  let replay = [];
+  if (values.replay) {
+    try {
+      replay = readFileSync(values.replay, "utf8").split("\n");
+    } catch (err) {
+      console.error(`--replay: ${err.message}`);
+      process.exit(2);
+    }
+  }
   const info = { killAfter: values["kill-after"], replay: Boolean(values.replay), speed };
   const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false });
   // busy names the demo.sh command in flight; one runs at a time.
@@ -114,7 +123,9 @@ function main() {
   function demo(args, onLine, onExit) {
     child = spawn(join(root, "demo/demo.sh"), args, { cwd: root, env: { ...process.env, ...env } });
     for (const stream of [child.stdout, child.stderr]) createInterface({ input: stream }).on("line", onLine);
-    child.on("exit", (code) => {
+    child.on("error", (err) => onLine(`spawn demo.sh: ${err.message}`));
+    // close, unlike exit, also fires when the spawn itself failed.
+    child.on("close", (code) => {
       child = null;
       onExit(code ?? 1);
     });
@@ -123,9 +134,16 @@ function main() {
 
   function detect() {
     status({ busy: "detect" });
-    execFile("gh", ["pr", "list", "--state", "open", "--json", "number,headRefName,isDraft,url"], { cwd: root }, (err, stdout) => {
-      if (err) send({ kind: "task", task: "detect", raw: String(err.message).trim() });
-      const found = err ? undefined : findDemoPR(JSON.parse(stdout));
+    // A stalled gh would otherwise keep every button disabled.
+    const args = ["pr", "list", "--state", "open", "--json", "number,headRefName,isDraft,url"];
+    execFile("gh", args, { cwd: root, timeout: 15_000 }, (err, stdout) => {
+      let found;
+      try {
+        if (err) throw err;
+        found = findDemoPR(JSON.parse(stdout));
+      } catch (e) {
+        send({ kind: "task", task: "detect", raw: `gh pr list: ${String(e.message).trim()}` });
+      }
       status(found ? { busy: "", pr: found.number, url: found.url, prepared: true } : { busy: "" });
     });
   }
@@ -151,16 +169,24 @@ function main() {
   }
 
   function start(chaos) {
-    status({ busy: info.replay ? "" : "run", started: true });
+    if (info.replay && state.started) {
+      // Each replay starts from a blank page, so a talk can be rehearsed again.
+      state = fresh();
+      history = [];
+      broadcast({ kind: "reset" });
+    }
+    status({ busy: info.replay ? "replay" : "run", started: true });
     send({ kind: "started", at: Date.now(), chaos: !info.replay && chaos });
     if (info.replay) {
       let t = 0;
-      const lines = readFileSync(values.replay, "utf8").split("\n");
-      for (const raw of lines) {
+      for (const raw of replay) {
         t = parseLine(raw)?.t ?? t;
         setTimeout(() => emit(raw), (t * 1000) / speed);
       }
-      setTimeout(() => send({ kind: "exit", at: Date.now(), code: 0 }), (t * 1000) / speed + 100);
+      setTimeout(() => {
+        send({ kind: "exit", at: Date.now(), code: 0 });
+        status({ busy: "" });
+      }, (t * 1000) / speed + 100);
       return;
     }
     env = { KILL_AFTER: chaos ? info.killAfter : "" };
@@ -191,7 +217,7 @@ function main() {
       prep();
       res.writeHead(204).end();
     } else if (action?.pathname === "/start") {
-      if (state.busy || !state.prepared || state.started) return void res.writeHead(409).end();
+      if (state.busy || !state.prepared || (state.started && !info.replay)) return void res.writeHead(409).end();
       start(action.searchParams.get("chaos") === "1");
       res.writeHead(204).end();
     } else if (action?.pathname === "/cleanup" && !info.replay) {
@@ -321,13 +347,14 @@ function controls() {
   const s = S.status; if (!s) return;
   if (s.pr) { $("prlink").textContent = "#" + s.pr; if (s.url) $("prlink").href = s.url; }
   $("prep").disabled = Boolean(s.busy || s.pr);
-  $("start").disabled = Boolean(s.busy || !s.prepared || s.started);
+  $("start").disabled = Boolean(s.busy || !s.prepared || (s.started && !S.replay));
+  $("start").textContent = s.started && S.replay ? "再放一次" : "开始";
   $("cleanup").disabled = Boolean(s.busy || !s.pr);
   $("chaos").disabled = s.started;
   let hint;
   if (s.busy === "detect") hint = "查找已有的 draft 演示 PR…";
   else if (s.busy === "prep" || s.busy === "cleanup") hint = (s.busy === "prep" ? "准备：" : "收尾：") + (S.taskText || "启动中…");
-  else if (s.busy === "run") hint = "演示进行中";
+  else if (s.busy === "run" || s.busy === "replay") hint = s.busy === "run" ? "演示进行中" : "回放中";
   else if (s.started) hint = S.replay ? "回放结束" : "演示结束。讲完后点「收尾」关闭 PR 并删除预览环境";
   else if (s.prepared) hint = (s.pr ? "PR #" + s.pr + " 已就绪，" : "") + "点「开始」启动演示";
   else if (s.pr) hint = "PR #" + s.pr + " 的准备没有完成（" + (S.taskText || "见原始输出") + "），点「收尾」关掉后重新准备";
