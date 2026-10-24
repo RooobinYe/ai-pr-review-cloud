@@ -61,7 +61,7 @@ flowchart LR
 
 ### 2.2 负载、状态、扩缩容与故障恢复
 
-**负载与扩缩容。** PR 事件是突发的，单次评审端到端 P50 106 秒、P95 224 秒，95% 以上在等模型 API，runner 只申请 250m CPU、512Mi 内存，所以瓶颈是模型 API 的并发、限流和预算，不是算力。runner 按需建 Job，并发上限 `runs.maxRunning`（默认 4，约每小时 135 次评审）直接按模型账户限额设置，不用 HPA；节点不够时 Pod Pending，可配合节点自动扩容，下一步可按 `review_queue_depth` 接 KEDA。gateway 无状态，2 副本；controller 不在内存保存状态，领取任务和迁移已在多副本间串行化，但开启预览时必须单副本；生产环境 PostgreSQL 接外部托管库。
+**负载与扩缩容。** PR 事件是突发的，单次评审端到端 P50 106 秒、P95 224 秒，95% 以上在等模型 API，runner 只申请 250m CPU、512Mi 内存，所以瓶颈是模型 API 的并发、限流和预算，不是算力。runner 按需建 Job，并发上限 `runs.maxRunning`（默认 4，约每小时 135 次评审）直接按模型账户限额设置，不用 HPA；节点不够时 Pod Pending，可配合节点自动扩容，下一步可按 `review_queue_depth` 接 KEDA。gateway 无状态，2 副本；controller 不在内存保存状态，领取任务和迁移已在多副本间串行化，之后的步骤靠先查再写保证幂等，但未在多副本并发下实测，开启预览时必须单副本；生产环境 PostgreSQL 接外部托管库。
 
 **状态与故障。** Pod 里没有不能重建的东西：评审进度在 `review_run.state`，完成过的 GitHub 写操作在 `github_action`，agent 上下文是 `run_session` 里每轮一份的快照，已花的钱在 `run_usage`（重试签发的 key 只给剩余预算），凭据是每次尝试一个、归 Job 所有的 Secret。失败都写进 Check Run，附原因和尝试次数，不会无限重试，推送新提交即重新评审。
 
