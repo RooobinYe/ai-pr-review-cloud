@@ -17,20 +17,44 @@ kubectl -n ai-pr-review-cloud port-forward svc/ai-pr-review-cloud-grafana 3000:3
 ```
 
 ```bash
-demo/demo.sh prep
+node demo/console.mjs
 ```
 
-`prep` 从 `main` 建分支、提交改动、开 **draft** PR，然后等 CI 把 `:<head_sha>` 预览镜像推到 GHCR（约 1 分钟）。draft 不触发评审，所以开演时镜像已经就绪，不用在镜头前等 CI。
+打开 `http://localhost:8787`。演示页启动时会找已开的 draft 演示 PR（分支 `demo/version-endpoint-*`），找到就直接可以开始；没找到就点"准备"，等提示条显示"已就绪"。
 
-浏览器准备三个标签页：PR 的 Files changed、PR 的 Conversation（看 Check Run 和评审）、Grafana 首页。终端字号调大。
+"准备"运行 `demo.sh prep`：从 `main` 建分支、提交改动、开 **draft** PR，然后等 CI 把 `:<head_sha>` 预览镜像推到 GHCR（约 1 分钟）。draft 不触发评审，所以开演时镜像已经就绪，不用在镜头前等 CI。不用演示页时，在终端直接跑 `demo/demo.sh prep`，它最后打印的 `demo/demo.sh run <pr>` 就是要用的 PR 号；`node demo/console.mjs <pr>` 也可以直接指定 PR。
+
+浏览器准备四个标签页：演示页 `http://localhost:8787`、PR 的 Files changed、PR 的 Conversation（看 Check Run 和评审）、Grafana 首页。
+
+## 演示页
+
+[`demo/console.mjs`](../demo/console.mjs) 是一个无依赖的 Node 程序，只在本机 `127.0.0.1` 上监听。右上角三个按钮依次对应 `demo.sh` 的三个子命令：准备（`prep`）、开始（`run`）、收尾（`cleanup`），同一时间只运行一个，按钮下的提示条说明当前该点哪个。演示过程中的每行输出被解析成事件推给页面；数据全部来自脚本已有的输出，演示页只多调用一次 `gh pr list` 找已有的 PR，不另外访问数据库或集群。页面从上到下是：
+
+- 流程条：Webhook → 排队 → 评审代码 → 部署预览 → kubectl 取证 → 投票，当前步骤高亮，每步标出进入时间，右上角是大号计时器。
+- agent 活动：每次工具调用一行，按类型着色（read、grep、git、kubectl、submit），失败的调用标红。
+- 故障注入：删除 Pod、新尝试启动、读取快照、从第 N 轮续跑。默认勾选"第 25 秒删除 runner Pod"，取消勾选即不演示崩溃（`--kill-after` 改秒数）。
+- 预览环境：namespace、Pod、就绪状态、重启次数和 runner 拿到的预览结论。
+- 评审结果：结论、逐行评论、各阶段耗时条、花费，以及跳到 GitHub 评审的按钮。
+
+页面最下方的"原始输出"就是终端版的全部内容。演示页出问题时，直接回到终端跑 `demo.sh run`。
+
+`demo.sh run` 的输出可以存下来离线回放，用来练讲解，不需要集群，也不花模型费用：
+
+```bash
+KILL_AFTER=25 demo/demo.sh run <pr> | tee run.log
+```
+
+```bash
+node demo/console.mjs --replay run.log --speed 2
+```
 
 ## 时间线（3:00）
 
-开场一句话后立刻启动脚本，在 agent 读代码的同时讲 PR 的改动。时间点取自三次彩排，模型每次的探索路径不同，各段会前后浮动 10 到 20 秒。
+开场一句话后立刻启动脚本，在 agent 读代码的同时讲 PR 的改动。下表的"终端"在演示页里对应流程条、agent 活动和故障注入卡片。时间点取自三次彩排，模型每次的探索路径不同，各段会前后浮动 10 到 20 秒。
 
 | 时间 | 画面 | 讲什么 |
 | --- | --- | --- |
-| 0:00 | 终端执行 `KILL_AFTER=25 demo/demo.sh run <pr>` | 脚本只把 PR 标为待评审，之后的一切由 GitHub 事件驱动 |
+| 0:00 | 演示页点"开始"（或终端执行 `KILL_AFTER=25 demo/demo.sh run <pr>`） | 脚本只把 PR 标为待评审，之后的一切由 GitHub 事件驱动 |
 | 0:00–0:15 | 终端：`queued` → `running`，出现 runner Job | gateway 验签写库，controller 用 `SKIP LOCKED` 领取 run，为这个 PR 建一个独立 Job；runner 只有带预算的虚拟 key，没有 GitHub 凭据，出网只能到 LiteLLM 和 controller |
 | 0:15–0:30 | 浏览器：PR 的 Files changed；终端滚动 `agent read/grep/git ...` | 一个看起来无害的小重构。agent 自己决定读什么：被改的文件、chart 的模板与 values、相关文档，做跨文件核对 |
 | 约 0:35 | 终端：`chaos: deleted the runner Pod`，随后 `attempt 2`、`resuming from a snapshot` | 模拟节点故障。runner 每轮上传 session 快照，新 Pod 从第 N 轮接着跑，不从头再来，PR 上也不会出现第二份评论 |
@@ -39,7 +63,7 @@ demo/demo.sh prep
 | 2:15–2:45 | 浏览器：PR 的 Conversation | bot 的 COMMENT review：运行时证据、逐行评论、一行修复建议；Check Run 为 neutral。发现问题只评论、不阻塞合并；结论为 approve 时它投的是能计入审批数的 APPROVE |
 | 2:45–3:00 | Grafana | 看板上的吞吐、各阶段耗时、每次评审成本的 P50 / P95 |
 
-演示结束后关掉 PR（不计时）。controller 每分钟检查一次 PR 状态，约 1.5 分钟内删除预览 namespace：
+演示结束后关掉 PR（不计时）：在演示页点"收尾"，或在终端执行下面的命令。controller 每分钟检查一次 PR 状态，约 1.5 分钟内删除预览 namespace。演示页收尾完成后回到初始状态，可以直接"准备"下一次彩排。
 
 ```bash
 demo/demo.sh cleanup <pr>

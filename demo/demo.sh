@@ -15,6 +15,7 @@ base="${BASE:-main}"
 repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 started="$(date +%s)"
 
+# demo/console.mjs parses these lines (parseLine); keep them in step.
 say() {
   local t=$(($(date +%s) - started))
   printf '[%02d:%02d] %s\n' $((t / 60)) $((t % 60)) "$*"
