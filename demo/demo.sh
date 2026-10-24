@@ -32,19 +32,18 @@ preview_namespace() {
 }
 
 # The demo PR's version of demo/preview/server.mjs: a routing refactor with a
-# bug planted in it. It is encoded because the reviewing agent reads the whole
-# repository, this script included, and must not find the answer here.
+# bug planted in it. It is compressed and encoded because the reviewing agent
+# reads the whole repository, this script included, and must not find the
+# answer here; models can read plain base64.
 write_buggy_server() {
-  base64 -d >"$1/demo/preview/server.mjs" <<'EOF'
-aW1wb3J0IHsgY3JlYXRlU2VydmVyIH0gZnJvbSAnbm9kZTpodHRwJzsKCi8vIFBhdGhzIGFuc3dl
-cmVkIHdpdGggMjAwOyBldmVyeXRoaW5nIGVsc2UgaXMgNDA0Lgpjb25zdCByb3V0ZXMgPSBuZXcg
-TWFwKFsKICBbJy8nLCAncHJldmlldyBpcyBoZWFsdGh5XG4nXSwKICBbJy9oZWFsdGgnLCAncHJl
-dmlldyBpcyBoZWFsdGh5XG4nXSwKICBbJy92ZXJzaW9uJywgYCR7cHJvY2Vzcy5lbnYuQVBQX1ZF
-UlNJT04gPz8gJ2Rldid9XG5gXSwKXSk7CgpjcmVhdGVTZXJ2ZXIoKHJlcSwgcmVzKSA9PiB7CiAg
-Y29uc29sZS5sb2coYCR7cmVxLm1ldGhvZH0gJHtyZXEudXJsfWApOwogIGNvbnN0IGJvZHkgPSBy
-b3V0ZXMuZ2V0KHJlcS51cmwpOwogIHJlcy53cml0ZUhlYWQoYm9keSA/IDIwMCA6IDQwNCwgeyAn
-Q29udGVudC1UeXBlJzogJ3RleHQvcGxhaW4nIH0pOwogIHJlcy5lbmQoYm9keSA/PyAnbm90IGZv
-dW5kXG4nKTsKfSkubGlzdGVuKDgwODAsICcwLjAuMC4wJyk7Cg==
+  base64 -d <<'EOF' | gunzip >"$1/demo/preview/server.mjs"
+H4sIAAAAAAACA4WRQU/CQBCF7/yKdzDZkuDSGA4EgsQYEz2oRIwXMFLpQDcpu3V3oDak/90pVePN
+7Glnvvd2543ZFc4zjlh7Spjm5A/kUWPj3Q7KupRGGXOhxp1Ov49ZwllAYkNJnlKUhjNcxPEYJKqK
+M2O3oDwQTMAgHujO2tnA8G7PFDCBpRL3SREtOsBC9VUPqvB0MFIWRUZJzlm1tOq11wJt5V9MHg/G
+WeFWZ8fCuzWFoMke9NVs9vZy8zS/e3zAdAqV0kHVS7sS4WtXRvo7dBR5+ujBU+hicomjWDe/dznp
+3G0jcZa+3hFnLq3R3vY+r1di1KKMd5dWMmY7r94SR9/UiRFrXXrDdEtJGp3YaRMfRk1YPVmCunaW
+yfL5c1WQGkExfXK/yBNjFepfE7I/8mmzI8bG7W0qgQhRd3VugphEw3gYS3KxPp2m9wUJkKis7QEA
+AA==
 EOF
 }
 
@@ -147,8 +146,10 @@ run() {
 summary() {
   local id="$1" pr="$2" review
   echo
+  # A finished run keeps the reason its last failed attempt was retried.
   sql "select 'verdict ' || coalesce(verdict, '-') || ', attempts ' || attempt
-         || coalesce(', error: ' || error, '') from review_run where id = '${id}'"
+         || coalesce(case when state = 'failed' then ', error: ' else ', retried after: ' end || error, '')
+         from review_run where id = '${id}'"
   sql "select format('phases  queue %ss · startup %ss · fetch %ss · review %ss · publish %ss · total %ss',
            round(extract(epoch from started_at - created_at)), round(extract(epoch from fetch_started_at - started_at)),
            round(extract(epoch from fetch_finished_at - fetch_started_at)), round(extract(epoch from reviewed_at - fetch_finished_at)),
