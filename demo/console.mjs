@@ -70,9 +70,13 @@ function parseSummary(line) {
   return line.trim() ? { type: "log", text: line } : null;
 }
 
-/** Picks the newest open draft demo PR from `gh pr list --json number,headRefName,isDraft,url`. */
+/**
+ * Picks the newest open demo PR from `gh pr list --json number,headRefName,isDraft,url`.
+ * A draft is ready to demo; one that is no longer a draft has been demoed and
+ * only needs cleaning up.
+ */
 export function findDemoPR(prs) {
-  return prs.filter((p) => p.isDraft && p.headRefName.startsWith(DEMO_BRANCH)).sort((a, b) => b.number - a.number)[0];
+  return prs.filter((p) => p.headRefName.startsWith(DEMO_BRANCH)).sort((a, b) => b.number - a.number)[0];
 }
 
 function main() {
@@ -102,7 +106,7 @@ function main() {
     }
   }
   const info = { killAfter: values["kill-after"], replay: Boolean(values.replay), speed };
-  const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false, detectFailed: false });
+  const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false, demoed: false, detectFailed: false });
   // busy names the demo.sh command in flight; one runs at a time.
   let state = fresh();
   let history = [];
@@ -147,7 +151,8 @@ function main() {
         failed = true;
       }
       // A failed lookup is not "no demo PR": prepping then could open a second one.
-      status(found ? { busy: "", pr: found.number, url: found.url, prepared: true, detectFailed: false } : { busy: "", detectFailed: failed });
+      const pr = found && { pr: found.number, url: found.url, prepared: found.isDraft, demoed: !found.isDraft };
+      status(found ? { busy: "", ...pr, detectFailed: false } : { busy: "", detectFailed: failed });
     });
   }
 
@@ -362,6 +367,7 @@ function controls() {
   else if (s.busy === "run" || s.busy === "replay") hint = s.busy === "run" ? "演示进行中" : "回放中";
   else if (s.started) hint = S.replay ? "回放结束" : "演示结束。讲完后点「收尾」关闭 PR 并删除预览环境";
   else if (s.prepared) hint = (s.pr ? "PR #" + s.pr + " 已就绪，" : "") + "点「开始」启动演示";
+  else if (s.demoed) hint = "PR #" + s.pr + " 已经演示过（不再是 draft），点「收尾」关闭后再「准备」新的";
   else if (s.detectFailed) hint = "查找已有的演示 PR 失败（" + S.taskText + "），检查 gh 和网络后点「重新查找」";
   else if (s.pr) hint = "PR #" + s.pr + " 的准备没有完成（" + (S.taskText || "见原始输出") + "），点「收尾」关掉后重新准备";
   else hint = "没有找到 draft 演示 PR，点「准备」新开一个（约 1 分钟）" + (S.taskText ? "。上次输出：" + S.taskText : "");
