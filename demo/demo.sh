@@ -31,26 +31,20 @@ preview_namespace() {
   printf '%s' "${name}"
 }
 
-# The planted bug: a routing refactor renames /healthz, which both probes of the
-# preview chart still request. The diff alone looks harmless; the running Pod
-# never becomes Ready.
+# The demo PR's version of demo/preview/server.mjs: a routing refactor with a
+# bug planted in it. It is encoded because the reviewing agent reads the whole
+# repository, this script included, and must not find the answer here.
 write_buggy_server() {
-  cat >"$1/demo/preview/server.mjs" <<'EOF'
-import { createServer } from 'node:http';
-
-// Paths answered with 200; everything else is 404.
-const routes = new Map([
-  ['/', 'preview is healthy\n'],
-  ['/health', 'preview is healthy\n'],
-  ['/version', `${process.env.APP_VERSION ?? 'dev'}\n`],
-]);
-
-createServer((req, res) => {
-  console.log(`${req.method} ${req.url}`);
-  const body = routes.get(req.url);
-  res.writeHead(body ? 200 : 404, { 'Content-Type': 'text/plain' });
-  res.end(body ?? 'not found\n');
-}).listen(8080, '0.0.0.0');
+  base64 -d >"$1/demo/preview/server.mjs" <<'EOF'
+aW1wb3J0IHsgY3JlYXRlU2VydmVyIH0gZnJvbSAnbm9kZTpodHRwJzsKCi8vIFBhdGhzIGFuc3dl
+cmVkIHdpdGggMjAwOyBldmVyeXRoaW5nIGVsc2UgaXMgNDA0Lgpjb25zdCByb3V0ZXMgPSBuZXcg
+TWFwKFsKICBbJy8nLCAncHJldmlldyBpcyBoZWFsdGh5XG4nXSwKICBbJy9oZWFsdGgnLCAncHJl
+dmlldyBpcyBoZWFsdGh5XG4nXSwKICBbJy92ZXJzaW9uJywgYCR7cHJvY2Vzcy5lbnYuQVBQX1ZF
+UlNJT04gPz8gJ2Rldid9XG5gXSwKXSk7CgpjcmVhdGVTZXJ2ZXIoKHJlcSwgcmVzKSA9PiB7CiAg
+Y29uc29sZS5sb2coYCR7cmVxLm1ldGhvZH0gJHtyZXEudXJsfWApOwogIGNvbnN0IGJvZHkgPSBy
+b3V0ZXMuZ2V0KHJlcS51cmwpOwogIHJlcy53cml0ZUhlYWQoYm9keSA/IDIwMCA6IDQwNCwgeyAn
+Q29udGVudC1UeXBlJzogJ3RleHQvcGxhaW4nIH0pOwogIHJlcy5lbmQoYm9keSA/PyAnbm90IGZv
+dW5kXG4nKTsKfSkubGlzdGVuKDgwODAsICcwLjAuMC4wJyk7Cg==
 EOF
 }
 
@@ -62,7 +56,7 @@ prep() {
   git worktree add -q -b "${branch}" "${dir}" "origin/${base}"
   write_buggy_server "${dir}"
   git -C "${dir}" commit -qam "feat: add /version endpoint to the preview app"
-  git -C "${dir}" push -q -u origin "${branch}"
+  git -C "${dir}" push -q -u origin "${branch}" 2>/dev/null
   git worktree remove --force "${dir}"
   git branch -q -D "${branch}"
 
@@ -107,7 +101,7 @@ run() {
   ns="$(preview_namespace "${pr}")"
   trap 'stop_follower' EXIT
 
-  gh pr ready "${pr}" >/dev/null
+  gh pr ready "${pr}" >/dev/null 2>&1
   say "PR #${pr} marked ready for review: $(gh pr view "${pr}" --json url -q .url)"
 
   while :; do
