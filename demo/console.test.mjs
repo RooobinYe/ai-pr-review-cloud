@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseLine } from "./console.mjs";
+import { findDemoPR, parseLine } from "./console.mjs";
 
 test("parseLine", () => {
   const cases = [
@@ -54,4 +54,16 @@ test("parseLine", () => {
     ["review  https://github.com/o/r/pull/17#pullrequestreview-1", { type: "review", url: "https://github.com/o/r/pull/17#pullrequestreview-1" }],
   ];
   for (const [line, want] of cases) assert.deepEqual(parseLine(line), want, line);
+});
+
+test("findDemoPR", () => {
+  const pr = (number, headRefName, isDraft) => ({ number, headRefName, isDraft, url: `https://github.com/o/r/pull/${number}` });
+  const cases = [
+    [[], undefined],
+    [[pr(21, "feat/demo-console", false)], undefined],
+    [[pr(20, "demo/version-endpoint-1024153202", false)], undefined],
+    [[pr(21, "feat/demo-console", true), pr(22, "demo/version-endpoint-1025090000", true)], pr(22, "demo/version-endpoint-1025090000", true)],
+    [[pr(22, "demo/version-endpoint-1", true), pr(24, "demo/version-endpoint-2", true)], pr(24, "demo/version-endpoint-2", true)],
+  ];
+  for (const [prs, want] of cases) assert.deepEqual(findDemoPR(prs), want);
 });

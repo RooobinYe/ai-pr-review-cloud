@@ -1,13 +1,15 @@
-// Browser view of the live demo (docs/demo.md). Runs `demo/demo.sh run <pr>`
-// when the page's start button is pressed, parses each output line into an
-// event, and streams the events to the page. No dependencies.
+// Browser view of the live demo (docs/demo.md). Drives `demo/demo.sh` from the
+// page: prep opens the draft demo PR, start runs the review, cleanup closes the
+// PR. Each output line of the run is parsed into an event and streamed to the
+// page. No dependencies.
 //
-//   node demo/console.mjs <pr> [--port 8787] [--kill-after 25]
+//   node demo/console.mjs [pr] [--port 8787] [--kill-after 25]
 //   node demo/console.mjs --replay <saved run output> [--speed 4]
 //
-// --replay plays back a saved `demo.sh run` output on its own timestamps, for
-// rehearsing the talk without the cluster or model spend.
-import { spawn } from "node:child_process";
+// Without a PR number the console picks up an open draft demo PR, or offers to
+// prep one. --replay plays back a saved `demo.sh run` output on its own
+// timestamps, for rehearsing the talk without the cluster or model spend.
+import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
@@ -15,6 +17,8 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
+// demo.sh prep names its branches with this prefix.
+const DEMO_BRANCH = "demo/version-endpoint-";
 const TOOLS = new Set(["read", "grep", "find", "ls", "git", "kubectl", "submit_review"]);
 
 /** Parses one line of `demo.sh run` output; null for blank lines. */
@@ -66,6 +70,11 @@ function parseSummary(line) {
   return line.trim() ? { type: "log", text: line } : null;
 }
 
+/** Picks the newest open draft demo PR from `gh pr list --json number,headRefName,isDraft,url`. */
+export function findDemoPR(prs) {
+  return prs.filter((p) => p.isDraft && p.headRefName.startsWith(DEMO_BRANCH)).sort((a, b) => b.number - a.number)[0];
+}
+
 function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
@@ -76,28 +85,73 @@ function main() {
       speed: { type: "string", default: "1" },
     },
   });
-  const pr = positionals[0];
-  if (!values.replay && !/^\d+$/.test(pr ?? "")) {
-    console.error("usage: node demo/console.mjs <pr> [--port 8787] [--kill-after 25]\n       node demo/console.mjs --replay <file> [--speed 4]");
+  if (positionals[0] && !/^\d+$/.test(positionals[0])) {
+    console.error("usage: node demo/console.mjs [pr] [--port 8787] [--kill-after 25]\n       node demo/console.mjs --replay <file> [--speed 4]");
     process.exit(2);
   }
   const port = Number(values.port);
   const speed = Number(values.speed) || 1;
   const root = dirname(dirname(fileURLToPath(import.meta.url)));
-  const info = { pr: pr ?? null, killAfter: values["kill-after"], replay: Boolean(values.replay), speed };
-  const history = [];
+  const info = { killAfter: values["kill-after"], replay: Boolean(values.replay), speed };
+  const fresh = () => ({ pr: Number(positionals[0]) || null, url: "", busy: "", prepared: Boolean(positionals[0] || values.replay), started: false });
+  // busy names the demo.sh command in flight; one runs at a time.
+  let state = fresh();
+  let history = [];
   const clients = new Set();
   let child = null;
-  let started = false;
+  let env = {};
 
-  const send = (msg) => {
-    history.push(msg);
+  const broadcast = (msg) => {
     for (const res of clients) res.write(`data: ${JSON.stringify(msg)}\n\n`);
   };
+  const send = (msg) => {
+    history.push(msg);
+    broadcast(msg);
+  };
+  const status = (patch) => send({ kind: "status", ...Object.assign(state, patch) });
   const emit = (raw) => send({ kind: "line", raw, ev: parseLine(raw) });
 
+  function demo(args, onLine, onExit) {
+    child = spawn(join(root, "demo/demo.sh"), args, { cwd: root, env: { ...process.env, ...env } });
+    for (const stream of [child.stdout, child.stderr]) createInterface({ input: stream }).on("line", onLine);
+    child.on("exit", (code) => {
+      child = null;
+      onExit(code ?? 1);
+    });
+  }
+  const taskLine = (task) => (raw) => send({ kind: "task", task, raw });
+
+  function detect() {
+    status({ busy: "detect" });
+    execFile("gh", ["pr", "list", "--state", "open", "--json", "number,headRefName,isDraft,url"], { cwd: root }, (err, stdout) => {
+      if (err) send({ kind: "task", task: "detect", raw: String(err.message).trim() });
+      const found = err ? undefined : findDemoPR(JSON.parse(stdout));
+      status(found ? { busy: "", pr: found.number, url: found.url, prepared: true } : { busy: "" });
+    });
+  }
+
+  function prep() {
+    status({ busy: "prep" });
+    demo(["prep"], (raw) => {
+      taskLine("prep")(raw);
+      const x = /draft PR #(\d+) opened: (\S+)/.exec(raw);
+      if (x) status({ pr: Number(x[1]), url: x[2] });
+    }, (code) => status({ busy: "", prepared: code === 0 }));
+  }
+
+  function cleanup() {
+    status({ busy: "cleanup" });
+    demo(["cleanup", String(state.pr)], taskLine("cleanup"), (code) => {
+      if (code !== 0) return status({ busy: "" });
+      // Back to a blank page, ready to prep the next rehearsal.
+      state = { ...fresh(), pr: null, prepared: false };
+      history = [{ kind: "status", ...state }];
+      broadcast({ kind: "reset" });
+    });
+  }
+
   function start(chaos) {
-    started = true;
+    status({ busy: info.replay ? "" : "run", started: true });
     send({ kind: "started", at: Date.now(), chaos: !info.replay && chaos });
     if (info.replay) {
       let t = 0;
@@ -109,14 +163,10 @@ function main() {
       setTimeout(() => send({ kind: "exit", at: Date.now(), code: 0 }), (t * 1000) / speed + 100);
       return;
     }
-    child = spawn(join(root, "demo/demo.sh"), ["run", pr], {
-      cwd: root,
-      env: { ...process.env, KILL_AFTER: chaos ? info.killAfter : "" },
-    });
-    for (const stream of [child.stdout, child.stderr]) createInterface({ input: stream }).on("line", emit);
-    child.on("exit", (code) => {
-      child = null;
+    env = { KILL_AFTER: chaos ? info.killAfter : "" };
+    demo(["run", String(state.pr)], emit, (code) => {
       send({ kind: "exit", at: Date.now(), code });
+      status({ busy: "" });
     });
   }
 
@@ -125,6 +175,7 @@ function main() {
   const allowed = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
   const server = createServer((req, res) => {
     const origin = req.headers.origin;
+    const action = req.method === "POST" ? new URL(req.url ?? "/", "http://localhost") : null;
     if (!allowed.has(req.headers.host ?? "") || (origin && !allowed.has(origin.replace(/^http:\/\//, "")))) {
       res.writeHead(403).end();
     } else if (req.method === "GET" && req.url === "/") {
@@ -135,15 +186,25 @@ function main() {
       for (const msg of history) res.write(`data: ${JSON.stringify(msg)}\n\n`);
       clients.add(res);
       req.on("close", () => clients.delete(res));
-    } else if (req.method === "POST" && req.url?.startsWith("/start")) {
-      if (started) return void res.writeHead(409).end();
-      start(new URL(req.url, "http://localhost").searchParams.get("chaos") === "1");
+    } else if (action?.pathname === "/prep" && !info.replay) {
+      if (state.busy || state.pr) return void res.writeHead(409).end();
+      prep();
+      res.writeHead(204).end();
+    } else if (action?.pathname === "/start") {
+      if (state.busy || !state.prepared || state.started) return void res.writeHead(409).end();
+      start(action.searchParams.get("chaos") === "1");
+      res.writeHead(204).end();
+    } else if (action?.pathname === "/cleanup" && !info.replay) {
+      if (state.busy || !state.pr) return void res.writeHead(409).end();
+      cleanup();
       res.writeHead(204).end();
     } else {
       res.writeHead(404).end();
     }
   });
   server.listen(port, "127.0.0.1", () => console.log(`demo console: http://localhost:${port}`));
+  if (state.pr || info.replay) status({});
+  else detect();
 
   process.on("SIGINT", () => {
     if (!child) process.exit(130);
@@ -186,14 +247,16 @@ button:disabled{opacity:.4;cursor:default}label{color:var(--muted);user-select:n
 .comment{border-left:3px solid var(--warn);padding:4px 10px;margin:8px 0;font-size:14px}.comment code{color:var(--muted)}
 #phases{display:flex;height:22px;border-radius:5px;overflow:hidden;margin:10px 0 4px}#phases div{min-width:2px}
 #plegend{font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 12px}
+#bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:8px;background:var(--soft)}#bar.busy::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid var(--accent);border-right-color:transparent;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(1turn)}}button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
 #warn{display:none;background:var(--warn);color:#fff;padding:10px 16px;border-radius:8px}
 details{color:var(--muted)}pre{white-space:pre-wrap;font-size:12px}
 @media (max-width:900px){.grid{grid-template-columns:1fr}#flow{grid-template-columns:repeat(3,1fr)}#timer{font-size:40px}#stream{height:50vh}}
 </style></head><body><main>
 <header><h1>AI PR 评审 · 现场演示 <a id="prlink" target="_blank"></a><span id="model"></span></h1>
 <label id="chaosbox"><input type="checkbox" id="chaos" checked> 第 <span id="killafter"></span> 秒删除 runner Pod</label>
-<button id="start" disabled>开始</button><div id="timer">0:00</div></header>
-<div id="warn"></div>
+<button id="prep" class="ghost" disabled>准备</button><button id="start" disabled>开始</button><button id="cleanup" class="ghost" disabled>收尾</button><div id="timer">0:00</div></header>
+<div id="bar">连接中…</div><div id="warn"></div>
 <div id="flow"></div>
 <div class="grid"><section class="panel"><h2>agent 活动</h2><div id="stream"></div></section>
 <div class="side">
@@ -210,7 +273,7 @@ const fmt = (s) => Math.floor(s / 60) + ":" + String(Math.floor(s % 60)).padStar
 const STAGES = [["webhook", "Webhook"], ["queue", "排队"], ["review", "评审代码"], ["preview", "部署预览"], ["evidence", "kubectl 取证"], ["vote", "投票"]];
 const PHASES = { queue: ["排队", "#8a94a6"], startup: ["建 Pod", "#4b6cb7"], fetch: ["拉代码", "#7b4bb7"], review: ["评审", "#1f8a8a"], publish: ["投票", "#13804b"] };
 const VERDICTS = { approve: "批准", request_changes: "需要修改", comment: "仅评论" };
-const S = { stage: -1, times: [], startedAt: 0, speed: 1, frozen: null, previewSeen: false, chaos: false, attempt: 1, pod: {} };
+const S = { status: null, taskText: "", replay: false, stage: -1, times: [], startedAt: 0, speed: 1, frozen: null, previewSeen: false, chaos: false, attempt: 1, pod: {} };
 for (const [, label] of STAGES) { const d = el("div", "step"); d.append(el("b", "", label), el("span", "", "–")); $("flow").append(d); }
 
 function advance(name, t) {
@@ -242,6 +305,35 @@ function renderPreview() {
   if (p.pod) pairs.push(["Pod", p.pod], ["就绪", p.ready ? "Ready" : "未就绪", "badge " + (p.ready ? "yes" : "no")], ["重启次数", String(p.restarts), "badge " + (p.restarts ? "no" : "yes")]);
   pairs.push(["状态", p.status || "尚未部署"]);
   kv($("preview"), pairs);
+}
+
+// Turns a demo.sh prep or cleanup line into the hint shown in the bar.
+function taskText(raw) {
+  const text = raw.replace(/^\[\d+:\d{2}\] /, "");
+  let x;
+  if ((x = /^draft PR #(\d+) opened/.exec(text))) return "已开 draft PR #" + x[1] + "（draft 不触发评审）";
+  if (text.startsWith("waiting for the preview image")) return "等待 CI 推送预览镜像，约 1 分钟…";
+  if (text.startsWith("preview image published")) return "预览镜像就绪";
+  if ((x = /^PR #(\d+) closed/.exec(text))) return "PR #" + x[1] + " 已关闭，等待 controller 删除预览 namespace…";
+  return text;
+}
+function controls() {
+  const s = S.status; if (!s) return;
+  if (s.pr) { $("prlink").textContent = "#" + s.pr; if (s.url) $("prlink").href = s.url; }
+  $("prep").disabled = Boolean(s.busy || s.pr);
+  $("start").disabled = Boolean(s.busy || !s.prepared || s.started);
+  $("cleanup").disabled = Boolean(s.busy || !s.pr);
+  $("chaos").disabled = s.started;
+  let hint;
+  if (s.busy === "detect") hint = "查找已有的 draft 演示 PR…";
+  else if (s.busy === "prep" || s.busy === "cleanup") hint = (s.busy === "prep" ? "准备：" : "收尾：") + (S.taskText || "启动中…");
+  else if (s.busy === "run") hint = "演示进行中";
+  else if (s.started) hint = S.replay ? "回放结束" : "演示结束。讲完后点「收尾」关闭 PR 并删除预览环境";
+  else if (s.prepared) hint = (s.pr ? "PR #" + s.pr + " 已就绪，" : "") + "点「开始」启动演示";
+  else if (s.pr) hint = "PR #" + s.pr + " 的准备没有完成（" + (S.taskText || "见原始输出") + "），点「收尾」关掉后重新准备";
+  else hint = "没有找到 draft 演示 PR，点「准备」新开一个（约 1 分钟）" + (S.taskText ? "。上次输出：" + S.taskText : "");
+  $("bar").textContent = hint;
+  $("bar").className = s.busy && s.busy !== "run" ? "busy" : "";
 }
 
 function apply(ev, t) {
@@ -306,11 +398,17 @@ es.onmessage = (e) => {
     if (connected) return location.reload();
     connected = true;
     S.speed = m.speed; $("killafter").textContent = m.killAfter;
-    if (m.replay) $("chaosbox").style.display = "none";
-    if (m.pr) { $("prlink").textContent = "#" + m.pr; }
-    $("start").disabled = false;
+    S.replay = m.replay;
+    if (m.replay) for (const id of ["chaosbox", "prep", "cleanup"]) $(id).style.display = "none";
+  } else if (m.kind === "reset") {
+    location.reload();
+  } else if (m.kind === "status") {
+    S.status = m; controls();
+  } else if (m.kind === "task") {
+    $("raw").textContent += m.raw + "\n";
+    S.taskText = taskText(m.raw); controls();
   } else if (m.kind === "started") {
-    S.startedAt = m.at; $("start").disabled = true; $("chaos").disabled = true; advance("webhook", 0);
+    S.startedAt = m.at; advance("webhook", 0);
   } else if (m.kind === "line") {
     $("raw").textContent += m.raw + "\n";
     if (m.ev) { lastT = m.ev.t ?? lastT; apply(m.ev, m.ev.t); }
@@ -319,8 +417,10 @@ es.onmessage = (e) => {
     if (m.code) { $("warn").style.display = "block"; $("warn").textContent = "demo.sh 退出码 " + m.code + "，详情见原始输出"; }
   }
 };
-es.onerror = () => { $("start").disabled = true; };
+es.onerror = () => { for (const id of ["prep", "start", "cleanup"]) $(id).disabled = true; $("bar").textContent = "与演示页服务断开，等待重连…"; };
+$("prep").onclick = () => fetch("/prep", { method: "POST" });
 $("start").onclick = () => fetch("/start?chaos=" + ($("chaos").checked ? 1 : 0), { method: "POST" });
+$("cleanup").onclick = () => fetch("/cleanup", { method: "POST" });
 setInterval(() => { if (S.startedAt && S.frozen == null) $("timer").textContent = fmt(((Date.now() - S.startedAt) / 1000) * S.speed); }, 250);
 </script></body></html>`;
 
